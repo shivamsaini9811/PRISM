@@ -136,7 +136,8 @@ _PICK_COMPOSER_JS = """sel => {
 # Before sending: record every piece of text the page adds from now on.
 _WATCH_JS = """() => {
   if (window.__prismWatch) window.__prismWatch.obs.disconnect();
-  const w = window.__prismWatch = {nodes: new Set()};
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim();
+  const w = window.__prismWatch = {nodes: new Set(), before: norm(document.body.innerText)};
   w.obs = new MutationObserver(muts => { for (const m of muts) {
     if (m.type === 'characterData') w.nodes.add(m.target);
     else m.addedNodes.forEach(n => w.nodes.add(n));
@@ -157,6 +158,7 @@ _FIND_REPLY_JS = """prompt => {
     if (!el || el.closest('textarea, [contenteditable="true"], nav, aside, header, [data-prism-seen-user]')) continue;
     const t = norm(n.textContent);
     if (!t || (p && p.includes(t))) continue;   // our own message, shown back
+    if (t.length >= 30 && w.before.includes(t)) continue;  // old messages the page re-drew
     items.push([el, t.length]); total += t.length;
   }
   if (!total) return 0;
@@ -263,8 +265,10 @@ class SiteAdapter:
         self.notes, self._composer_guessed = [], False
         while True:
             try:
-                # The known message box; after a few seconds without it, the likeliest text box.
-                if await self._find_composer(page, guess=time.monotonic() - start > 5):
+                # The known message box; only well after it should have shown up, the likeliest
+                # text box (sites load slowly; a guess is learned once a reply comes back).
+                guess = time.monotonic() - start > min(15.0, self.load_timeout_ms / 2000)
+                if await self._find_composer(page, guess=guess):
                     if await self._signed_out(page):
                         raise await self.diagnose(page)
                     await self._dismiss_cookie_notice(page)
@@ -288,6 +292,10 @@ class SiteAdapter:
         """The configured message box, else (guess) the likeliest visible text box on the page."""
         box = page.locator(self.cfg.composer).filter(visible=True).first
         if await box.count():
+            if self._composer_guessed:  # it was only slow to load: nothing to learn
+                self._composer_guessed = False
+                await page.evaluate("() => document.querySelectorAll('[data-prism-composer]')"
+                                    ".forEach(e => e.removeAttribute('data-prism-composer'))")
             return box
         tagged = page.locator("[data-prism-composer]").filter(visible=True).first
         if await tagged.count():

@@ -429,13 +429,14 @@ async def test_layout_advice_comes_from_another_assistant(client, monkeypatch):
         assert await app_mod.layout_advisor("gpt")("which box?") == ""
 
 
-def wait_profile(client, chat):
-    for _ in range(200):
+def wait_profile(client, chat, last):
+    """The update starts just after the meeting ends: wait for its outcome, not for 'idle'."""
+    for _ in range(300):
         v = client.get(f"/api/chats/{chat}").json()
-        if not v["profile"]["updating"]:
+        if v["profile"]["last"] == last and not v["profile"]["updating"]:
             return v
         time.sleep(0.02)
-    raise AssertionError("profile update did not finish")
+    raise AssertionError(f"profile update did not finish: {v['profile']}")
 
 
 def test_profile_is_kept_from_what_the_user_says(client, monkeypatch):
@@ -460,7 +461,8 @@ def test_profile_is_kept_from_what_the_user_says(client, monkeypatch):
         wait_meeting(client, chat)
     assert not prompts  # two new messages: not enough for an update yet
     client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt keep answers short", "format": "chat"})
-    v = wait_profile(client, wait_meeting(client, chat)["chat"]["id"])
+    wait_meeting(client, chat)
+    v = wait_profile(client, chat, "updated from 3 messages")
     assert len(prompts) == 1 and "I run marathons" in prompts[0] and "keep answers short" in prompts[0]
     item = next(c for c in v["context"] if c["name"] == "profile")
     assert item["chat_id"] is None and item["always"] and "marathons" in item["content"]
@@ -473,7 +475,7 @@ def test_profile_is_kept_from_what_the_user_says(client, monkeypatch):
     # /profile forces an update; UNCHANGED keeps the profile as it was.
     r = client.post(f"/api/chats/{chat}/messages", json={"content": "/profile"}).json()
     assert r["notice"].startswith("Updating your profile")
-    v = wait_profile(client, chat)
+    v = wait_profile(client, chat, "checked - nothing new")
     assert "@gpt hi" in prompts[1] and "I run marathons" not in prompts[1].split("RECENTLY")[1]
     assert next(c for c in v["context"] if c["name"] == "profile")["content"] == item["content"]
     assert v["profile"]["last"] == "checked - nothing new"

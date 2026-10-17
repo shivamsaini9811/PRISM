@@ -63,6 +63,9 @@ ASK_HELP = (" You can ask the other assistants the user uses ({askable}): each k
             "you then finish your turn. When the user mentions their own things you don't have "
             "(a routine, a plan, past decisions, personal history), ASK before guessing. At most "
             "{max_asks} asks per turn.{prism}")
+ASK_PRISM_ONLY = (" You can search the user's past chats in this app: write one line "
+                  "`ASK @prism: <keywords>` and nothing after it; the matching messages come back "
+                  "to you and you then finish your turn. At most {max_asks} asks per turn.")
 ASK_PRISM = (" `prism` is not an assistant: `ASK @prism: <keywords>` searches the user's past "
              "chats in this app and returns the matching messages.")
 ASK_LINE = re.compile(r"^[\s*_`>-]*ASK\s+@([A-Za-z][\w-]*)[*_`]*\s*:[\s*_`]*(.+?)[\s*_`]*$", re.I)
@@ -408,9 +411,11 @@ class Session:
     def _system(self, m: Member) -> str:
         others = ", ".join(n for n in self.members if n not in (m.name, MODERATOR)) or "none"
         askable = self._askable(m)
-        help_ = (ASK_HELP.format(askable=", ".join(askable), max_asks=self.max_asks,
-                                 prism=ASK_PRISM if "prism" in askable else "")
-                 if askable and self.max_asks else "")
+        assistants = [a for a in askable if a != "prism"]
+        help_ = ("" if not self.max_asks else
+                 ASK_HELP.format(askable=", ".join(assistants), max_asks=self.max_asks,
+                                 prism=ASK_PRISM if "prism" in askable else "") if assistants else
+                 ASK_PRISM_ONLY.format(max_asks=self.max_asks) if askable else "")
         return _with_context(MEMBER_SYSTEM.format(name=m.name, others=others,
                                                   deep=(DEEP if self.deep else "") + help_),
                              self.context)

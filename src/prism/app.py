@@ -592,8 +592,9 @@ def start_recall(chat_id: int, platform: str, name: str, direction: str) -> str:
 PROFILE, PROFILE_TITLE = "profile", "About you (kept by PRISM from your chats)"
 PROFILE_EVERY = 3        # new things the user said before an automatic update
 PROFILE_MAX_CHARS = 2500
+PROFILE_FAILURES = 3     # then automatic updates pause until /profile (e.g. signed out)
 PROFILE_PROMPT = (
-    "You keep a short profile of me for the AI assistants I use, so they know who I am. Below "
+    "PRISM profile update. You keep a short profile of me for the AI assistants I use, so they know who I am. Below "
     "is my current profile, then things I wrote recently in my chats.\n\n"
     "CURRENT PROFILE:\n{profile}\n\nWHAT I WROTE RECENTLY (chat title: message):\n{said}\n\n"
     "Write my full updated profile: only lasting facts about me that I stated or clearly "
@@ -634,6 +635,9 @@ def maybe_update_profile(force: bool = False) -> bool:
     s = store()
     if (profile_mode() == "off" and not force) or _vault["key"] is None:
         return False
+    failures = int(s.get_meta("profile_failures") or 0)
+    if failures >= PROFILE_FAILURES and not force:
+        return False
     task = _profile_task["task"]
     if task and not task.done():
         return False
@@ -663,8 +667,12 @@ def maybe_update_profile(force: bool = False) -> bool:
                                            settings().request_timeout_s)).strip()
         except Exception as e:
             log.warning("profile update failed: %s", e)
-            s.set_meta("profile_last", f"failed: {type(e).__name__}")
+            n = 1 if force else failures + 1
+            s.set_meta("profile_failures", str(n))
+            s.set_meta("profile_last", f"failed: {type(e).__name__}" + (
+                " - paused until you press Update now" if n >= PROFILE_FAILURES else ""))
             return  # not marked as read: the next update tries these messages again
+        s.set_meta("profile_failures", "0")
         new = text if len(text) >= 40 and "UNCHANGED" not in text[:40] else None
         if new and (not current or new != current["content"]):
             s.add_context(None, PROFILE_TITLE, new[:PROFILE_MAX_CHARS], name=PROFILE, always=True)

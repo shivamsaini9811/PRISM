@@ -13,18 +13,23 @@ FAKE_CHAT = """<!doctype html><html><body>
 <div id="log"></div>
 <textarea id="composer"></textarea><input type="file" id="upload" multiple hidden><button id="send">Send</button>
 <script>
+if (location.hash === '#late') setTimeout(() => {  // the real message box loads slowly
+  document.getElementById('composer').id = 'late';
+}, 6500);
 if (location.hash === '#input') {  // a message box that isn't a text area: nothing generic finds it
   const i = document.createElement('input'); i.type = 'text'; i.id = 'composer';
   i.style.cssText = 'width:600px;height:40px'; document.getElementById('composer').replaceWith(i);
 }
 let n = 0;
+const remount = location.hash === '#remount';  // read now: pushState drops the hash
 const delay = location.hash === '#slow' ? 3000 : 400, virtual = location.hash === '#virtual';  // #slow: the model thinks first
 document.getElementById('composer').onkeydown = e => {  // Enter sends, like real chat sites
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('send').click(); }
 };
 document.getElementById('send').onclick = () => {
-  const box = document.getElementById('composer'), q = box.value; box.value = '';
+  const box = document.querySelector('#composer, #late'), q = box.value; box.value = '';
   if (!location.pathname.startsWith('/c/')) history.pushState({}, '', '/c/42');
+  if (remount) log.querySelectorAll('.assistant').forEach(e => e.replaceWith(e.cloneNode(true)));  // React re-draws old replies
   const u = document.createElement('div'); u.className = 'user'; u.textContent = q; log.appendChild(u);
   setTimeout(() => {                       // the reply box shows up a moment after the question
   const a = document.createElement('div'); a.className = 'assistant'; log.appendChild(a);
@@ -286,3 +291,27 @@ async def test_another_assistant_finds_an_unusual_message_box(manager):
     assert await p.complete([{"role": "user", "content": "odd box"}]) == "echo: odd box"
     assert len(questions) == 1 and "odd box" not in questions[0]  # no chat text goes out
     assert any("another assistant" in n for n in p.notes)
+
+
+async def test_watching_the_page_ignores_old_replies_it_redraws(manager):
+    # Two turns on one page; before the second reply the page re-draws the first one.
+    cfg = CONFIG.with_overrides({"assistant_message": ".bot-answer-v2", "streaming": ".gone",
+                                 "new_chat_url": "http://fake.test/new#remount"})
+    page = await manager.new_page()
+    try:
+        first = SiteAdapter(cfg, load_timeout_s=5, fallback_after_s=1)
+        await first.open(page)
+        assert await asyncio.wait_for(first.send(page, "a first question with a long answer"), 30) \
+            == "echo: a first question with a long answer"
+        fresh = SiteAdapter(cfg, load_timeout_s=5, fallback_after_s=1)  # has learned nothing
+        assert await asyncio.wait_for(fresh.send(page, "second"), 30) == "echo: second"
+    finally:
+        await page.close()
+
+
+async def test_slow_message_box_is_not_learned_as_a_new_one(manager):
+    learned = []
+    cfg = CONFIG.with_overrides({"composer": "#late", "new_chat_url": "http://fake.test/new#late"})
+    p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=20, on_learn=learned.append))
+    assert await p.complete([{"role": "user", "content": "patience"}]) == "echo: patience"
+    assert learned == []
