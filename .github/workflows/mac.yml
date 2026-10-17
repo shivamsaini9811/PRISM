@@ -1,0 +1,51 @@
+# macOS builds: PyInstaller only builds for the OS it runs on, so this runs on GitHub's Macs.
+# Push a tag (git tag v0.6.4 && git push --tags) or run it by hand from the Actions tab;
+# a tag also publishes the zips as a release.
+name: mac
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest      # Apple Silicon
+            arch: arm64
+          - runner: macos-15-intel    # Intel Macs
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        # --no-browser: uses the Mac's Chrome or Edge; PRISM fetches Chromium itself if neither
+        # is installed. Bundling Chromium inside a PyInstaller folder breaks its macOS framework.
+        run: python packaging/build.py --no-browser --build-dir "$RUNNER_TEMP/prism-build" --dist-dir dist-mac --arch ${{ matrix.arch }}
+      - name: Smoke test
+        run: |
+          export PRISM_HOME="$RUNNER_TEMP/prism-home"
+          ./dist-mac/PRISM/PRISM --no-browser --port 18765 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:18765/api/status && break; sleep 1; done
+          curl -sf http://127.0.0.1:18765/api/status | grep -q '"version"'
+          kill %1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PRISM-macos-${{ matrix.arch }}
+          path: dist-mac/*.zip
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "PRISM $GITHUB_REF_NAME" --notes-file packaging/MAC.md
+          gh release upload "$GITHUB_REF_NAME" dist-mac/*.zip --clobber

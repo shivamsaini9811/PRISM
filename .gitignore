@@ -1,0 +1,12 @@
+.env
+*.env
+node_modules/
+__pycache__/
+.venv/
+dist/
+build/
+*.db
+*.db-journal
+dist*/
+.pytest_cache/
+*.zip

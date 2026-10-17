@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRISM</title>
+<style>
+  :root { --bg:#f6f6f7; --fg:#18181b; --muted:#6b6b76; --card:#fff; --border:#e2e2e6; --accent:#5b4bdb; --accent-fg:#fff; --err:#c62828; --ok:#2e7d32; --side:#efeff2; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#131316; --fg:#ececf1; --muted:#9a9aa6; --card:#1d1d22; --border:#2f2f37; --accent:#8b7dff; --accent-fg:#111; --err:#ef6b6b; --ok:#6fcf73; --side:#18181c; }
+  }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; font:14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--fg); }
+  button { font:inherit; cursor:pointer; border:1px solid var(--border); background:var(--card); color:var(--fg); border-radius:7px; padding:5px 11px; }
+  button.primary { background:var(--accent); color:var(--accent-fg); border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  input, textarea, select { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--border); border-radius:7px; padding:6px 8px; }
+  a { color:var(--accent); }
+  .muted { color:var(--muted); } .err { color:var(--err); } .ok { color:var(--ok); }
+  .hidden { display:none !important; }
+
+  #app { display:grid; grid-template-columns:240px 1fr 280px; height:100vh; }
+  aside, #ctx { background:var(--side); border-right:1px solid var(--border); display:flex; flex-direction:column; min-height:0; }
+  #ctx { border-right:0; border-left:1px solid var(--border); }
+  .pad { padding:12px; }
+  .brand { font-weight:700; font-size:18px; letter-spacing:.5px; }
+  .brand small { display:block; font-weight:400; font-size:11px; color:var(--muted); letter-spacing:0; }
+  #chats { flex:1; overflow:auto; padding:0 8px 8px; }
+  .chat-item { display:flex; align-items:center; gap:6px; padding:7px 8px; border-radius:7px; cursor:pointer; border:1px solid transparent; }
+  .chat-item:hover { background:var(--border); } .chat-item.active { background:var(--card); border-color:var(--border); }
+  .chat-item span { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .chat-item button { border:0; background:none; padding:0 4px; color:var(--muted); visibility:hidden; }
+  .chat-item:hover button { visibility:visible; }
+  .side-foot { padding:10px 12px; border-top:1px solid var(--border); display:flex; gap:6px; flex-wrap:wrap; }
+
+  main { display:flex; flex-direction:column; min-width:0; min-height:0; }
+  #topbar { display:flex; align-items:flex-end; gap:6px; padding:10px 14px 0; border-bottom:1px solid var(--border); }
+  #tabs { display:flex; gap:4px; overflow-x:auto; flex:1; }
+  .tab { border:1px solid transparent; border-bottom:0; border-radius:7px 7px 0 0; padding:6px 12px; background:none; white-space:nowrap; }
+  .tab.active { background:var(--card); border-color:var(--border); margin-bottom:-1px; }
+  #remote { padding:6px 16px; font-size:12px; }
+  #thread { flex:1; overflow:auto; padding:8px 16px 16px; }
+  .msg { max-width:820px; margin:10px auto; padding:10px 14px; border-radius:10px; background:var(--card); border:1px solid var(--border); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .msg.user { border-left:3px solid var(--accent); }
+  .msg .who { font-size:11px; color:var(--muted); margin-bottom:2px; white-space:normal; }
+  details { margin-top:8px; font-size:12.5px; white-space:normal; }
+  details pre { white-space:pre-wrap; background:var(--bg); padding:8px; border-radius:6px; margin:4px 0 10px; max-height:300px; overflow:auto; }
+  .score { display:inline-block; min-width:2.6em; text-align:center; border-radius:5px; background:var(--bg); padding:0 5px; }
+  form#composer { display:flex; gap:8px; padding:10px 16px 16px; max-width:852px; width:100%; margin:0 auto; }
+  form#composer textarea { flex:1; min-height:56px; max-height:200px; resize:vertical; }
+  /* meeting */
+  .round-div { max-width:820px; margin:18px auto 4px; display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.06em; }
+  .round-div::before, .round-div::after { content:""; flex:1; border-top:1px solid var(--border); }
+  .seats { max-width:820px; margin:6px auto; display:flex; flex-direction:column; gap:8px; }  /* parallel answers, stacked */
+  .seats .msg { margin:0; }
+  .msg.lookup, .msg.recall { font-size:13px; border-style:dashed; }
+  .media-img { display:block; max-width:100%; max-height:420px; margin:8px 0; border-radius:8px; border:1px solid var(--border); }
+  .file-link, .chip { display:inline-flex; align-items:center; gap:4px; margin:6px 6px 0 0; padding:3px 9px; border:1px solid var(--border);
+    border-radius:999px; font-size:12.5px; text-decoration:none; color:inherit; background:var(--bg); }
+  #attached { max-width:852px; width:100%; margin:0 auto; padding:0 16px; }
+  #attached:empty { display:none; }
+  .chip button { border:0; background:none; padding:0 2px; cursor:pointer; color:inherit; }
+  #mic.on { background:#c0392b; color:#fff; border-color:#c0392b; }
+  .msg.topic { border-left:3px solid var(--accent); }
+  .msg.topic .who b { color:var(--fg); }
+  .msg.analysis { border:1px solid var(--accent); background:color-mix(in srgb, var(--accent) 7%, var(--card)); white-space:normal; }
+  .msg.analysis h4 { margin:10px 0 2px; font-size:13px; } .msg.analysis h4:first-of-type { margin-top:2px; }
+  .msg.analysis .ask { background:color-mix(in srgb, var(--accent) 16%, transparent); border-radius:6px; padding:4px 8px; }
+  .msg.analysis p { margin:2px 0; white-space:pre-wrap; }
+  .msg.final { border:2px solid var(--ok); }
+  .pill { display:inline-block; font-size:11px; border-radius:99px; padding:0 8px; border:1px solid var(--border); margin-left:6px; }
+  .pill.converged { color:var(--ok); border-color:var(--ok); } .pill.open { color:var(--muted); }
+  .speaker-name { font-weight:600; color:var(--fg); }
+  #meetbar { max-width:852px; width:100%; margin:0 auto; padding:8px 16px 0; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; font-size:12.5px; }
+  #meetbar label { display:flex; align-items:center; gap:5px; color:var(--muted); }
+  #meetbar select { padding:2px 4px; font-size:12.5px; }
+  #seatsCfg { display:flex; flex-wrap:wrap; gap:6px 12px; }
+  #status { flex:1; display:flex; align-items:center; gap:8px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); animation:pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  .msg.context { font-size:12.5px; padding:6px 12px; border-style:dashed; white-space:normal; }
+  .msg.context details { margin:0; } .msg.context pre { white-space:pre-wrap; margin:4px 0 0; }
+  .msg .tools { float:right; visibility:hidden; } .msg:hover .tools { visibility:visible; }
+  .msg .tools button { font-size:11px; padding:1px 7px; }
+  .role { font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); margin-left:6px; }
+  #suggest { max-width:852px; width:100%; margin:0 auto; padding:6px 16px 0; display:flex; flex-wrap:wrap; gap:6px; }
+  #suggest button { font-size:12px; padding:2px 9px; border-radius:99px; }
+  #suggest button.on { border-color:var(--accent); color:var(--accent); }
+  #help { max-width:852px; width:100%; margin:-10px auto 0; padding:0 16px 10px; font-size:11.5px; }
+  #notice { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); background:var(--fg); color:var(--bg); padding:7px 14px; border-radius:8px; font-size:13px; z-index:20; }
+  .empty { margin:auto; text-align:center; color:var(--muted); padding:40px 16px; }
+
+  #ctx h3, .modal h3 { margin:0 0 8px; font-size:14px; }
+  #ctxList { flex:1; overflow:auto; padding:0 12px; }
+  .ctx-item { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:8px; margin-bottom:8px; font-size:12.5px; }
+  .ctx-item b { display:flex; justify-content:space-between; gap:6px; }
+  .ctx-item b button { border:0; background:none; padding:0; color:var(--muted); }
+  .ctx-item p { margin:4px 0 0; white-space:pre-wrap; max-height:90px; overflow:auto; color:var(--muted); }
+  .tag { font-size:10px; font-weight:400; border:1px solid var(--border); border-radius:4px; padding:0 4px; color:var(--muted); }
+  #ctxForm { padding:12px; border-top:1px solid var(--border); display:grid; gap:6px; }
+  #ctxForm textarea { min-height:70px; resize:vertical; }
+
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  .modal { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; width:100%; max-width:440px; max-height:90vh; overflow:auto; }
+  .modal.wide { max-width:760px; }
+  .modal .row { display:grid; gap:6px; margin:10px 0; }
+  .plat { border:1px solid var(--border); border-radius:10px; padding:12px; margin:10px 0; }
+  .plat-head { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .plat-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+  .plat-grid label { display:grid; gap:3px; font-size:12px; color:var(--muted); }
+  .plat-actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+  .plat pre { white-space:pre-wrap; font-size:12px; background:var(--bg); padding:8px; border-radius:6px; }
+  .plat textarea { width:100%; min-height:110px; font-family:ui-monospace, monospace; font-size:12px; }
+  .note { font-size:12px; color:var(--muted); background:var(--bg); border-radius:8px; padding:8px 10px; }
+  .narrow-only { display:none; }
+
+  @media (max-width: 900px) {
+    #app { grid-template-columns:1fr; }
+    aside, #ctx { position:fixed; top:0; bottom:0; width:min(300px, 85vw); z-index:5; transform:translateX(-105%); transition:transform .2s; }
+    #ctx { right:0; transform:translateX(105%); }
+    aside.open, #ctx.open { transform:none; }
+    .narrow-only { display:inline-block; }
+    .plat-grid { grid-template-columns:1fr; }
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div class="pad"><div class="brand">PRISM<small>One group chat for all your AIs</small></div></div>
+    <div class="pad" style="padding-top:0"><button class="primary" style="width:100%" id="newChat">+ New chat</button></div>
+    <div id="chats"></div>
+    <div class="side-foot">
+      <button id="openSettings">Settings</button>
+      <button id="lockBtn">Lock</button>
+      <span class="muted" id="motherLabel" style="font-size:12px;align-self:center"></span>
+    </div>
+  </aside>
+
+  <main>
+    <div id="topbar">
+      <button class="narrow-only" id="menuBtn" style="margin-bottom:6px">☰</button>
+      <div id="tabs"></div>
+      <button class="narrow-only" id="ctxBtn" style="margin-bottom:6px">Context</button>
+    </div>
+    <div id="remote" class="muted hidden"></div>
+    <div id="thread"><div class="empty">Create or pick a chat.</div></div>
+    <div id="meetbar" class="hidden">
+      <div id="setup" style="display:contents">
+        <label title="How the bots answer when you @all, @name several, or mention nobody">Format
+          <select id="format">
+            <option value="roundtable">Round table - all at once, discuss</option>
+            <option value="round_robin">Round robin - one after another</option>
+            <option value="review">Ask &amp; review - first @named answers, others review</option>
+            <option value="chat">Chat - each answers once</option>
+          </select></label>
+        <label title="How many rounds before the final answer">Rounds
+          <select id="rounds"></select></label>
+        <label title="Advice budget: how many times each bot may ASK the other platforms (their memory of you, or advice) per turn">Asks
+          <select id="asks"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
+        <label title="Ask API models to think longer, and every speaker to reason step by step">
+          <input type="checkbox" id="deep"> Deep</label>
+        <span class="muted" title="How long each speaker may talk per turn: Full = no limit (Long/Medium/Short ask for about 400/200/80 words)">Speakers:</span>
+        <div id="seatsCfg"></div>
+      </div>
+      <div id="status" class="hidden"><span class="dot"></span><span id="statusText"></span>
+        <button id="stopBtn" style="margin-left:auto">Stop &amp; conclude</button></div>
+    </div>
+    <div id="suggest" class="hidden"></div>
+    <div id="attached"></div>
+    <form id="composer" class="hidden">
+      <textarea id="input" placeholder="Message the room… (Enter to send, Shift+Enter for a new line)"></textarea>
+      <input type="file" id="attachInput" multiple hidden>
+      <button type="button" id="attach" title="Attach files - each bot gets them through its site's own upload">📎</button>
+      <button type="button" id="mic" title="Speak - your words appear here; check them, then Send">🎤</button>
+      <button class="primary" id="send">Send</button>
+    </form>
+    <div id="help" class="muted hidden"><b>@claude</b> asks one · <b>@claude @gpt</b> asks several · <b>@all</b> or no @ asks everyone switched on · <b>@moderator</b> sums up ·
+      <b>#name</b> attaches saved context · <b>/save #name</b> [text] saves the last answer (or the text) · <b>/save-global #name</b> · <b>/forget #name</b><br>
+      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all)</div>
+  </main>
+
+  <section id="ctx">
+    <div class="pad"><h3>Context</h3><div class="muted" style="font-size:12px">Write <b>#name</b> in a message to give it to the room. Items marked <i>always</i> go with every message. Global items work in every chat.</div></div>
+    <div id="ctxList"></div>
+    <form id="ctxForm" class="hidden">
+      <input id="ctxTitle" placeholder="#name (e.g. spec)" required>
+      <textarea id="ctxContent" placeholder="Notes, facts, code, requirements…" required></textarea>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="ctxGlobal"> Global (all chats)</label>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="ctxAlways"> Always send (not only when #named)</label>
+      <button class="primary">Add to context</button>
+    </form>
+  </section>
+</div>
+
+<div class="overlay hidden" id="lock">
+  <form class="modal" id="lockForm">
+    <h3 id="lockTitle">Unlock PRISM</h3>
+    <p class="muted" id="lockText"></p>
+    <div class="row"><input type="password" id="pw" placeholder="Master password" autocomplete="current-password" required></div>
+    <div class="row hidden" id="pw2Row"><input type="password" id="pw2" placeholder="Confirm master password" autocomplete="new-password"></div>
+    <p class="err" id="lockErr"></p>
+    <button class="primary" style="width:100%" id="lockSubmit">Unlock</button>
+  </form>
+</div>
+
+<div class="overlay hidden" id="settings">
+  <div class="modal wide">
+    <div class="plat-head"><h3>Settings</h3><button id="closeSettings">Close</button></div>
+    <div class="row">
+      <label class="muted" style="font-size:12px">Primary (mother) LLM: moderates the meeting, analyses each round and writes the final answer</label>
+      <select id="primary"></select>
+      <div class="note">The primary moderates every meeting: after each round it writes the analysis, and at the end the final answer. It uses one extra conversation per meeting. An <b>API</b> connection makes it much faster.</div>
+    </div>
+    <div id="plats"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+/* Pictures and files saved from replies arrive as ![image](media/x) and [📄 name](media/x). */
+const mediaUrl = p => '/media/' + encodeURIComponent(p.replace(/^media\//, ''));
+function rich(html) {  // after esc(): markdown media links become pictures and download links
+  return html
+    .replace(/!\[image\]\(((?:media\/)?[\w.\- ]+)\)/g, (_, p) => /\.(png|jpe?g|gif|webp|svg)$/i.test(p)
+      ? `<a href="${mediaUrl(p)}" target="_blank"><img class="media-img" src="${mediaUrl(p)}" alt="image"></a>` : '')
+    .replace(/\[(\u{1F4C4}[^\]]*)\]\((media\/[\w.\- ]+)\)/gu, (_, label, p) =>
+      `<a class="file-link" href="${mediaUrl(p)}" download>${label}</a>`);
+}
+const filesHtml = names => (names || []).map(n => /\.(png|jpe?g|gif|webp)$/i.test(n)
+  ? `<a href="${mediaUrl(n)}" target="_blank"><img class="media-img" style="max-height:160px" src="${mediaUrl(n)}" alt=""></a>`
+  : `<a class="file-link" href="${mediaUrl(n)}" download>📎 ${esc(n.split('-').slice(1).join('-'))}</a>`).join('');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let state = { chats: [], view: null, tab: 'mother', platforms: null, busy: false, poll: null };
+const BUDGETS = [['full', 'Full'], ['long', 'Long'], ['medium', 'Medium'], ['short', 'Short'], ['off', 'Off']];
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { headers: {'Content-Type': 'application/json'}, ...opts,
+                                body: opts.body ? JSON.stringify(opts.body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 423) { showLock(); throw new Error('locked'); }
+  if (!r.ok) throw new Error(data.detail || r.statusText);
+  return data;
+}
+
+/* ---------- vault ---------- */
+async function boot() {
+  const s = await api('/api/status');
+  if (!s.unlocked) return showLock(s);
+  $('lock').classList.add('hidden');
+  await Promise.all([loadChats(), loadPlatforms()]);
+  if (state.chats.length) openChat(state.chats[0].id); else render();
+  if (!state.platforms.credentials.length) $('openSettings').click();
+}
+async function showLock(s) {
+  s = s || await api('/api/status');
+  const create = !s.initialized;
+  $('lockTitle').textContent = create ? 'Create a master password' : 'Unlock PRISM';
+  $('lockText').textContent = create
+    ? 'It encrypts the platform keys stored on this computer. It cannot be recovered, so keep it safe.'
+    : 'Enter your master password to decrypt your stored platform keys.';
+  $('pw2Row').classList.toggle('hidden', !create);
+  $('lockSubmit').textContent = create ? 'Create' : 'Unlock';
+  $('lockForm').dataset.create = create ? '1' : '';
+  $('lock').classList.remove('hidden');
+  $('pw').focus();
+}
+$('lockForm').onsubmit = async e => {
+  e.preventDefault();
+  $('lockErr').textContent = '';
+  if ($('lockForm').dataset.create && $('pw').value !== $('pw2').value)
+    return $('lockErr').textContent = 'Passwords do not match';
+  try { await api('/api/unlock', {method: 'POST', body: {password: $('pw').value}});
+        $('pw').value = $('pw2').value = ''; boot(); }
+  catch (err) { $('lockErr').textContent = err.message; }
+};
+$('lockBtn').onclick = async () => { await api('/api/lock', {method: 'POST'}); showLock(); };
+
+/* ---------- chats ---------- */
+async function loadChats() { state.chats = await api('/api/chats'); renderChats(); }
+function renderChats() {
+  $('chats').innerHTML = state.chats.map(c =>
+    `<div class="chat-item ${state.view?.chat.id === c.id ? 'active' : ''}" data-id="${c.id}">
+       <span title="${esc(c.title)}">${esc(c.title)}</span><button data-del="${c.id}" title="Delete chat">✕</button></div>`).join('')
+    || '<div class="muted pad">No chats yet.</div>';
+}
+$('chats').onclick = async e => {
+  const del = e.target.dataset.del;
+  if (del) {
+    e.stopPropagation();
+    if (!confirm('Delete this chat and its bound platform threads from PRISM?')) return;
+    await api(`/api/chats/${del}`, {method: 'DELETE'});
+    if (state.view?.chat.id == del) state.view = null;
+    await loadChats(); return render();
+  }
+  const item = e.target.closest('.chat-item');
+  if (item) { openChat(+item.dataset.id); $('side').classList.remove('open'); }
+};
+$('newChat').onclick = async () => { const c = await api('/api/chats', {method: 'POST'}); await loadChats(); openChat(c.id); };
+async function openChat(id) { state.view = await api(`/api/chats/${id}`); state.tab = 'mother'; renderChats(); render(); watch(); }
+
+/* While a meeting runs, refresh about once a second so every statement shows up as it lands. */
+function watch() {
+  clearTimeout(state.poll);
+  const v = state.view;
+  const recalling = v?.messages.some(m => m.meta?.pending);
+  if (!v?.meeting && !recalling) return;
+  state.poll = setTimeout(async () => {
+    if (state.view?.chat.id !== v.chat.id) return;
+    try {
+      const fresh = await api(`/api/chats/${v.chat.id}`);
+      if (state.view?.chat.id !== v.chat.id) return;
+      const sig = x => JSON.stringify([x.messages.length, x.meeting, x.daughters.map(d => d.messages.length),
+                                       x.context.length, x.messages.filter(m => m.meta?.pending).length]);
+      const changed = sig(fresh) !== sig(v);
+      state.view = fresh;
+      if (changed) render();
+      if (!fresh.meeting && changed) loadChats();
+    } catch (err) { /* transient - try again */ }
+    watch();
+  }, 1000);
+}
+
+/* ---------- thread ---------- */
+function render() {
+  const v = state.view;
+  $('ctxForm').classList.toggle('hidden', !v);
+  if (!v) { $('tabs').innerHTML = ''; $('remote').classList.add('hidden'); $('composer').classList.add('hidden');
+            $('meetbar').classList.add('hidden'); $('thread').innerHTML = '<div class="empty">Create or pick a chat.</div>'; $('ctxList').innerHTML = ''; return; }
+
+  const tabs = [['mother', 'PRISM']].concat(v.daughters.map(d => [String(d.id), d.platform]));
+  $('tabs').innerHTML = tabs.map(([id, label]) =>
+    `<button class="tab ${state.tab === id ? 'active' : ''}" data-tab="${id}">${esc(label)}</button>`).join('');
+
+  const d = v.daughters.find(x => String(x.id) === state.tab);
+  $('remote').classList.toggle('hidden', !d);
+  if (d) $('remote').innerHTML = `Bound thread · ${esc(d.model)}` +
+    (d.remote_url ? ` · <a href="${esc(d.remote_url)}" target="_blank" rel="noopener">open on ${esc(d.platform)}</a>` : '');
+
+  const msgs = d ? d.messages : v.messages;
+  const t = $('thread'), atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 80;
+  t.innerHTML = msgs.length ? (d ? msgs.map(m => msgHtml(m, false)).join('') : meetingHtml(msgs, v.meeting))
+    : `<div class="empty">${d ? 'No messages in this thread yet.' :
+       'A group chat with your AI models. @mention one to ask it, or ask everyone and let them '
+       + 'discuss in the format below. You can join in while they talk.'}</div>`;
+  if (atBottom || state.busy) t.scrollTop = t.scrollHeight;
+  $('composer').classList.toggle('hidden', !!d);
+  renderMeetbar(!d);
+  $('help').classList.toggle('hidden', !!d);
+
+  $('ctxList').innerHTML = v.context.map(c =>
+    `<div class="ctx-item"><b><span>#${esc(c.name)} ${c.chat_id == null ? '<span class="tag">global</span>' : ''}
+       ${c.always ? '<span class="tag">always</span>' : ''}</span>
+       <button data-ctxdel="${c.id}" title="Remove">✕</button></b><p>${esc(c.content)}</p></div>`).join('')
+    || '<div class="muted" style="font-size:12px">Nothing stored yet.</div>';
+}
+function md(text) {  // just enough markdown for the analysis: ## headings and **bold**
+  let html = '', ask = false;
+  for (const block of esc(text).split(/\n(?=## )/)) {
+    const m = block.match(/^## (.*)\n?([\s\S]*)$/);
+    if (!m) { html += `<p>${block}</p>`; continue; }
+    ask = /question/i.test(m[1]);
+    html += `<h4>${m[1]}</h4><p class="${ask && !/^\s*none\.?\s*$/i.test(m[2]) ? 'ask' : ''}">${m[2].trim()}</p>`;
+  }
+  return html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+}
+
+const FORMAT_LABEL = {roundtable: 'round table', round_robin: 'round robin', review: 'ask & review',
+                      chat: 'chat', summary: 'summary', plan: 'task plan'};
+const ROLE_LABEL = {review: 'review', revise: 'revision', discuss: '', task: 'task'};
+const saveBtn = id => `<span class="tools"><button data-save="${id}" title="Save as named context">Save as #…</button></span>`;
+
+function meetingHtml(msgs, live) {
+  let html = '', group = null, seats = [], order = [], fmt = 'chat', rounds = 1;
+  const flush = () => {
+    if (!seats.length) return;
+    seats.sort((a, b) => order.indexOf(a.who) - order.indexOf(b.who));  // same seat every round
+    html += seats.length > 1 ? `<div class="seats">${seats.map(x => x.html).join('')}</div>` : seats[0].html;
+    seats = [];
+  };
+  for (const m of msgs) {
+    const meta = m.meta || {}, kind = meta.kind;
+    if (!kind) { flush(); html += msgHtml(m, true); continue; }  // a chat from before meetings
+    if (kind === 'topic') {
+      flush(); group = null; order = meta.speakers || []; fmt = meta.format || 'chat'; rounds = meta.rounds || 1;
+      const to = (meta.mentions || []).length ? meta.mentions.map(x => '@' + x).join(' ') : '@all';
+      const how = fmt === 'chat' || fmt === 'summary' ? '' : ` · ${FORMAT_LABEL[fmt]}, ${rounds} round${rounds > 1 ? 's' : ''}`;
+      html += `<div class="msg topic"><div class="who"><b>You</b> → ${esc(to)}${how}</div>${esc(m.content)}${filesHtml(meta.files)}</div>`;
+      continue;
+    }
+    if (kind === 'context') {
+      flush();
+      const [head, ...body] = m.content.split('\n');
+      html += `<div class="msg context"><details><summary>📎 ${esc(head)}</summary><pre>${esc(body.join('\n'))}</pre></details></div>`;
+      continue;
+    }
+    if (kind === 'speaker') {
+      const key = `${meta.round}/${meta.step}`;
+      if (key !== group) {
+        flush();
+        if (fmt !== 'chat' && fmt !== 'plan' && meta.round !== +(group || '0/').split('/')[0])
+          html += `<div class="round-div">Round ${meta.round}</div>`;
+        group = key;
+      }
+      const role = ROLE_LABEL[meta.role] ? `<span class="role">${ROLE_LABEL[meta.role]}</span>` : '';
+      seats.push({who: meta.speaker, html: `<div class="msg">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">${esc(meta.speaker)}</span>${role}`
+        + ` · ${esc(meta.model || '')} · ${meta.latency_s}s</div>`
+        + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : rich(esc(m.content)))
+        + '</div>'});
+      continue;
+    }
+    flush();
+    if (kind === 'recall') {
+      const what = meta.pending ? `<em class="muted">recalling… (a new chat on ${esc(meta.speaker)})</em>`
+        : meta.error ? `<span class="err">${esc(meta.error)}</span>`
+        : `saved as <b>#${esc(meta.name)}</b> (global context, ${meta.chars} characters, ${meta.latency_s}s)`;
+      html += `<div class="msg recall"><div class="who"><span class="speaker-name">/recall</span> · ${esc(meta.speaker)}'s memory: ${esc(meta.direction || '')}</div>${what}</div>`;
+      continue;
+    }
+    if (kind === 'lookup') {
+      html += `<div class="msg lookup"><details><summary><b>${esc(meta.asker)}</b> asked <b>${esc(meta.speaker)}</b>'s memory: ${esc(meta.question)}</summary>`
+        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : esc(m.content.split('\n\n').slice(1).join('\n\n'))) + '</details></div>';
+      continue;
+    }
+    if (kind === 'user') {
+      html += `<div class="msg user"><div class="who"><b>You</b>${meta.during ? ' · joined the discussion' : ''}</div>${esc(m.content)}${filesHtml(meta.files)}</div>`;
+    } else if (kind === 'analysis' || kind === 'summary') {
+      const status = (m.content.match(/STATUS:\s*(converged|open)/i) || [])[1]?.toLowerCase();
+      const body = m.content.replace(/\n?STATUS:.*$/i, '');
+      html += `<div class="msg analysis">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">moderator</span> · `
+        + (kind === 'summary' ? 'summary' : `analysis after round ${meta.round}`)
+        + (status ? `<span class="pill ${status}">${status}</span>` : '') + '</div>'
+        + (meta.error ? `<span class="err">No ${kind}: ${esc(meta.error)}</span>` : rich(md(body))) + '</div>';
+    } else if (kind === 'final') {
+      html += `<div class="msg final">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">Final answer</span> · ${esc(meta.speaker)}`
+        + (meta.role === 'revise' ? ' (revised after review)' : '') + '</div>'
+        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : rich(esc(m.content))) + '</div>';
+    }
+  }
+  flush();
+  for (const q of state.view.queued || [])
+    html += `<div class="msg user" style="opacity:.6"><div class="who"><b>You</b> · queued - runs when the room is free</div>${esc(q)}</div>`;
+  if (live) {
+    const what = live.phase === 'final' ? 'Writing the final answer…'
+      : live.phase === 'analysing' ? `The moderator is analysing round ${live.round}…`
+      : live.waiting_on.length ? `Waiting on ${live.waiting_on.join(', ')}…` : 'Starting…';
+    html += `<div class="msg"><em class="muted">${esc(what)}</em></div>`;
+  }
+  return html;
+}
+
+function renderMeetbar(show) {
+  const v = state.view, live = v.meeting, def = v.meeting_defaults;
+  $('meetbar').classList.toggle('hidden', !show);
+  $('setup').classList.toggle('hidden', !!live);
+  $('status').classList.toggle('hidden', !live);
+  if (live) {
+    $('statusText').textContent = (live.rounds > 1 ? `${FORMAT_LABEL[live.format]} · round ${live.round} of ${live.rounds} · ` : '')
+      + ({speaking: 'bots talking', analysing: 'moderator analysing', final: 'writing the final answer',
+          starting: 'starting'}[live.phase] || live.phase)
+      + (live.stopping ? ' · stopping…' : '');
+    $('stopBtn').disabled = live.stopping || (live.phase === 'final' && !(v.queued || []).length);
+    $('input').placeholder = live.phase === 'final' ? 'Wait for the final answer…'
+      : 'Join in: every bot sees it on its next turn. With an @mention it runs as its own turn next…';
+    $('send').textContent = 'Add';
+    $('send').disabled = live.phase === 'final';
+    return;
+  }
+  $('input').placeholder = 'Message the room… @name to ask someone, #name for context (Enter to send)';
+  $('send').textContent = 'Send'; $('send').disabled = false;
+  if (!$('rounds').options.length)
+    $('rounds').innerHTML = [1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}">${n}</option>`).join('');
+  if (document.activeElement?.closest('#setup')) return;  // don't reset a control being used
+  $('rounds').value = def.rounds; $('asks').value = def.asks ?? 3; $('deep').checked = def.deep; $('format').value = def.format || 'roundtable';
+  const seats = (state.platforms?.credentials || []).filter(c => c.enabled);
+  $('seatsCfg').innerHTML = seats.map(c => `<label>${esc(c.platform)}<select data-seat="${esc(c.platform)}">`
+    + BUDGETS.map(([k, l]) => `<option value="${k}" ${(def.speakers[c.platform] || 'full') === k ? 'selected' : ''}>${l}</option>`).join('')
+    + '</select></label>').join('') || '<span class="muted">none set up - see Settings</span>';
+}
+$('stopBtn').onclick = async () => {
+  $('stopBtn').disabled = true;
+  state.view = await api(`/api/chats/${state.view.chat.id}/meeting/stop`, {method: 'POST'}); render(); watch();
+};
+
+function msgHtml(m, mother) {
+  const who = m.role === 'user' ? 'You' : (mother ? 'PRISM' : 'Platform');
+  let extra = '';
+  const meta = m.meta;
+  if (mother && meta) {
+    const ds = (meta.daughters || []).map(r =>
+      `<p><b>${esc(r.platform)}</b> <span class="muted">${esc(r.model)} · ${r.latency_s.toFixed(1)}s</span>
+         <span class="score">${meta.scores?.[r.platform] ?? '–'}</span></p>
+       <div class="muted">Task: ${esc(r.task.length > 200 ? r.task.slice(0, 200) + '…' : r.task)}</div>
+       ${r.error ? `<p class="err">${esc(r.error)}</p>` : `<pre>${esc(r.text)}</pre>`}`).join('');
+    const errs = (meta.errors || []).map(e => `<li class="err">${esc(e)}</li>`).join('');
+    extra = `<details><summary>Mother: ${esc(meta.mother)} · ${esc(meta.plan_reason || '')}</summary>
+      ${meta.judge_rationale ? `<p><b>Judge:</b> ${esc(meta.judge_rationale)}</p>` : ''}
+      ${errs ? `<ul>${errs}</ul>` : ''}${ds}</details>`;
+  }
+  return `<div class="msg ${m.role}"><div class="who">${who}</div>${rich(esc(m.content))}${extra}</div>`;
+}
+$('tabs').onclick = e => { const t = e.target.dataset.tab; if (t) { state.tab = t; render(); } };
+$('input').onkeydown = e => {
+  const first = suggestions()[0];
+  if (first && (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey))) { e.preventDefault(); return pick(first); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); $('suggest').classList.add('hidden'); $('composer').requestSubmit(); }
+};
+$('composer').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('input').value.trim();
+  const files = state.files || [];
+  if ((!text && !files.length) || state.busy) return;
+  const id = state.view.chat.id, body = {content: text, files: files.map(f => f.id)};
+  if (!state.view.meeting) {  // a new meeting: send its setup (remembered for next time)
+    body.rounds = +$('rounds').value; body.asks = +$('asks').value; body.deep = $('deep').checked; body.speakers = {};
+    body.format = $('format').value;
+    document.querySelectorAll('[data-seat]').forEach(s => body.speakers[s.dataset.seat] = s.value);
+  }
+  if (rec) rec.abort();  // stop listening: what was said is in the message
+  state.busy = true; $('send').disabled = true; $('input').value = '';
+  try { state.view = await api(`/api/chats/${id}/messages`, {method: 'POST', body});
+        state.files = []; renderAttached();
+        if (state.view.notice) notice(state.view.notice); }
+  catch (err) { $('input').value = text; if (err.message !== 'locked') alert(err.message); }
+  finally { render(); state.busy = false; loadChats(); watch(); }
+};
+
+/* ---------- attachments: uploaded at once, sent with the next message ---------- */
+function renderAttached() {
+  $('attached').innerHTML = (state.files || []).map((f, i) =>
+    `<span class="chip">📎 ${esc(f.name)} <button type="button" data-unattach="${i}" title="Remove">✕</button></span>`).join('');
+}
+$('attach').onclick = () => $('attachInput').click();
+$('attachInput').onchange = async () => {
+  state.files = state.files || [];
+  for (const f of $('attachInput').files) {
+    try {
+      const r = await fetch('/api/media?name=' + encodeURIComponent(f.name), {method: 'POST', body: f});
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || r.statusText);
+      state.files.push(data);
+    } catch (err) { alert(`${f.name}: ${err.message}`); }
+  }
+  $('attachInput').value = ''; renderAttached(); $('input').focus();
+};
+$('attached').onclick = e => {
+  const i = e.target.dataset.unattach; if (i === undefined) return;
+  state.files.splice(+i, 1); renderAttached();
+};
+
+/* ---------- voice: the browser's own speech recognition (Edge/Chrome), no API key ---------- */
+const Speech = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec = null;
+if (!Speech) { $('mic').disabled = true; $('mic').title = 'Voice input needs Edge or Chrome'; }
+$('mic').onclick = () => {
+  if (rec) { rec.stop(); return; }
+  const input = $('input'), base = input.value ? input.value.replace(/\s*$/, ' ') : '';
+  rec = new Speech();
+  rec.lang = navigator.language || 'en-US'; rec.continuous = true; rec.interimResults = true;
+  rec.onresult = e => {  // finished phrases stay; the phrase being spoken is replaced as it firms up
+    let said = '';
+    for (const r of e.results) said += r[0].transcript;
+    input.value = base + said.trim();
+  };
+  rec.onerror = e => { if (e.error !== 'no-speech' && e.error !== 'aborted') notice(`Voice: ${e.error}`); };
+  rec.onend = () => { rec = null; $('mic').classList.remove('on'); input.focus(); };
+  rec.start(); $('mic').classList.add('on'); notice('Listening… click 🎤 again to stop');
+};
+
+/* ---------- context ---------- */
+$('ctxForm').onsubmit = async e => {
+  e.preventDefault();
+  const name = $('ctxTitle').value.replace(/^#/, '').trim();
+  state.view = await api(`/api/chats/${state.view.chat.id}/context`, {method: 'POST',
+    body: {title: name, name, content: $('ctxContent').value, global: $('ctxGlobal').checked,
+           always: $('ctxAlways').checked}});
+  $('ctxTitle').value = $('ctxContent').value = ''; $('ctxGlobal').checked = $('ctxAlways').checked = false;
+  render(); notice(`Saved - use it with #${state.view.context.at(-1)?.name ?? name}`);
+};
+$('thread').onclick = async e => {
+  const id = e.target.dataset.save; if (!id) return;
+  const m = state.view.messages.find(x => String(x.id) === id);
+  const name = (prompt('Save as context named # (letters, digits, - or _):', '') || '').replace(/^#/, '').trim();
+  if (!name || !m) return;
+  try {
+    state.view = await api(`/api/chats/${state.view.chat.id}/context`, {method: 'POST',
+      body: {title: name, name, content: m.content}});
+    render(); notice(`Saved - use it with #${state.view.context.find(c => c.title === name)?.name || name}`);
+  } catch (err) { alert(err.message); }
+};
+
+function notice(text) {
+  document.getElementById('notice')?.remove();
+  document.body.insertAdjacentHTML('beforeend', `<div id="notice">${esc(text)}</div>`);
+  setTimeout(() => document.getElementById('notice')?.remove(), 3500);
+}
+
+/* @name and #name suggestions for the word being typed */
+function suggestions() {
+  const v = state.view, input = $('input');
+  const word = input.value.slice(0, input.selectionStart).match(/(?:^|\s)([@#])([\w-]*)$/);
+  if (!v || !word) return [];
+  const [, sigil, part] = word;
+  const names = sigil === '@'
+    ? (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform).concat(['all', 'moderator'])
+    : v.context.map(c => c.name);
+  return names.filter(n => n.startsWith(part.toLowerCase()) && n !== part.toLowerCase()).map(n => sigil + n);
+}
+function renderSuggest() {
+  const list = suggestions();
+  $('suggest').classList.toggle('hidden', !list.length);
+  $('suggest').innerHTML = list.map((x, i) => `<button type="button" class="${i ? '' : 'on'}" data-pick="${esc(x)}">${esc(x)}</button>`).join('');
+}
+function pick(token) {
+  const input = $('input'), at = input.selectionStart;
+  const before = input.value.slice(0, at).replace(/[@#][\w-]*$/, token + ' ');
+  input.value = before + input.value.slice(at);
+  input.selectionStart = input.selectionEnd = before.length;
+  input.focus(); renderSuggest();
+}
+$('input').oninput = renderSuggest;
+$('input').onclick = renderSuggest;
+$('suggest').onclick = e => { const t = e.target.dataset.pick; if (t) pick(t); };
+$('ctxList').onclick = async e => {
+  const id = e.target.dataset.ctxdel; if (!id) return;
+  await api(`/api/context/${id}`, {method: 'DELETE'}); openChat(state.view.chat.id);
+};
+
+/* ---------- settings ---------- */
+async function loadPlatforms() {
+  state.platforms = await api('/api/platforms');
+  const p = state.platforms;
+  $('motherLabel').textContent = p.primary ? `Mother: ${p.primary}` : 'No primary set';
+}
+$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); };
+$('closeSettings').onclick = () => { $('settings').classList.add('hidden'); if (state.view) render(); };
+
+function renderSettings(drafts = {}) {
+  const {catalog, credentials, primary} = state.platforms;
+  const creds = Object.fromEntries(credentials.map(c => [c.platform, c]));
+  $('primary').innerHTML = '<option value="">Pick one…</option>' + Object.entries(catalog).map(([id, s]) =>
+    `<option value="${id}" ${primary === id ? 'selected' : ''} ${creds[id] ? '' : 'disabled'}>${esc(s.label)}${creds[id] ? '' : ' (not set up)'}</option>`).join('');
+  $('plats').innerHTML = Object.entries(catalog).map(([id, s]) => {
+    const c = creds[id] || {model: s.default_model, enabled: true, transport: s.web ? 'browser' : 'api'};
+    const transport = drafts[id] || c.transport;
+    const browser = transport === 'browser';
+    const needsKey = s.needs_secret !== false;
+    const saved = creds[id] && creds[id].transport === transport;
+    return `<div class="plat" data-p="${id}">
+      <div class="plat-head"><b>${esc(s.label)}</b>
+        <span class="muted" style="font-size:12px">${creds[id] ? (c.enabled ? '<span class="ok">enabled</span>' : 'disabled') : 'not set up'}</span></div>
+      <div class="plat-grid">
+        <label>Connection<select data-f="transport">
+          <option value="api" ${!browser ? 'selected' : ''}>API key</option>
+          ${s.web ? `<option value="browser" ${browser ? 'selected' : ''}>Browser (sign in to the web app)</option>` : ''}</select></label>
+        <label class="${browser ? 'hidden' : ''}">Model<input data-f="model" value="${esc(c.model)}"></label>
+        <label class="${browser || !needsKey ? 'hidden' : ''}">API key<input data-f="secret" type="password" placeholder="${c.has_secret ? 'stored, leave blank to keep' : 'paste key'}"></label>
+        <label class="${browser || needsKey ? 'hidden' : ''}">Base URL<input data-f="base_url" value="${esc(c.base_url || s.base_url || '')}"></label>
+        <label style="align-self:end"><span><input type="checkbox" data-f="enabled" ${c.enabled ? 'checked' : ''}> Enabled</span></label>
+      </div>
+      <div class="plat-actions">
+        <button class="primary" data-act="save">Save</button>
+        ${creds[id] ? '<button data-act="remove">Remove</button>' : ''}
+        ${browser && saved ? '<button data-act="connect">Connect (sign in)</button><button data-act="doctor">Check</button><button data-act="selectors">Selectors</button>' : ''}
+        <span class="muted" data-out style="font-size:12px"></span>
+      </div>
+      ${browser ? `<div class="note" style="margin-top:8px">${saved ? '' : 'Save first. '}Connect opens the site in PRISM's own browser. Sign in there once; the session is kept between runs. Then press Check.</div>` : ''}
+      <div data-detail></div>
+    </div>`;
+  }).join('');
+}
+$('primary').onchange = async e => { if (!e.target.value) return;
+  state.platforms = await api('/api/primary', {method: 'PUT', body: {platform: e.target.value}});
+  loadPlatforms(); };
+$('plats').onchange = e => {
+  if (e.target.dataset.f !== 'transport') return;  // re-render with the other connection type's fields
+  const drafts = {};
+  document.querySelectorAll('#plats .plat').forEach(b => drafts[b.dataset.p] = b.querySelector('[data-f="transport"]').value);
+  renderSettings(drafts);
+};
+$('plats').onclick = async e => {
+  const act = e.target.dataset.act; if (!act) return;
+  const box = e.target.closest('.plat'), p = box.dataset.p;
+  const out = box.querySelector('[data-out]'), detail = box.querySelector('[data-detail]');
+  const f = name => box.querySelector(`[data-f="${name}"]`);
+  out.className = 'muted'; out.textContent = '…';
+  try {
+    if (act === 'save') {
+      const body = {transport: f('transport').value, model: f('model').value, enabled: f('enabled').checked,
+                    base_url: f('base_url').value || null};
+      if (f('secret').value) body.secret = f('secret').value;
+      state.platforms = await api(`/api/credentials/${p}`, {method: 'PUT', body});
+      if (!state.platforms.primary) state.platforms = await api('/api/primary', {method: 'PUT', body: {platform: p}});
+      await loadPlatforms(); renderSettings(); return;
+    }
+    if (act === 'remove') { await api(`/api/credentials/${p}`, {method: 'DELETE'}); await loadPlatforms(); renderSettings(); return; }
+    if (act === 'connect') {
+      let r;
+      try { r = await api(`/api/platforms/${p}/connect`, {method: 'POST'}); }
+      catch (err) {  // a meeting is running: signing in restarts the browser it uses
+        if (!err.message.startsWith('Signing in restarts') || !confirm(err.message)) throw err;
+        r = await api(`/api/platforms/${p}/connect?stop=true`, {method: 'POST'});
+        if (state.view) openChat(state.view.chat.id);
+      }
+      out.textContent = `Opened ${r.opened}. Sign in there, then press Check.`; return; }
+    if (act === 'doctor') {
+      const r = await api(`/api/platforms/${p}/doctor`);
+      out.className = r.logged_in ? 'ok' : 'err';
+      out.textContent = r.logged_in ? `Signed in, message box found (${r.message_box}).`
+        : r.message_box ? 'Not signed in (the site shows a Log in button).' : 'Not signed in, or no message box found.';
+      const inputs = (r.inputs_on_page || []).map(e => '  ' + Object.entries(e).map(([k, v]) => `${k}=${v}`).join(' '));
+      detail.innerHTML = `<pre>${esc(r.url)} · ${esc(r.title || '')}\n` + Object.entries(r.checks).map(([k, c]) =>
+        `${k.padEnd(18)} ${c.matches === null ? '(not set)' : c.matches + ' match(es)'}   ${esc(c.selector)}`).join('\n')
+        + (inputs.length ? `\n\nOn the page (text boxes first):\n${esc(inputs.join('\n'))}` : '') + '</pre>';
+      return;
+    }
+    if (act === 'selectors') {
+      const r = await api(`/api/platforms/${p}/selectors`);
+      out.textContent = 'Overrides replace the built-in selectors when a site changes its layout.';
+      detail.innerHTML = `<textarea data-sel>${esc(JSON.stringify(r.effective, null, 2))}</textarea>
+        <div class="plat-actions"><button data-act="saveSelectors">Save selectors</button><button data-act="resetSelectors">Reset to built-in</button></div>`;
+      return;
+    }
+    if (act === 'saveSelectors' || act === 'resetSelectors') {
+      const body = act === 'resetSelectors' ? {} : JSON.parse(box.querySelector('[data-sel]').value);
+      await api(`/api/platforms/${p}/selectors`, {method: 'PUT', body});
+      out.className = 'ok'; out.textContent = 'Saved.'; detail.innerHTML = ''; return;
+    }
+  } catch (err) { out.className = 'err'; out.textContent = err.message; }
+};
+
+$('menuBtn').onclick = () => $('side').classList.toggle('open');
+$('ctxBtn').onclick = () => $('ctx').classList.toggle('open');
+boot();
+</script>
+</body>
+</html>
