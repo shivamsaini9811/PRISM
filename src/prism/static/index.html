@@ -93,6 +93,7 @@
 
   #ctx h3, .modal h3 { margin:0 0 8px; font-size:14px; }
   #ctxList { flex:1; overflow:auto; padding:0 12px; }
+  #profileBar { margin:0 12px 8px; } #profileBar p { max-height:none; }
   .ctx-item { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:8px; margin-bottom:8px; font-size:12.5px; }
   .ctx-item b { display:flex; justify-content:space-between; gap:6px; }
   .ctx-item b button { border:0; background:none; padding:0; color:var(--muted); }
@@ -179,11 +180,12 @@
     </form>
     <div id="help" class="muted hidden"><b>@claude</b> asks one · <b>@claude @gpt</b> asks several · <b>@all</b> or no @ asks everyone switched on · <b>@moderator</b> sums up ·
       <b>#name</b> attaches saved context · <b>/save #name</b> [text] saves the last answer (or the text) · <b>/save-global #name</b> · <b>/forget #name</b><br>
-      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all)</div>
+      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
   </main>
 
   <section id="ctx">
     <div class="pad"><h3>Context</h3><div class="muted" style="font-size:12px">Write <b>#name</b> in a message to give it to the room. Items marked <i>always</i> go with every message. Global items work in every chat.</div></div>
+    <div id="profileBar" class="ctx-item"></div>
     <div id="ctxList"></div>
     <form id="ctxForm" class="hidden">
       <input id="ctxTitle" placeholder="#name (e.g. spec)" required>
@@ -306,14 +308,14 @@ function watch() {
   clearTimeout(state.poll);
   const v = state.view;
   const recalling = v?.messages.some(m => m.meta?.pending);
-  if (!v?.meeting && !recalling) return;
+  if (!v?.meeting && !recalling && !v?.profile?.updating) return;
   state.poll = setTimeout(async () => {
     if (state.view?.chat.id !== v.chat.id) return;
     try {
       const fresh = await api(`/api/chats/${v.chat.id}`);
       if (state.view?.chat.id !== v.chat.id) return;
       const sig = x => JSON.stringify([x.messages.length, x.meeting, x.daughters.map(d => d.messages.length),
-                                       x.context.length, x.messages.filter(m => m.meta?.pending).length]);
+                                       x.context.length, x.messages.filter(m => m.meta?.pending).length, x.profile]);
       const changed = sig(fresh) !== sig(v);
       state.view = fresh;
       if (changed) render();
@@ -350,6 +352,11 @@ function render() {
   renderMeetbar(!d);
   $('help').classList.toggle('hidden', !!d);
 
+  const pr = v.profile || {mode: 'off'};
+  $('profileBar').innerHTML = `<b><span>Your profile ${pr.mode === 'auto' ? '<span class="tag">on</span>' : '<span class="tag">off</span>'}</span></b>
+    <p>${pr.mode === 'auto' ? 'PRISM keeps #profile (about you) up to date from your chats; every chat gets it.' : 'Off: #profile is not updated.'}${pr.updating ? ' Updating…' : pr.last ? ` Last: ${esc(pr.last)}.` : ''}</p>
+    <div class="plat-actions"><button data-profile="${pr.mode === 'auto' ? 'off' : 'auto'}">${pr.mode === 'auto' ? 'Turn off' : 'Turn on'}</button>
+    <button data-profile="update" ${pr.updating ? 'disabled' : ''}>Update now</button></div>`;
   $('ctxList').innerHTML = v.context.map(c =>
     `<div class="ctx-item"><b><span>#${esc(c.name)} ${c.chat_id == null ? '<span class="tag">global</span>' : ''}
        ${c.always ? '<span class="tag">always</span>' : ''}</span>
@@ -744,6 +751,17 @@ $('plats').onclick = async e => {
 
 $('menuBtn').onclick = () => $('side').classList.toggle('open');
 $('ctxBtn').onclick = () => $('ctx').classList.toggle('open');
+$('profileBar').onclick = async e => {
+  const act = e.target.dataset.profile;
+  if (!act || !state.view) return;
+  try {
+    if (act === 'update') {
+      const r = await api('/api/profile/update', {method: 'POST'});
+      notice(r.started ? 'Updating your profile from your chats…' : 'Nothing new to learn about you yet, or no primary LLM set.');
+    } else await api('/api/profile', {method: 'PUT', body: {mode: act}});
+    openChat(state.view.chat.id);
+  } catch (err) { notice(err.message); }
+};
 boot();
 </script>
 </body>

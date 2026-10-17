@@ -244,6 +244,36 @@ class Store:
                  "meta": json.loads(r["meta_json"]) if r["meta_json"] else None,
                  "created_at": r["created_at"]} for r in rows]
 
+    def user_messages_after(self, after_id: int, limit: int = 60) -> list[dict]:
+        """What the user wrote in any chat (room messages), newest `limit`, oldest first."""
+        rows = self._q(
+            "SELECT m.id, m.content, m.meta_json, m.created_at, c.title FROM messages m"
+            " JOIN chats c ON c.id = m.chat_id WHERE m.id > ? AND m.daughter_id IS NULL"
+            " AND m.role = 'user' AND m.content != '' ORDER BY m.id DESC LIMIT ?", (after_id, limit * 3))
+        said = [dict(r) for r in rows  # not the #context items attached to a message
+                if (json.loads(r["meta_json"] or "{}")).get("kind") in ("topic", "user")]
+        return list(reversed(said[:limit]))
+
+    def search_messages(self, words: list[str], exclude_chat: int | None = None,
+                        limit: int = 6, scan: int = 400) -> list[dict]:
+        """Room messages from any chat containing the words, best match first (most words,
+        then newest). Plain LIKE: no full-text index needed."""
+        if not words:
+            return []
+        where = " OR ".join("m.content LIKE ?" for _ in words)
+        rows = self._q(
+            "SELECT m.id, m.chat_id, m.role, m.content, m.meta_json, m.created_at, c.title"
+            " FROM messages m JOIN chats c ON c.id = m.chat_id"
+            f" WHERE m.daughter_id IS NULL AND m.content != '' AND m.chat_id IS NOT ? AND ({where})"
+            " ORDER BY m.id DESC LIMIT ?",
+            (exclude_chat, *(f"%{w}%" for w in words), scan))
+        def score(r):
+            text = r["content"].lower()
+            return sum(w.lower() in text for w in words)
+        best = sorted(rows, key=lambda r: (-score(r), -r["id"]))[:limit]
+        return [{**dict(r), "meta": json.loads(r["meta_json"]) if r["meta_json"] else {}}
+                for r in best]
+
     # --- context store --------------------------------------------------------------
 
     def add_context(self, chat_id: int | None, title: str, content: str,

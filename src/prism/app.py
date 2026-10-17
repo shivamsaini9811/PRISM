@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -371,6 +372,7 @@ def chat_view(chat_id: int) -> dict:
         "meeting": meeting,
         "queued": [q.content for q in _queued.get(chat_id, [])],
         "meeting_defaults": meeting_defaults(),
+        "profile": profile_state(),
     }
 
 
@@ -400,6 +402,7 @@ MENTION = re.compile(r"(?<![\w.])@([A-Za-z][\w-]*)")
 CONTEXT_REF = re.compile(r"(?<![\w&#])#([A-Za-z][\w-]*)")   # "C#" and "#1" are not references
 COMMAND = re.compile(r"^/(save|save-global|forget)\s+#([A-Za-z][\w-]*)\s*(.*)$", re.S)
 RECALL = re.compile(r"^/recall\s+@([A-Za-z][\w-]*)\s+#([A-Za-z][\w-]*)\s*(.*)$", re.S)
+PROFILE_CMD = re.compile(r"^/profile(?:\s+(on|off|update))?\s*$", re.I)
 # A task plan: lines that start with @mentions ("1. @gpt write it", "then @claude review").
 PLAN_LINE = re.compile(r"^\s*(?:\d+[.)]\s*|[-*\u2022]\s*|then\s+|->\s*|\u2192\s*)?"
                        r"((?:@[A-Za-z][\w-]*[\s,]*(?:and\s+|&\s*)?)+)(.*)$", re.I)
@@ -489,6 +492,9 @@ async def send(chat_id: int, body: SendIn) -> dict:
         text = "(see the attached files)"
     if not text:
         raise HTTPException(400, "Empty message")
+    if cmd := PROFILE_CMD.match(text):
+        notice = profile_command((cmd.group(1) or "update").lower())
+        return {**chat_view(chat_id), "notice": notice}
     if cmd := RECALL.match(text):
         notice = start_recall(chat_id, *cmd.groups())  # first: the view shows its pending card
         return {**chat_view(chat_id), "notice": notice}
@@ -522,6 +528,9 @@ def context_command(chat_id: int, verb: str, name: str, text: str) -> str:
         return f"Forgot #{name}."
     content = text.strip() or latest_answer(chat_id)
     scope = None if verb == "save-global" else chat_id
+    if scope is None and name == PROFILE:  # the user editing their profile by hand
+        s.add_context(None, PROFILE_TITLE, content, name=PROFILE, always=True)
+        return "Saved your profile (#profile) - every chat gets it."
     s.add_context(scope, name, content, name=name)
     return f"Saved #{name}{' (global)' if scope is None else ''} - use it with #{name}."
 
@@ -576,6 +585,141 @@ def start_recall(chat_id: int, platform: str, name: str, direction: str) -> str:
     _recalls.add(task)
     task.add_done_callback(_recalls.discard)
     return f"Recalling #{name} from {platform}: it appears under Context (global) when done."
+
+
+# --- the user's profile: what PRISM's own chats say about the user -------------------------
+
+PROFILE, PROFILE_TITLE = "profile", "About you (kept by PRISM from your chats)"
+PROFILE_EVERY = 3        # new things the user said before an automatic update
+PROFILE_MAX_CHARS = 2500
+PROFILE_PROMPT = (
+    "You keep a short profile of me for the AI assistants I use, so they know who I am. Below "
+    "is my current profile, then things I wrote recently in my chats.\n\n"
+    "CURRENT PROFILE:\n{profile}\n\nWHAT I WROTE RECENTLY (chat title: message):\n{said}\n\n"
+    "Write my full updated profile: only lasting facts about me that I stated or clearly "
+    "implied - who I am, my work and projects, goals, preferences (including how I like answers), "
+    "constraints, and decisions I made. Leave out one-off requests and anything about the AI "
+    "assistants themselves. Keep everything from the current profile that is still true. Short "
+    "bullet points under a few headings, at most 300 words. Plain text in this chat, no "
+    "documents. If nothing lasting is new, reply with exactly: UNCHANGED")
+_profile_task: dict[str, asyncio.Task | None] = {"task": None}
+
+
+def profile_mode() -> str:
+    return store().get_meta("profile_mode") or "auto"  # auto | off
+
+
+def profile_state() -> dict:
+    task = _profile_task["task"]
+    return {"mode": profile_mode(), "updating": bool(task and not task.done()),
+            "last": store().get_meta("profile_last") or ""}
+
+
+def profile_command(arg: str) -> str:
+    if arg in ("on", "off"):
+        store().set_meta("profile_mode", "auto" if arg == "on" else "off")
+        return ("Profile on: PRISM keeps #profile (about you) up to date from your chats, and "
+                "every chat gets it." if arg == "on" else
+                "Profile off: #profile is no longer updated (it stays until you /forget #profile).")
+    if not maybe_update_profile(force=True):
+        return "Nothing new to learn about you yet, or no primary LLM is set up."
+    return "Updating your profile from your chats - it appears as #profile under Context."
+
+
+def maybe_update_profile(force: bool = False) -> bool:
+    """After a meeting (or on /profile): if the user said enough new things since the last
+    update, the primary LLM rewrites #profile from them, in the background. The profile is
+    a global, always-sent context item; it is only rewritten when it actually changed,
+    because a change makes every bot re-read the context on its next turn."""
+    s = store()
+    if (profile_mode() == "off" and not force) or _vault["key"] is None:
+        return False
+    task = _profile_task["task"]
+    if task and not task.done():
+        return False
+    seen = int(s.get_meta("profile_seen_id") or 0)
+    said = s.user_messages_after(seen)
+    if not said or (len(said) < PROFILE_EVERY and not force):
+        return False
+    primary = s.get_meta("primary_platform")
+    creds = {c["platform"]: c for c in s.enabled_credentials(vault())}
+    if primary not in creds:
+        return False
+    current = next((c for c in s.context_for(0) if c["name"] == PROFILE and c["chat_id"] is None), None)
+    lines, used = [], 0
+    for m in reversed(said):  # the newest first, up to about 12k characters
+        line = f"{m['title'][:50]}: {' '.join(m['content'].split())[:1500]}"
+        if used + len(line) > 12_000:
+            break
+        lines.append(line)
+        used += len(line)
+    prompt = PROFILE_PROMPT.format(profile=current["content"] if current else "(none yet)",
+                                   said="\n".join(reversed(lines)))
+    provider = make_provider(creds[primary], fresh=True)
+
+    async def run() -> None:
+        try:
+            text = (await asyncio.wait_for(provider.complete([{"role": "user", "content": prompt}]),
+                                           settings().request_timeout_s)).strip()
+        except Exception as e:
+            log.warning("profile update failed: %s", e)
+            s.set_meta("profile_last", f"failed: {type(e).__name__}")
+            return  # not marked as read: the next update tries these messages again
+        new = text if len(text) >= 40 and "UNCHANGED" not in text[:40] else None
+        if new and (not current or new != current["content"]):
+            s.add_context(None, PROFILE_TITLE, new[:PROFILE_MAX_CHARS], name=PROFILE, always=True)
+            s.set_meta("profile_last", f"updated from {len(said)} messages")
+        else:
+            s.set_meta("profile_last", "checked - nothing new")
+        s.set_meta("profile_seen_id", str(said[-1]["id"]))
+
+    _profile_task["task"] = asyncio.create_task(run())
+    return True
+
+
+class ProfileIn(BaseModel):
+    mode: str
+
+
+@app.put("/api/profile")
+def put_profile(body: ProfileIn) -> dict:
+    if body.mode not in ("auto", "off"):
+        raise HTTPException(400, "mode is auto or off")
+    store().set_meta("profile_mode", body.mode)
+    return profile_state()
+
+
+@app.post("/api/profile/update")
+async def update_profile() -> dict:
+    vault()
+    return {**profile_state(), "started": maybe_update_profile(force=True)}
+
+
+# --- ASK @prism: the user's past chats in PRISM itself, searched locally --------------------
+
+PRISM_BOT = "prism"
+STOPWORDS = set("""a an and are as at be but by can did do does for from has have how i in is it
+its me my of on or so that the their them they this to user user's was what when where which who
+why will with you your about any all know tell past chat chats""".split())
+
+
+def search_history(question: str, chat_id: int | None) -> str:
+    words = [w for w in dict.fromkeys(re.findall(r"[\w'-]{3,}", question.lower())) if w not in STOPWORDS]
+    hits = store().search_messages(words[:8], exclude_chat=chat_id)
+    if not hits:
+        return "Nothing in the user's past PRISM chats matches that."
+    out = []
+    for h in hits:
+        who = "the user" if h["role"] == "user" else h["meta"].get("speaker") or "a bot"
+        text, at = " ".join(h["content"].split()), 0
+        for w in words:
+            if (i := text.lower().find(w)) >= 0:
+                at = max(0, i - 150)
+                break
+        snippet = ("…" if at else "") + text[at:at + 700] + ("…" if len(text) > at + 700 else "")
+        day = time.strftime("%Y-%m-%d", time.localtime(h["created_at"]))
+        out.append(f"- {day}, chat \"{h['title'][:50]}\", {who}: {snippet}")
+    return "From the user's past PRISM chats:\n" + "\n".join(out)
 
 
 def latest_answer(chat_id: int) -> str:
@@ -712,12 +856,15 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         "speakers": speakers, "mentions": mentions, **({"files": body.files} if body.files else {})})
     room.append(topic)
     async def ask(platform: str, question: str) -> str:
-        """A bot's ASK: a new chat on that platform, so its memory of the user applies."""
+        """A bot's ASK: a new chat on that platform, so its memory of the user applies;
+        @prism searches the user's other PRISM chats."""
+        if platform == PRISM_BOT:
+            return search_history(question, chat_id)
         return await make_provider(creds[platform], fresh=True).complete(
             [{"role": "user", "content": ASK_PROMPT.format(question=question)}])
 
     # Memory lives in the signed-in web apps; API models remember nothing between calls.
-    askable = [p for p, c in creds.items() if c["transport"] == "browser"]
+    askable = [PRISM_BOT] + [p for p, c in creds.items() if c["transport"] == "browser"]
     session = Session(room, members, script, emit, context=context_block(context_items),
                       timeout=settings().request_timeout_s, deep=opts["deep"],
                       ask=ask, askable=askable, max_asks=opts["asks"])
@@ -742,6 +889,10 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         finally:
             _session_tasks.pop(chat_id, None)
             if not cancelled:
+                try:
+                    maybe_update_profile()
+                except Exception:
+                    log.exception("could not start the profile update")
                 await start_next_queued(chat_id)
 
     _session_tasks[chat_id] = asyncio.create_task(run())

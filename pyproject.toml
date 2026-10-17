@@ -1,6 +1,6 @@
 [project]
 name = "prism"
-version = "0.6.5"
+version = "0.6.6"
 description = "PRISM - Parallel Routing, Inter-model Scoring & Merging across multiple AI models"
 readme = "README.md"
 requires-python = ">=3.10"

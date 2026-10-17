@@ -137,6 +137,7 @@ def test_context_added_mid_chat_is_resent_to_bound_daughters(client):
     client.put("/api/credentials/claude", json={"secret": "sk-x"})
     client.put("/api/credentials/gpt", json={"transport": "browser"})
     client.put("/api/primary", json={"platform": "claude"})
+    client.put("/api/profile", json={"mode": "off"})  # its updates are calls too
     chat = client.post("/api/chats").json()["id"]
     def send():
         client.post(f"/api/chats/{chat}/messages", json={"content": "Q?", "format": "chat"})
@@ -426,3 +427,92 @@ async def test_layout_advice_comes_from_another_assistant(client, monkeypatch):
     async with app_mod.browsers().lock("claude"):  # busy: asking it could wait on us
         client.delete("/api/credentials/gemini")
         assert await app_mod.layout_advisor("gpt")("which box?") == ""
+
+
+def wait_profile(client, chat):
+    for _ in range(200):
+        v = client.get(f"/api/chats/{chat}").json()
+        if not v["profile"]["updating"]:
+            return v
+        time.sleep(0.02)
+    raise AssertionError("profile update did not finish")
+
+
+def test_profile_is_kept_from_what_the_user_says(client, monkeypatch):
+    prompts = []
+
+    class ProfileWriter(Fake):
+        async def complete(self, messages, system=None):
+            prompts.append(messages[-1]["content"])
+            return "UNCHANGED" if len(prompts) > 1 else "- Runs marathons; knee injury in 2025\n- Prefers short answers"
+
+    def provider(cred, **kw):
+        f = ProfileWriter(cred["platform"]) if kw.get("fresh") else Fake(cred["platform"])
+        f.thread_url = None
+        return f
+    monkeypatch.setattr(app_mod, "make_provider", provider)
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"transport": "browser"})
+    client.put("/api/primary", json={"platform": "gpt"})
+    chat = client.post("/api/chats").json()["id"]
+    for text in ("@gpt I run marathons", "@gpt my knee hurts since 2025"):
+        client.post(f"/api/chats/{chat}/messages", json={"content": text, "format": "chat"})
+        wait_meeting(client, chat)
+    assert not prompts  # two new messages: not enough for an update yet
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt keep answers short", "format": "chat"})
+    v = wait_profile(client, wait_meeting(client, chat)["chat"]["id"])
+    assert len(prompts) == 1 and "I run marathons" in prompts[0] and "keep answers short" in prompts[0]
+    item = next(c for c in v["context"] if c["name"] == "profile")
+    assert item["chat_id"] is None and item["always"] and "marathons" in item["content"]
+    assert v["profile"]["last"] == "updated from 3 messages"
+
+    # Every chat gets it.
+    other = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{other}/messages", json={"content": "@gpt hi", "format": "chat"})
+    wait_meeting(client, other)
+    # /profile forces an update; UNCHANGED keeps the profile as it was.
+    r = client.post(f"/api/chats/{chat}/messages", json={"content": "/profile"}).json()
+    assert r["notice"].startswith("Updating your profile")
+    v = wait_profile(client, chat)
+    assert "@gpt hi" in prompts[1] and "I run marathons" not in prompts[1].split("RECENTLY")[1]
+    assert next(c for c in v["context"] if c["name"] == "profile")["content"] == item["content"]
+    assert v["profile"]["last"] == "checked - nothing new"
+
+    # Off: no more updates. Editing it by hand keeps it going to every chat.
+    client.post(f"/api/chats/{chat}/messages", json={"content": "/profile off"})
+    assert client.get(f"/api/chats/{chat}").json()["profile"]["mode"] == "off"
+    client.post(f"/api/chats/{chat}/messages", json={"content": "/save-global #profile I am a runner."})
+    item = next(c for c in client.get(f"/api/chats/{chat}").json()["context"] if c["name"] == "profile")
+    assert item["always"] and item["content"] == "I am a runner."
+
+
+def test_ask_prism_searches_the_users_other_chats(client, monkeypatch):
+    from test_meeting import Asker
+    questions = []
+
+    class PrismAsker(Asker):
+        async def complete(self, messages, system=None):
+            self.calls.append((messages, system))
+            if len(self.calls) == 1:
+                questions.append(system)
+                return "ASK @prism: knee injury decision"
+            return "grok used: " + messages[-1]["content"]
+
+    def provider(cred, **kw):
+        f = PrismAsker(cred["platform"]) if cred["platform"] == "grok" else Fake(cred["platform"])
+        f.thread_url = None
+        return f
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    old = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{old}/messages", json={"content": "@gpt I decided to rest my knee injury for 6 weeks", "format": "chat"})
+    wait_meeting(client, old)
+    client.put("/api/credentials/grok", json={"secret": "k"})
+    monkeypatch.setattr(app_mod, "make_provider", provider)
+    chat = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@grok what about my knee?", "format": "chat"})
+    v = wait_meeting(client, chat)
+    assert "ASK @prism" in questions[0]  # offered even with no web platforms set up
+    lookup = next(m for m in v["messages"] if m["meta"]["kind"] == "lookup")
+    assert lookup["meta"]["speaker"] == "prism" and "rest my knee injury for 6 weeks" in lookup["content"]
+    assert "rest my knee" in v["messages"][-1]["content"]
