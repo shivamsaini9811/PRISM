@@ -9,9 +9,14 @@ from prism.browser import (BotCheck, BrowserManager, BrowserProvider, NotLoggedI
 from prism.browser.adapter import clean_reply
 
 FAKE_CHAT = """<!doctype html><html><body>
+<nav><textarea id="search" placeholder="Search chats" style="width:90px;height:18px"></textarea></nav>
 <div id="log"></div>
 <textarea id="composer"></textarea><input type="file" id="upload" multiple hidden><button id="send">Send</button>
 <script>
+if (location.hash === '#input') {  // a message box that isn't a text area: nothing generic finds it
+  const i = document.createElement('input'); i.type = 'text'; i.id = 'composer';
+  i.style.cssText = 'width:600px;height:40px'; document.getElementById('composer').replaceWith(i);
+}
 let n = 0;
 const delay = location.hash === '#slow' ? 3000 : 400, virtual = location.hash === '#virtual';  // #slow: the model thinks first
 document.getElementById('composer').onkeydown = e => {  // Enter sends, like real chat sites
@@ -241,3 +246,43 @@ async def test_recovers_after_the_browser_dies(manager):
     await page.close()
     p = BrowserProvider("fake", manager, SiteAdapter(CONFIG, load_timeout_s=10))
     assert await p.complete([{"role": "user", "content": "back"}]) == "echo: back"
+
+
+async def test_renamed_reply_is_read_by_watching_the_page_and_learned(manager):
+    # The site renamed its reply blocks: the configured selector never matches.
+    learned = []
+    cfg = CONFIG.with_overrides({"assistant_message": ".bot-answer-v2", "streaming": ".gone"})
+    adapter = SiteAdapter(cfg, load_timeout_s=5, on_learn=learned.append, fallback_after_s=1)
+    p = BrowserProvider("fake", manager, adapter)
+    reply = await asyncio.wait_for(p.complete([{"role": "user", "content": "where did it go"}]), 30)
+    assert reply == "echo: where did it go"
+    assert learned == [{"assistant_message": "div.assistant"}]
+    assert p.notes and "reply layout changed" in p.notes[0]
+    # Next turn uses what was learned, straight away.
+    reply2 = await asyncio.wait_for(p.complete([{"role": "user", "content": "where did it go"},
+                                                {"role": "assistant", "content": reply},
+                                                {"role": "user", "content": "and now"}]), 30)
+    assert reply2 == "echo: and now" and p.notes == []
+
+
+async def test_renamed_message_box_is_found_not_the_sidebar_search(manager):
+    learned = []
+    cfg = CONFIG.with_overrides({"composer": "#prompt-v2"})
+    p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=15, on_learn=learned.append))
+    assert await p.complete([{"role": "user", "content": "hello box"}]) == "echo: hello box"
+    assert learned == [{"composer": "textarea#composer"}]
+
+
+async def test_another_assistant_finds_an_unusual_message_box(manager):
+    questions = []
+
+    async def advisor(question):
+        questions.append(question)
+        line = next(x for x in question.splitlines() if "tag=input" in x)
+        return line.split()[0].removeprefix("n=")
+
+    cfg = CONFIG.with_overrides({"composer": "#prompt-v2", "new_chat_url": "http://fake.test/new#input"})
+    p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=3, advisor=advisor))
+    assert await p.complete([{"role": "user", "content": "odd box"}]) == "echo: odd box"
+    assert len(questions) == 1 and "odd box" not in questions[0]  # no chat text goes out
+    assert any("another assistant" in n for n in p.notes)

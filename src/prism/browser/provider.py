@@ -21,6 +21,7 @@ class BrowserProvider(Provider):
         self.thread_url = thread_url
         self.fresh = fresh
         self.resend_system = resend_system
+        self.notes: list[str] = []
 
     async def complete(self, messages: list[Message], system: str | None = None) -> str:
         return await self.complete_with_files(messages, system)
@@ -38,6 +39,7 @@ class BrowserProvider(Provider):
             try:
                 await self.adapter.open(page, None if self.fresh else self.thread_url)
                 reply = await self.adapter.send(page, text, files=files)
+                self.notes = list(self.adapter.notes)  # the site's layout changed: what PRISM did
                 if not self.fresh:
                     self.thread_url = page.url  # binds the daughter to the remote conversation
                 self.resend_system = False  # the remote chat has it now

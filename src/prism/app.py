@@ -76,9 +76,48 @@ def chat_or_404(chat_id: int) -> dict:
     return chat
 
 
+def _meta_json(key: str) -> dict:
+    raw = store().get_meta(key)
+    return json.loads(raw) if raw else {}
+
+
 def site_config(platform: str) -> SiteConfig:
-    overrides = store().get_meta(f"site:{platform}")
-    return SITES[platform].with_overrides(json.loads(overrides) if overrides else None)
+    """Built-in selectors, then what PRISM learned when the site changed its layout, then
+    the user's own overrides."""
+    return SITES[platform].with_overrides(_meta_json(f"learned:{platform}")) \
+        .with_overrides(_meta_json(f"site:{platform}"))
+
+
+def remember_layout(platform: str, learned: dict) -> None:
+    log.warning("%s changed its layout - learned %s", platform, learned)
+    store().set_meta(f"learned:{platform}", json.dumps({**_meta_json(f"learned:{platform}"), **learned}))
+
+
+LAYOUT_ADVICE_TIMEOUT_S = 120
+
+
+def layout_advisor(platform: str):
+    """When PRISM can't find a site's message box itself, it asks another assistant: an API
+    one if there is one (fast), else another signed-in site that isn't busy (waiting on a
+    busy one could wait on this very site's turn)."""
+    async def advise(question: str) -> str:
+        try:
+            creds = [c for c in store().enabled_credentials(vault()) if c["platform"] != platform]
+        except HTTPException:
+            creds = []
+        creds.sort(key=lambda c: c["transport"] != "api")
+        for cred in creds:
+            if cred["transport"] == "browser" and (cred["platform"] not in SITES
+                                                   or browsers().lock(cred["platform"]).locked()):
+                continue
+            try:
+                helper = make_provider(cred, fresh=True, advisor=False)
+                return await asyncio.wait_for(
+                    helper.complete([{"role": "user", "content": question}]), LAYOUT_ADVICE_TIMEOUT_S)
+            except Exception as e:
+                log.warning("layout advice from %s failed: %s", cred["platform"], e)
+        return ""
+    return advise
 
 
 def media_dir() -> Path:
@@ -86,19 +125,21 @@ def media_dir() -> Path:
     return data_dir() / "media"
 
 
-def site_adapter(platform: str) -> SiteAdapter:
+def site_adapter(platform: str, advisor: bool = True) -> SiteAdapter:
     # Failed page loads leave a screenshot here, named in the error message.
     return SiteAdapter(site_config(platform), screenshot_dir=data_dir() / "screenshots",
-                       media_dir=media_dir())
+                       media_dir=media_dir(),
+                       on_learn=lambda learned: remember_layout(platform, learned),
+                       advisor=layout_advisor(platform) if advisor else None)
 
 
 def make_provider(cred: dict, thread_url: str | None = None, fresh: bool = False,
-                  resend_system: bool = False) -> Provider:
+                  resend_system: bool = False, advisor: bool = True) -> Provider:
     """API providers are stateless; browser providers bind to a remote conversation."""
     if cred["transport"] == "browser":
         if cred["platform"] not in SITES:
             raise ValueError(f"{cred['platform']} has no web app support")
-        return BrowserProvider(cred["platform"], browsers(), site_adapter(cred["platform"]),
+        return BrowserProvider(cred["platform"], browsers(), site_adapter(cred["platform"], advisor),
                                thread_url=thread_url, fresh=fresh, resend_system=resend_system)
     return build_provider(cred["platform"], cred["model"], cred["secret"], cred["base_url"])
 
@@ -271,15 +312,19 @@ async def doctor(platform: str) -> dict:
 @app.get("/api/platforms/{platform}/selectors")
 def get_selectors(platform: str) -> dict:
     _web_platform(platform)
-    raw = store().get_meta(f"site:{platform}")
-    return {"defaults": SITES[platform].to_dict(), "overrides": json.loads(raw) if raw else {},
-            "effective": site_config(platform).to_dict()}
+    return {"defaults": SITES[platform].to_dict(), "learned": _meta_json(f"learned:{platform}"),
+            "overrides": _meta_json(f"site:{platform}"), "effective": site_config(platform).to_dict()}
 
 
 @app.put("/api/platforms/{platform}/selectors")
 def put_selectors(platform: str, overrides: dict) -> dict:
+    """Saves only what differs from built-in + learned. {} = reset: forgets what was learned too."""
     _web_platform(platform)
-    store().set_meta(f"site:{platform}", json.dumps({k: v for k, v in overrides.items() if v}))
+    if not overrides:
+        store().set_meta(f"learned:{platform}", json.dumps({}))
+    base = SITES[platform].with_overrides(_meta_json(f"learned:{platform}")).to_dict()
+    store().set_meta(f"site:{platform}", json.dumps(
+        {k: v for k, v in overrides.items() if v and base.get(k) != v}))
     return get_selectors(platform)
 
 

@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from playwright.async_api import Page
 
@@ -113,6 +114,115 @@ _COOKIE_BUTTONS = ", ".join([
 
 # When a site renames its message box: every chat page has exactly one visible text box.
 _ANY_COMPOSER = 'textarea, [contenteditable="true"], [role="textbox"]'
+# Every chat site shows a Stop button while it writes; used when the reply had to be found
+# by watching the page (its own "writing" marker may be gone too).
+_ANY_STOP = 'button[aria-label*="Stop" i], button[data-testid*="stop" i]'
+
+# --- finding things when the site changed its layout -----------------------------------
+# The message box: the biggest visible text box, the lower the better (the composer sits at
+# the bottom; a search box in the sidebar is small and at the top). Tagged for later use.
+_PICK_COMPOSER_JS = """sel => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 20 && r.height > 10
+    && getComputedStyle(e).visibility !== 'hidden'; };
+  const all = [...document.querySelectorAll(sel)].filter(e => vis(e) && !e.closest('nav, aside'));
+  if (!all.length) return null;
+  const score = e => { const r = e.getBoundingClientRect(); return r.width * Math.max(r.height, 20) + r.top * 50; };
+  const best = all.sort((a, b) => score(b) - score(a))[0];
+  document.querySelectorAll('[data-prism-composer]').forEach(e => e.removeAttribute('data-prism-composer'));
+  best.setAttribute('data-prism-composer', '');
+  return best.tagName.toLowerCase();
+}"""
+
+# Before sending: record every piece of text the page adds from now on.
+_WATCH_JS = """() => {
+  if (window.__prismWatch) window.__prismWatch.obs.disconnect();
+  const w = window.__prismWatch = {nodes: new Set()};
+  w.obs = new MutationObserver(muts => { for (const m of muts) {
+    if (m.type === 'characterData') w.nodes.add(m.target);
+    else m.addedNodes.forEach(n => w.nodes.add(n));
+  }});
+  w.obs.observe(document.body, {childList: true, subtree: true, characterData: true});
+}"""
+
+# After sending: the reply is the deepest element holding most of the text added since -
+# leaving out the message box, the sidebar, and the echo of what we sent. Tagged
+# data-prism-reply; returns its length (0 = nothing yet).
+_FIND_REPLY_JS = """prompt => {
+  const w = window.__prismWatch; if (!w) return 0;
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim(), p = norm(prompt);
+  const items = []; let total = 0;
+  for (const n of w.nodes) {
+    if (!n.isConnected) continue;
+    const el = n.nodeType === 1 ? n : n.parentElement;
+    if (!el || el.closest('textarea, [contenteditable="true"], nav, aside, header, [data-prism-seen-user]')) continue;
+    const t = norm(n.textContent);
+    if (!t || (p && p.includes(t))) continue;   // our own message, shown back
+    items.push([el, t.length]); total += t.length;
+  }
+  if (!total) return 0;
+  const held = new Map();
+  for (const [el, n] of items)
+    for (let a = el; a && a !== document.body; a = a.parentElement) held.set(a, (held.get(a) || 0) + n);
+  let best = null;
+  for (const [a, n] of held) if (n >= 0.7 * total && (!best || best.contains(a))) best = a;
+  if (!best) return 0;
+  document.querySelectorAll('[data-prism-reply]').forEach(e => e.removeAttribute('data-prism-reply'));
+  best.setAttribute('data-prism-reply', '');
+  return norm(best.innerText).length;
+}"""
+
+# A selector for what was found, to remember for next time: built from the element's (or,
+# for a reply, its containers') stable attributes. A reply selector must match every reply
+# and nothing else: not the message box, not the user's own message.
+_NAME_IT_JS = """([kind, prompt]) => {
+  const el = document.querySelector(kind === 'composer' ? '[data-prism-composer]' : '[data-prism-reply]');
+  if (!el) return null;
+  const norm = s => (s || '').replace(/\\s+/g, ' ').trim(), p = norm(prompt);
+  const stable = v => v && v.length <= 60 && !/\\d{3,}|[:][a-z0-9]+[:]|^radix-|^headlessui-/i.test(v);
+  const q = v => '"' + v.replace(/["\\\\]/g, '\\\\$&') + '"';
+  const chain = [el]; if (kind !== 'composer') for (let a = el.parentElement, i = 0; a && a !== document.body && i < 4; a = a.parentElement, i++) chain.push(a);
+  const cands = [];
+  for (const e of chain) {
+    const tag = e.tagName.toLowerCase();
+    for (const at of ['data-testid', 'data-message-author-role', 'data-role', 'role', 'aria-label', 'placeholder', 'name'])
+      if (stable(e.getAttribute(at))) cands.push(`${tag}[${at}=${q(e.getAttribute(at))}]`);
+    if (stable(e.id)) cands.push(`${tag}#${CSS.escape(e.id)}`);
+    for (const c of e.classList) if (/^[a-z][a-z-]{2,30}$/i.test(c)) cands.push(`${tag}.${c}`);
+  }
+  const vis = e => e.offsetWidth || e.offsetHeight;
+  for (const c of cands) {
+    let all; try { all = [...document.querySelectorAll(c)]; } catch (e) { continue; }
+    if (!all.some(m => m === el || m.contains(el))) continue;
+    if (kind === 'composer') { if (all.filter(vis).length === 1) return c; continue; }
+    const last = all[all.length - 1];
+    if (!(last === el || last.contains(el))) continue;
+    if (all.some(m => m.matches('textarea, [contenteditable="true"]') || m.querySelector('textarea, [contenteditable="true"]'))) continue;
+    if (p && all.some(m => { const t = norm(m.innerText); return t && (t === p || (p.length >= 20 && t.includes(p))); })) continue;
+    return c;
+  }
+  return null;
+}"""
+
+# For asking another assistant: the page's controls, numbered - structure only, no chat text.
+_OUTLINE_JS = """() => {
+  const vis = e => { const r = e.getBoundingClientRect(); return r.width > 4 && r.height > 4; };
+  const els = [...document.querySelectorAll('textarea, input:not([type=hidden]):not([type=file]):not([type=checkbox]):not([type=radio]),'
+    + ' [contenteditable], [role="textbox"], button, [role="button"]')].filter(vis).slice(0, 80);
+  return els.map((e, i) => { e.setAttribute('data-prism-pick', i); const r = e.getBoundingClientRect();
+    const o = {n: i, tag: e.tagName.toLowerCase(), type: e.getAttribute('type'), role: e.getAttribute('role'),
+      editable: e.isContentEditable || undefined, label: e.getAttribute('aria-label'),
+      placeholder: e.getAttribute('placeholder') || e.getAttribute('data-placeholder'),
+      testid: e.getAttribute('data-testid'),
+      button_text: e.tagName === 'BUTTON' ? (e.innerText || '').trim().slice(0, 24) : undefined,
+      at: `${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`};
+    return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null && v !== undefined && v !== ''));
+  });
+}"""
+_LAYOUT_QUESTION = (
+    "I'm automating a chat website and can't find its message box (where a user types a new "
+    "chat message). Here are the visible controls on the page, numbered, with their position "
+    "and size (x,y widthxheight; the page is about 1280x720):\n\n{outline}\n\nWhich number is "
+    "the message box? Reply with the number only, or 'none'.")
 
 # What Check lists when a site changes its layout: the visible boxes and buttons to pick from.
 _INPUTS_JS = """() => [...document.querySelectorAll(
@@ -127,41 +237,92 @@ _INPUTS_JS = """() => [...document.querySelectorAll(
 
 class SiteAdapter:
     def __init__(self, config: SiteConfig, load_timeout_s: float = 60.0,
-                 screenshot_dir: Path | None = None, media_dir: Path | None = None):
+                 screenshot_dir: Path | None = None, media_dir: Path | None = None,
+                 on_learn: Callable[[dict], None] | None = None,
+                 advisor: Callable[[str], Awaitable[str]] | None = None,
+                 fallback_after_s: float = 30.0):
         self.cfg = config
         self.load_timeout_ms = load_timeout_s * 1000
         self.screenshot_dir = screenshot_dir
         self.media_dir = media_dir  # images in replies are saved here
+        # When the site changed its layout: what worked is passed to on_learn (saved, used
+        # first next time); advisor(question) asks another assistant when PRISM can't tell.
+        self.on_learn = on_learn
+        self.advisor = advisor
+        self.fallback_after_s = fallback_after_s  # no reply on the known selector by then: watch the page
+        self.notes: list[str] = []  # what changed in the last send, for the room to show
+        self._composer_guessed = False
 
     async def open(self, page: Page, thread_url: str | None = None) -> None:
         """Open a new chat, or the bound remote conversation, and wait for the composer.
         A login or bot-check page fails at once instead of after the whole load timeout."""
         await page.goto(thread_url or self.cfg.new_chat_url, wait_until="domcontentloaded",
                         timeout=self.load_timeout_ms)
-        composer = self._composer(page)
-        deadline = time.monotonic() + self.load_timeout_ms / 1000
+        start = time.monotonic()
+        deadline = start + self.load_timeout_ms / 1000
+        self.notes, self._composer_guessed = [], False
         while True:
             try:
-                await composer.wait_for(state="visible", timeout=1000)
-                if await self._signed_out(page):
-                    raise await self.diagnose(page)
-                await self._dismiss_cookie_notice(page)
-                return
+                # The known message box; after a few seconds without it, the likeliest text box.
+                if await self._find_composer(page, guess=time.monotonic() - start > 5):
+                    if await self._signed_out(page):
+                        raise await self.diagnose(page)
+                    await self._dismiss_cookie_notice(page)
+                    return
             except ProviderError:
                 raise
             except Exception:
-                pass
+                pass  # mid-navigation
             try:
                 blocked = bool(_LOGIN_URL.search(page.url) or _BOT_TITLE.search(await page.title()))
             except Exception:  # mid-navigation
                 blocked = False
             if blocked or time.monotonic() > deadline:
-                raise await self.diagnose(page)
+                error = await self.diagnose(page)
+                if isinstance(error, PageNotReady) and await self._ask_for_composer(page):
+                    return
+                raise error
+            await asyncio.sleep(1)
 
-    def _composer(self, page: Page):
-        """The configured message box, else any visible text box (the site changed its layout)."""
-        return page.locator(self.cfg.composer).or_(page.locator(_ANY_COMPOSER)) \
-            .filter(visible=True).first
+    async def _find_composer(self, page: Page, guess: bool = True):
+        """The configured message box, else (guess) the likeliest visible text box on the page."""
+        box = page.locator(self.cfg.composer).filter(visible=True).first
+        if await box.count():
+            return box
+        tagged = page.locator("[data-prism-composer]").filter(visible=True).first
+        if await tagged.count():
+            return tagged
+        if guess and await page.evaluate(_PICK_COMPOSER_JS, _ANY_COMPOSER):
+            self._composer_guessed = True
+            return tagged
+        return None
+
+    async def _ask_for_composer(self, page: Page) -> bool:
+        """Last resort: show another assistant the page's controls (no chat text) and try the
+        one it names - kept only if it really is a box we can type into."""
+        if not self.advisor:
+            return False
+        try:
+            outline = await page.evaluate(_OUTLINE_JS)
+            if not outline:
+                return False
+            lines = "\n".join(" ".join(f"{k}={v}" for k, v in o.items()) for o in outline)
+            answer = await self.advisor(_LAYOUT_QUESTION.format(outline=lines))
+            n = re.search(r"\d+", answer or "")
+            if not n:
+                return False
+            box = page.locator(f'[data-prism-pick="{n.group()}"]')
+            if not await box.count() or not await box.evaluate(
+                    "e => e.isContentEditable || ['TEXTAREA', 'INPUT'].includes(e.tagName)"):
+                return False
+            await page.evaluate("() => document.querySelectorAll('[data-prism-composer]')"
+                                ".forEach(e => e.removeAttribute('data-prism-composer'))")
+            await box.evaluate("e => e.setAttribute('data-prism-composer', '')")
+            self._composer_guessed = True
+            self.notes.append("another assistant found the new message box")
+            return True
+        except Exception:
+            return False
 
     async def _signed_out(self, page: Page) -> bool:
         return bool(self.cfg.signed_out) and \
@@ -203,7 +364,10 @@ class SiteAdapter:
         # from the page as new ones arrive (long chats on claude.ai).
         replies = page.locator(f":is({self.cfg.assistant_message}):not([data-prism-seen])")
 
-        composer = self._composer(page)
+        composer = await self._find_composer(page)
+        if composer is None:
+            raise await self.diagnose(page)
+        await page.evaluate(_WATCH_JS)  # in case the reply selector no longer matches
         try:
             await composer.click(timeout=3000)
         except Exception:  # something still covers it: focus and type without clicking
@@ -220,13 +384,53 @@ class SiteAdapter:
             await composer.press("Enter")
 
         deadline = time.monotonic() + timeout_s
+        watch_from = time.monotonic() + self.fallback_after_s
+        watching = False
         while not await replies.count():
             if time.monotonic() > deadline:
                 raise ProviderError("no reply appeared")
+            # The site may have renamed its replies: read whatever the page added instead.
+            if time.monotonic() > watch_from and await page.evaluate(_FIND_REPLY_JS, text):
+                watching = True
+                break
             await asyncio.sleep(0.25)
-        reply = replies.last
-        text_out = await self._wait_until_stable(page, reply, deadline, text)
+        if watching:
+            async def current():  # the known selector may still turn up; else re-find it
+                if await replies.count():
+                    return replies.last
+                await page.evaluate(_FIND_REPLY_JS, text)
+                return page.locator("[data-prism-reply]")
+            text_out = await self._wait_until_stable(page, current, deadline, text, settle_s=5.0,
+                                                     streaming=_ANY_STOP)
+            reply = await current()
+        else:
+            reply = replies.last
+            text_out = await self._wait_until_stable(page, reply, deadline, text)
+        await self._learn(page, text, watching and not await replies.count())
         return "\n\n".join([text_out] + await self._save_media(page, reply))
+
+    async def _learn(self, page: Page, sent: str, reply_found_by_watching: bool) -> None:
+        """The turn worked with what PRISM found itself: name it, and remember it."""
+        learned = {}
+        try:
+            if self._composer_guessed:
+                if sel := await page.evaluate(_NAME_IT_JS, ["composer", sent]):
+                    learned["composer"] = sel
+                self.notes.append("the message box moved - found it" + (" and saved it" if sel else ""))
+            if reply_found_by_watching:
+                if sel := await page.evaluate(_NAME_IT_JS, ["reply", sent]):
+                    learned["assistant_message"] = sel
+                self.notes.append("the reply layout changed - read it by watching the page"
+                                  + (" and saved the new layout" if sel else ""))
+        except Exception:
+            pass
+        if learned:
+            self.cfg = self.cfg.with_overrides(learned)
+            if self.on_learn:
+                try:
+                    self.on_learn(learned)
+                except Exception:
+                    pass
 
     async def _dismiss_cookie_notice(self, page: Page) -> None:
         try:
@@ -340,17 +544,24 @@ class SiteAdapter:
         return saved
 
     async def _wait_until_stable(self, page: Page, reply, deadline: float, sent: str = "",
-                                 settle_s: float = 1.5, stuck_s: float = 60.0) -> str:
+                                 settle_s: float = 1.5, stuck_s: float = 60.0,
+                                 streaming: str = "") -> str:
         """The reply is done when nothing is streaming and its text stopped changing.
-        `reply` is re-resolved each time, so an echo of `sent` is skipped for the real reply."""
+        `reply` is re-resolved each time, so an echo of `sent` is skipped for the real reply;
+        it may also be an async function returning the locator to read."""
+        marker = ", ".join(s for s in (self.cfg.streaming, streaming) if s)
         last, stable_since = None, time.monotonic()
         while time.monotonic() < deadline:
-            text = (await reply.inner_text()).strip()
-            streaming = bool(self.cfg.streaming) and await page.locator(self.cfg.streaming).count() > 0
+            loc = await reply() if callable(reply) else reply
+            try:
+                text = (await loc.inner_text(timeout=5000)).strip()
+            except Exception:  # replaced while we read it
+                text = ""
+            streaming_now = bool(marker) and await page.locator(marker).filter(visible=True).count() > 0
             quiet = time.monotonic() - stable_since
             if text != last or not text or _is_echo(text, sent):
                 last, stable_since = text, time.monotonic()
-            elif (quiet >= settle_s and not streaming) or quiet >= stuck_s:
+            elif (quiet >= settle_s and not streaming_now) or quiet >= stuck_s:
                 return clean_reply(text)  # done, or the site's "writing" marker got stuck
             await asyncio.sleep(0.3)
         raise ProviderError("reply did not finish before the timeout")
@@ -359,14 +570,18 @@ class SiteAdapter:
         """Report how many elements each configured selector matches on the new-chat page."""
         await page.goto(self.cfg.new_chat_url, wait_until="domcontentloaded")
         found = None
-        try:
-            box = self._composer(page)
-            await box.wait_for(state="visible", timeout=20_000)
-            found = await box.evaluate(
-                "el => el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')"
-                " + (el.getAttribute('name') ? `[name=${el.getAttribute('name')}]` : '')")
-        except Exception:
-            pass
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not found:
+            try:
+                box = await self._find_composer(page, guess=time.monotonic() > deadline - 15)
+                if box:
+                    found = await box.evaluate(
+                        "el => el.tagName.toLowerCase() + (el.id ? '#' + el.id : '')"
+                        " + (el.getAttribute('name') ? `[name=${el.getAttribute('name')}]` : '')")
+            except Exception:
+                pass
+            if not found:
+                await asyncio.sleep(1)
         signed_out = await self._signed_out(page)
         checks = {}
         for name in ("composer", "send_button", "assistant_message", "streaming", "signed_out"):

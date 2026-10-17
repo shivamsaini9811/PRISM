@@ -17,7 +17,7 @@
   button:disabled { opacity:.5; cursor:default; }
   input, textarea, select { font:inherit; color:var(--fg); background:var(--card); border:1px solid var(--border); border-radius:7px; padding:6px 8px; }
   a { color:var(--accent); }
-  .muted { color:var(--muted); } .err { color:var(--err); } .ok { color:var(--ok); }
+  .muted { color:var(--muted); } .err { color:var(--err); } .ok { color:var(--ok); } .note { font-size:12px; margin-top:6px; }
   .hidden { display:none !important; }
 
   #app { display:grid; grid-template-columns:240px 1fr 280px; height:100vh; }
@@ -408,6 +408,7 @@ function meetingHtml(msgs, live) {
       seats.push({who: meta.speaker, html: `<div class="msg">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">${esc(meta.speaker)}</span>${role}`
         + ` · ${esc(meta.model || '')} · ${meta.latency_s}s</div>`
         + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : rich(esc(m.content)))
+        + (meta.notes || []).map(n => `<div class="muted note">⚙ ${esc(meta.speaker)}: ${esc(n)}</div>`).join('')
         + '</div>'});
       continue;
     }
@@ -726,9 +727,11 @@ $('plats').onclick = async e => {
     }
     if (act === 'selectors') {
       const r = await api(`/api/platforms/${p}/selectors`);
-      out.textContent = 'Overrides replace the built-in selectors when a site changes its layout.';
+      const learned = Object.entries(r.learned || {});
+      out.textContent = 'Overrides replace the built-in selectors when a site changes its layout.'
+        + (learned.length ? ` PRISM learned by itself: ${learned.map(([k, v]) => `${k} = ${v}`).join('; ')}. Reset forgets it.` : '');
       detail.innerHTML = `<textarea data-sel>${esc(JSON.stringify(r.effective, null, 2))}</textarea>
-        <div class="plat-actions"><button data-act="saveSelectors">Save selectors</button><button data-act="resetSelectors">Reset to built-in</button></div>`;
+        <div class="plat-actions"><button data-act="saveSelectors">Save selectors</button><button data-act="resetSelectors">Reset to built-in (forget learned)</button></div>`;
       return;
     }
     if (act === 'saveSelectors' || act === 'resetSelectors') {

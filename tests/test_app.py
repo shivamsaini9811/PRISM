@@ -393,3 +393,36 @@ def test_quit_stops_the_server_only_with_a_json_confirm(client):
         assert server.should_exit
     finally:
         del app_mod.app.state.server
+
+
+def test_learned_layout_is_used_shown_and_reset(client):
+    client.post("/api/unlock", json={"password": "longenough"})
+    app_mod.remember_layout("gpt", {"assistant_message": "div.answer"})
+    r = client.get("/api/platforms/gpt/selectors").json()
+    assert r["learned"] == {"assistant_message": "div.answer"}
+    assert r["effective"]["assistant_message"] == "div.answer"
+    # Saving the whole effective set (what the UI does) keeps only the user's own change.
+    edited = {**r["effective"], "composer": "#mine"}
+    r = client.put("/api/platforms/gpt/selectors", json=edited).json()
+    assert r["overrides"] == {"composer": "#mine"} and r["effective"]["assistant_message"] == "div.answer"
+    r = client.put("/api/platforms/gpt/selectors", json={}).json()
+    assert r["learned"] == {} and r["overrides"] == {}
+    assert r["effective"] == r["defaults"]
+
+
+async def test_layout_advice_comes_from_another_assistant(client, monkeypatch):
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"transport": "browser"})
+    client.put("/api/credentials/claude", json={"transport": "browser"})
+    client.put("/api/credentials/gemini", json={"secret": "k"})
+    asked = []
+
+    def provider(cred, **kw):
+        asked.append((cred["platform"], kw.get("advisor")))
+        return Fake(cred["platform"])
+    monkeypatch.setattr(app_mod, "make_provider", provider)
+    assert await app_mod.layout_advisor("gpt")("which box?") == "gemini r1"
+    assert asked == [("gemini", False)]  # an API one first; never the broken site itself
+    async with app_mod.browsers().lock("claude"):  # busy: asking it could wait on us
+        client.delete("/api/credentials/gemini")
+        assert await app_mod.layout_advisor("gpt")("which box?") == ""

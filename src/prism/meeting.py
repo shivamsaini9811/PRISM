@@ -348,6 +348,8 @@ class Session:
                 "model": self.members[st.speaker].provider.model, "role": st.role,
                 "round": st.round, "step": st.step, "latency_s": round(st.latency_s, 1),
                 "error": st.error, "format": self.script.format}
+        if notes := getattr(self.members[st.speaker].provider, "notes", None):
+            meta["notes"] = list(notes)
         entry = Entry(st.speaker, kind, st.text or "")
         entry.id = self.emit("entry", entry=entry, meta=meta, statement=st)
         if st.text:
