@@ -1,6 +1,6 @@
 # macOS builds: PyInstaller only builds for the OS it runs on, so this runs on GitHub's Macs.
 # Push a tag (git tag v0.6.4 && git push --tags) or run it by hand from the Actions tab;
-# a tag also publishes the zips as a release.
+# a tag also publishes the .dmg files as a release.
 name: mac
 
 on:
@@ -34,18 +34,18 @@ jobs:
       - name: Smoke test
         run: |
           export PRISM_HOME="$RUNNER_TEMP/prism-home"
-          ./dist-mac/PRISM/PRISM --no-browser --port 18765 &
+          ./dist-mac/PRISM.app/Contents/MacOS/PRISM --no-browser --port 18765 &
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:18765/api/status && break; sleep 1; done
           curl -sf http://127.0.0.1:18765/api/status | grep -q '"version"'
           kill %1
       - uses: actions/upload-artifact@v4
         with:
           name: PRISM-macos-${{ matrix.arch }}
-          path: dist-mac/*.zip
+          path: dist-mac/*.dmg
       - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "PRISM $GITHUB_REF_NAME" --notes-file packaging/MAC.md
-          gh release upload "$GITHUB_REF_NAME" dist-mac/*.zip --clobber
+          gh release upload "$GITHUB_REF_NAME" dist-mac/*.dmg --clobber

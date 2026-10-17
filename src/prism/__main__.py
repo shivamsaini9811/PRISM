@@ -14,8 +14,20 @@ DEFAULT_PORT = 8765
 
 
 def _frozen_setup() -> None:
-    """Inside the packaged executable, use the Chromium bundled next to the Playwright driver."""
-    if getattr(sys, "frozen", False):
+    """Inside the packaged app. Windows: use the Chromium bundled next to the Playwright driver.
+    macOS: PRISM.app bundles no browser (it drives Chrome or Edge); a Chromium it has to fetch
+    goes into the data folder - the signed app bundle must not change. A Mac app has no
+    terminal, so its output goes to a log file."""
+    if not getattr(sys, "frozen", False):
+        return
+    from .config import data_dir
+    if sys.platform == "darwin":
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(data_dir() / "browsers"))
+        if sys.stdout is None or not sys.stdout.isatty():
+            data_dir().mkdir(parents=True, exist_ok=True)
+            log = open(data_dir() / "prism.log", "a", buffering=1, encoding="utf-8")
+            sys.stdout = sys.stderr = log
+    else:
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
 
@@ -70,11 +82,14 @@ def main() -> None:
                 return
             time.sleep(0.1)
 
-    print(f"PRISM {__version__}\n  UI:   {url}\n  Data: {data_dir()}\n  Press Ctrl+C to quit.", flush=True)
+    print(f"PRISM {__version__}\n  UI:   {url}\n  Data: {data_dir()}\n"
+          "  Quit: the Quit button in PRISM, or Ctrl+C here.", flush=True)
     if not args.no_browser:
         threading.Thread(target=open_when_ready, daemon=True).start()
     # Bound to localhost only: the vault and chats are never exposed to the network.
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    app.state.server = server  # the Quit button stops it
+    server.run()
 
 
 if __name__ == "__main__":

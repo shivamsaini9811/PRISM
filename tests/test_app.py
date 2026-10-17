@@ -377,3 +377,19 @@ def test_ask_budget_is_a_remembered_setting(client):
     client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt hi", "asks": 1})
     assert wait_meeting(client, chat)["meeting_defaults"]["asks"] == 1
     assert client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt hi", "asks": 9}).status_code == 422
+
+
+def test_quit_stops_the_server_only_with_a_json_confirm(client):
+    class Server:
+        should_exit = False
+    assert client.post("/api/quit", json={"confirm": True}).status_code == 409  # no launcher
+    app_mod.app.state.server = server = Server()
+    try:
+        # a plain cross-site form post can't carry JSON
+        assert client.post("/api/quit", content=b"confirm=true",
+                           headers={"content-type": "application/x-www-form-urlencoded"}).status_code == 422
+        assert not server.should_exit
+        assert client.post("/api/quit", json={"confirm": True}).json() == {"ok": True}
+        assert server.should_exit
+    finally:
+        del app_mod.app.state.server

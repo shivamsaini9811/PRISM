@@ -151,6 +151,24 @@ def get_media(name: str) -> FileResponse:
     return FileResponse(path, filename=shown)  # a download, under its own name
 
 
+class QuitIn(BaseModel):
+    confirm: bool
+
+
+@app.post("/api/quit")
+def quit_prism(body: QuitIn) -> dict:
+    """The Quit button: the Mac app has no window or Dock icon to quit from. Shutting down
+    closes the browser too (lifespan). A JSON body, so another website open in the browser
+    can't send it (a cross-site JSON POST needs a CORS preflight PRISM never grants)."""
+    if not body.confirm:
+        raise HTTPException(400, "Not confirmed")
+    server = getattr(app.state, "server", None)
+    if server is None:
+        raise HTTPException(409, "PRISM was not started by its launcher - stop it where it runs")
+    server.should_exit = True
+    return {"ok": True}
+
+
 # --- vault -------------------------------------------------------------------------------
 
 class UnlockRequest(BaseModel):

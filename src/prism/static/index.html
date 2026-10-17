@@ -134,6 +134,7 @@
     <div class="side-foot">
       <button id="openSettings">Settings</button>
       <button id="lockBtn">Lock</button>
+      <button id="quitBtn" title="Stop PRISM and its browser">Quit</button>
       <span class="muted" id="motherLabel" style="font-size:12px;align-self:center"></span>
     </div>
   </aside>
@@ -524,6 +525,14 @@ $('composer').onsubmit = async e => {
         if (state.view.notice) notice(state.view.notice); }
   catch (err) { $('input').value = text; if (err.message !== 'locked') alert(err.message); }
   finally { render(); state.busy = false; loadChats(); watch(); }
+};
+
+$('quitBtn').onclick = async () => {
+  if (!confirm('Quit PRISM? Bots still answering are cut off. Open PRISM again to come back.')) return;
+  try { await api('/api/quit', {method: 'POST', body: {confirm: true}}); }
+  catch (err) { alert(err.message); return; }
+  document.body.innerHTML = '<div style="margin:20vh auto;max-width:420px;text-align:center;font:16px system-ui">'
+    + '<h2>PRISM has stopped</h2><p>You can close this tab. Open PRISM again to come back.</p></div>';
 };
 
 /* ---------- attachments: uploaded at once, sent with the next message ---------- */

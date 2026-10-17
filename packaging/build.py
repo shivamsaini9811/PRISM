@@ -3,14 +3,15 @@
     python packaging/build.py              # full build, Chromium bundled
     python packaging/build.py --no-browser # smaller build, relies on Edge/Chrome on the target
 
-Output: dist/PRISM/ (PRISM.exe, or PRISM on macOS, + its files) and
-dist/PRISM-<version>-<os>[-<arch>].zip.
+Output - Windows/Linux: dist/PRISM/ (PRISM.exe + its files) and dist/PRISM-<version>-<os>.zip.
+macOS: dist/PRISM.app and dist/PRISM-<version>-macos-<arch>.dmg (drag PRISM to Applications).
 PyInstaller does not cross-compile: run this on Windows for the Windows build, on a Mac for
 the Mac build (.github/workflows/mac.yml does that on GitHub's Macs).
 """
 
 import argparse
 import os
+import plistlib
 import platform
 import shutil
 import subprocess
@@ -59,7 +60,7 @@ def main() -> None:
     #     -o packaging/requirements.lock.txt
     run(py, "-m", "pip", "install", "-q", "-r", ROOT / "packaging/requirements.lock.txt")
     run(py, "-m", "pip", "install", "-q", "--no-deps", str(src_copy))
-    run(py, "-m", "pip", "install", "-q", "pyinstaller>=6.10")
+    run(py, "-m", "pip", "install", "-q", "pyinstaller>=6.10", "pillow")  # pillow: the icon
 
     env = {**os.environ}
     if not args.no_browser:
@@ -71,23 +72,55 @@ def main() -> None:
     cmd = [py, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--name", "PRISM",
            "--distpath", args.dist_dir, "--workpath", args.build_dir / "pyinstaller",
            "--specpath", args.build_dir,
+           "--icon", ROOT / "packaging/icon.png",
            "--add-data", f"{ROOT / 'src/prism/static'}{sep}prism/static",
            "--collect-data", "playwright",
            "--collect-submodules", "uvicorn"]
     for pkg in PACKAGES_WITH_METADATA:
         cmd += ["--copy-metadata", pkg]
+    mac = platform.system() == "Darwin"
+    if mac:  # PRISM.app: opened from Applications, no terminal window
+        cmd += ["--windowed", "--osx-bundle-identifier", "app.prism.desktop"]
     run(*cmd, ROOT / "packaging/prism_launcher.py", env=env)
 
     version = next(line.split('"')[1] for line in (ROOT / "src/prism/__init__.py").read_text().splitlines()
                    if line.startswith("__version__"))
     osname = {"Windows": "windows", "Darwin": "macos"}.get(platform.system(), "linux")
     stem = args.dist_dir / f"PRISM-{version}-{osname}{'-' + args.arch if args.arch else ''}"
-    if platform.system() == "Darwin":  # ditto keeps symlinks and permissions (zipfile doesn't)
-        archive = f"{stem}.zip"
-        run("ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", args.dist_dir / "PRISM", archive)
-    else:
-        archive = shutil.make_archive(str(stem), "zip", args.dist_dir, "PRISM")
+    if mac:
+        app = args.dist_dir / "PRISM.app"
+        finish_mac_app(app, version)
+        print(f"\nBuilt {app}\nDMG   {make_dmg(app, args.build_dir, stem.with_suffix('.dmg'))}")
+        return
+    archive = shutil.make_archive(str(stem), "zip", args.dist_dir, "PRISM")
     print(f"\nBuilt {args.dist_dir / 'PRISM'}\nZip   {archive}")
+
+
+def finish_mac_app(app: Path, version: str) -> None:
+    """No Dock icon (PRISM has no window; the Quit button in the page stops it), the real
+    version in Finder, then sign again: editing Info.plist breaks PyInstaller's signature.
+    Ad-hoc signed only - without an Apple Developer ID, a downloaded copy needs the quarantine
+    flag cleared once (see packaging/MAC.md)."""
+    plist_path = app / "Contents/Info.plist"
+    info = plistlib.loads(plist_path.read_bytes())
+    info.update({"LSUIElement": True, "CFBundleShortVersionString": version,
+                 "CFBundleVersion": version, "CFBundleDisplayName": "PRISM",
+                 "NSHumanReadableCopyright": "PRISM - one group chat for your AI models"})
+    plist_path.write_bytes(plistlib.dumps(info))
+    run("codesign", "--force", "--deep", "--sign", "-", app)
+    run("codesign", "--verify", "--deep", "--strict", app)
+
+
+def make_dmg(app: Path, build_dir: Path, dmg: Path) -> Path:
+    """The usual Mac installer: a disk image with PRISM.app next to an Applications shortcut."""
+    stage = build_dir / "dmg"
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True)
+    run("ditto", app, stage / "PRISM.app")  # ditto keeps the bundle's symlinks and signature
+    (stage / "Applications").symlink_to("/Applications")
+    dmg.unlink(missing_ok=True)
+    run("hdiutil", "create", "-volname", "PRISM", "-srcfolder", stage, "-ov", "-format", "UDZO", dmg)
+    return dmg
 
 
 if __name__ == "__main__":
