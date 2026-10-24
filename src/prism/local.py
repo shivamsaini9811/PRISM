@@ -42,7 +42,8 @@ BROWSER_MAX_CHARS = 12_000  # in-browser models have the smallest windows
 def fit(messages: list[Message], system: str | None, max_chars: int) -> list[Message]:
     """System prompt first, then as many of the newest messages as fit; the newest message
     is kept even when it alone is too long (its start is cut)."""
-    sys_msg = [{"role": "system", "content": system[:max_chars // 3]}] if system else []
+    sys_msg = [{"role": "system", "content": system if len(system) <= max_chars // 2
+                else system[:max_chars // 2].rsplit("\n", 1)[0] + "\n(…)"}] if system else []
     budget = max_chars - sum(len(m["content"]) for m in sys_msg)
     kept: list[Message] = []
     for m in reversed(messages):

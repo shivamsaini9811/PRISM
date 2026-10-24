@@ -641,7 +641,9 @@ ASK_PROMPT = (
     "from your memory of me - saved memories and our past conversations - with the specific "
     "facts you know (dates, numbers, decisions, my own words where they matter). If it asks for "
     "advice, give your best advice. If you don't know or have nothing about it, say so plainly "
-    "in one line; don't guess. Plain text, no documents.")
+    "in one line; don't guess. Plain text, no documents. If it asks you to make a file (a page, "
+    "a component, an SVG), put the complete file in one fenced code block in this chat (```html, "
+    "```svg, ```jsx) - not in an artifact, canvas or side panel, which can't be passed on.")
 _recalls: set[asyncio.Task] = set()
 
 
@@ -962,7 +964,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         name = entry.who
         if entry.text and name in members and meta["kind"] != "lookup":  # its own thread
             s.add_message(chat_id, daughter_ids[name], "user", st.prompt if st else prompt)
-            s.add_message(chat_id, daughter_ids[name], "assistant", entry.text)
+            s.add_message(chat_id, daughter_ids[name], "assistant", entry.text,
+                          {"html": meta["html"]} if meta.get("html") else None)
             url = getattr(members[name].provider, "thread_url", None)
             if url:
                 s.set_remote_url(daughter_ids[name], url)

@@ -49,7 +49,8 @@ MEMBER_SYSTEM = (
     "asks for that. When you make a file to look at or use (a web page, a component, an SVG, "
     "a script), put the complete file in one fenced code block in your reply (```html, ```svg, "
     "```jsx ...) - not in an artifact, canvas or side panel, which the room can't see; PRISM "
-    "shows it as a live preview.{deep}"
+    "shows it as a live preview (for React: one component with a default export, using only "
+    "React itself and Tailwind classes - no other packages load there).{deep}"
 )
 MODERATOR_SYSTEM = (
     "You moderate a group chat between a user and AI models. You see the room labelled by who "
@@ -358,8 +359,11 @@ class Session:
                 "model": self.members[st.speaker].provider.model, "role": st.role,
                 "round": st.round, "step": st.step, "latency_s": round(st.latency_s, 1),
                 "error": st.error, "format": self.script.format}
-        if notes := getattr(self.members[st.speaker].provider, "notes", None):
+        provider = self.members[st.speaker].provider
+        if notes := getattr(provider, "notes", None):
             meta["notes"] = list(notes)
+        if st.text and (html := getattr(provider, "last_html", None)):
+            meta["html"] = html  # shown the way the site formatted it
         entry = Entry(st.speaker, kind, st.text or "")
         entry.id = self.emit("entry", entry=entry, meta=meta, statement=st)
         if st.text:
@@ -441,6 +445,8 @@ class Session:
             text = await asyncio.wait_for(m.provider.complete(msgs, system), self.timeout)
             m.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": text}]
             self._mark_seen(m, snapshot)
+            if html := getattr(m.provider, "last_html", None):
+                meta["html"] = html
             entry = Entry(MODERATOR, kind, text)
             entry.id = self.emit("entry", entry=entry, meta=meta, prompt=prompt)
             self.room.append(entry)

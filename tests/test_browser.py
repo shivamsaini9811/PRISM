@@ -359,3 +359,11 @@ async def test_code_blocks_come_back_fenced_with_their_language(manager):
     assert "```html\n<h1>Hi</h1>\n<p>there</p>\n```" in reply, reply
     assert reply.startswith("echo: some code please") and reply.endswith("Done.")
     assert "Copy" not in reply
+
+
+async def test_reply_keeps_the_sites_formatting_without_its_scripts(manager):
+    p = BrowserProvider("fake", manager, SiteAdapter(CONFIG, load_timeout_s=5))
+    await asyncio.wait_for(p.complete([{"role": "user", "content": "some code please"}]), 30)
+    html = p.last_html
+    assert "<pre><code" in html and "&lt;h1&gt;" in html and "<p>Done.</p>" in html
+    assert "<button" not in html and "Copy" not in html and "class=" not in html.replace('class="language-', '')

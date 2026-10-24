@@ -250,6 +250,25 @@ _REPLY_TEXT_JS = """el => {
   } finally { copy.remove(); }
 }"""
 
+# The finished reply as the site showed it (headings, lists, tables, code), for PRISM to show
+# the same way. Only structure is kept: the page sanitizes it again before showing it.
+_REPLY_HTML_JS = """el => {
+  const copy = el.cloneNode(true);
+  copy.querySelectorAll('script, style, link, button, svg, input, textarea, select, form, nav, iframe, object, '
+    + 'canvas, video, audio, [aria-hidden="true"], .sr-only, .visually-hidden, [role="button"], [role="tooltip"]')
+    .forEach(e => e.remove());
+  for (const e of copy.querySelectorAll('*')) {
+    for (const a of [...e.attributes]) {
+      const keep = (a.name === 'href' && /^https?:/i.test(a.value)) || a.name === 'colspan' || a.name === 'rowspan'
+        || (a.name === 'class' && /language-/.test(a.value));
+      if (!keep) e.removeAttribute(a.name);
+      else if (a.name === 'class') e.setAttribute('class', (a.value.match(/language-[\\w+#-]+/) || [''])[0]);
+    }
+  }
+  copy.querySelectorAll('img').forEach(e => e.remove());  // saved separately, with the site's cookies
+  return copy.innerHTML.replace(/<!--[\\s\\S]*?-->/g, '').replace(/\\s{3,}/g, '  ').slice(0, 400000);
+}"""
+
 # For asking another assistant: the page's controls, numbered - structure only, no chat text.
 _OUTLINE_JS = """() => {
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 4 && r.height > 4; };
@@ -298,6 +317,7 @@ class SiteAdapter:
         self.advisor = advisor
         self.fallback_after_s = fallback_after_s  # no reply on the known selector by then: watch the page
         self.notes: list[str] = []  # what changed in the last send, for the room to show
+        self.last_html: str | None = None  # the last reply as the site formatted it
         self._composer_guessed = False
 
     async def open(self, page: Page, thread_url: str | None = None) -> None:
@@ -412,6 +432,7 @@ class SiteAdapter:
 
     async def send(self, page: Page, text: str, timeout_s: float = 840.0,
                    files: list[str] = ()) -> str:
+        self.last_html = None
         await self._mark_old_replies(page)
         # The new reply is the one not marked: counting fails on sites that drop old messages
         # from the page as new ones arrive (long chats on claude.ai).
@@ -656,6 +677,10 @@ class SiteAdapter:
                         text = (await loc.evaluate(_REPLY_TEXT_JS)).strip() or text
                 except Exception:
                     pass
+                try:
+                    self.last_html = await loc.evaluate(_REPLY_HTML_JS)
+                except Exception:
+                    self.last_html = None
                 return clean_reply(text)
             await asyncio.sleep(0.3)
         raise ProviderError("reply did not finish before the timeout")

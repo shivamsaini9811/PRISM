@@ -117,6 +117,17 @@
   .narrow-only { display:none; }
 
   /* code blocks in replies, and the artifact pane: live previews of what the bots build */
+  .site { white-space:normal; line-height:1.6; }
+  .site > :first-child { margin-top:0; } .site > :last-child { margin-bottom:0; }
+  .site p { margin:0 0 .75em; } .site h1, .site h2, .site h3, .site h4 { margin:1.1em 0 .45em; line-height:1.3; }
+  .site h1 { font-size:1.35em; } .site h2 { font-size:1.2em; } .site h3 { font-size:1.07em; } .site h4 { font-size:1em; }
+  .site ul, .site ol { margin:0 0 .75em; padding-left:1.5em; } .site li { margin:.2em 0; } .site li > p { margin:0; }
+  .site blockquote { margin:0 0 .75em; padding:2px 12px; border-left:3px solid var(--border); color:var(--muted); }
+  .site table { border-collapse:collapse; margin:0 0 .9em; display:block; overflow-x:auto; font-size:.95em; }
+  .site th, .site td { border:1px solid var(--border); padding:5px 9px; text-align:left; vertical-align:top; }
+  .site th { background:var(--bg); } .site hr { border:0; border-top:1px solid var(--border); margin:1em 0; }
+  .site code { font:.92em ui-monospace, Consolas, monospace; background:var(--bg); padding:1px 4px; border-radius:4px; }
+  .site .code pre { background:none; } .site .code code { background:none; padding:0; }
   .code { margin:8px 0; border:1px solid var(--border); border-radius:8px; overflow:hidden; white-space:normal; background:var(--bg); }
   .code-head { display:flex; align-items:center; gap:6px; padding:4px 8px; font-size:11.5px; color:var(--muted); border-bottom:1px solid var(--border); }
   .code-head b { font-weight:600; color:var(--fg); margin-right:auto; }
@@ -295,29 +306,63 @@ function artTitle(code, kind, who) {
     : code.match(/<title>([^<]{1,80})<\/title>/i) || code.match(/<h1[^>]*>([^<{]{1,80})</i);
   return t ? t[1].trim() : `${kind === 'react' ? 'Component' : kind === 'svg' ? 'Drawing' : 'Page'} by ${who}`;
 }
+function codeBlock(lang, code, who) {
+  lang = (lang || '').toLowerCase();
+  let kind = PREVIEW[lang];
+  if (!kind && /^\s*<(!doctype html|html)/i.test(code)) kind = 'html';
+  if (!kind && /^\s*<svg[\s>]/i.test(code)) kind = 'svg';
+  let btn = '';
+  if (kind && state.arts) {
+    const n = state.arts.push({kind, code, who, title: artTitle(code, kind, who)}) - 1;
+    btn = `<button class="primary" data-art="${n}">Preview</button>`;
+  }
+  const lines = code.split('\n').length;
+  return `<div class="code"><div class="code-head"><b>${esc(lang || kind || 'code')}</b>${lines} line${lines === 1 ? '' : 's'}
+    ${btn}<button data-copycode>Copy</button></div><pre>${esc(code)}</pre></div>`;
+}
 function richText(raw, who = '') {
   const text = String(raw ?? '');
   let html = '', at = 0;
   const fence = /```([\w+#.-]*)[^\n]*\n([\s\S]*?)\n?```/g;
   let m;
   while ((m = fence.exec(text))) {
-    html += rich(esc(text.slice(at, m.index)));
-    const lang = m[1].toLowerCase(), code = m[2];
-    let kind = PREVIEW[lang];
-    if (!kind && /^\s*<(!doctype html|html)/i.test(code)) kind = 'html';
-    if (!kind && /^\s*<svg[\s>]/i.test(code)) kind = 'svg';
-    let btn = '';
-    if (kind && state.arts) {
-      const n = state.arts.push({kind, code, who, title: artTitle(code, kind, who)}) - 1;
-      btn = `<button class="primary" data-art="${n}">Preview</button>`;
-    }
-    const lines = code.split('\n').length;
-    html += `<div class="code"><div class="code-head"><b>${esc(lang || kind || 'code')}</b>${lines} line${lines === 1 ? '' : 's'}
-      ${btn}<button data-copycode>Copy</button></div><pre>${esc(code)}</pre></div>`;
+    html += rich(esc(text.slice(at, m.index))) + codeBlock(m[1], m[2], who);
     at = fence.lastIndex;
   }
   return html + rich(esc(text.slice(at)));
 }
+/* A reply as the site formatted it (kept by PRISM as HTML): only plain structure survives -
+   no scripts, styles, event handlers or outside images - and code blocks get Preview/Copy. */
+const SITE_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'UL', 'OL', 'LI', 'STRONG', 'B', 'EM', 'I', 'U', 'S', 'DEL',
+  'CODE', 'PRE', 'BLOCKQUOTE', 'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD', 'A', 'BR', 'HR', 'SPAN', 'DIV',
+  'SUP', 'SUB', 'MARK', 'KBD', 'DL', 'DT', 'DD', 'DETAILS', 'SUMMARY', 'SECTION', 'ARTICLE', 'FIGURE', 'FIGCAPTION']);
+function siteHtml(m, who) {
+  const doc = new DOMParser().parseFromString(`<body>${m.meta.html}</body>`, 'text/html');
+  const clean = node => {
+    for (const el of [...node.children]) {
+      if (!SITE_TAGS.has(el.tagName)) { el.replaceWith(...(['SCRIPT', 'STYLE', 'TEMPLATE'].includes(el.tagName) ? [] : el.childNodes)); continue; }
+      for (const a of [...el.attributes]) {
+        const ok = (a.name === 'href' && /^https?:/i.test(a.value)) || ['colspan', 'rowspan'].includes(a.name)
+          || (a.name === 'class' && /^language-[\w+#-]+$/.test(a.value));
+        if (!ok) el.removeAttribute(a.name);
+      }
+      if (el.tagName === 'A') { el.target = '_blank'; el.rel = 'noopener noreferrer'; }
+      clean(el);
+    }
+  };
+  clean(doc.body); clean(doc.body);  // twice: unwrapped children get checked too
+  for (const pre of [...doc.body.querySelectorAll('pre')]) {
+    const code = pre.querySelector('code') || pre;
+    const lang = ((code.className || '').match(/language-([\w+#-]+)/) || [])[1] || '';
+    const holder = doc.createElement('div');
+    holder.innerHTML = codeBlock(lang, code.textContent.replace(/\n$/, ''), who);
+    pre.replaceWith(holder.firstElementChild);
+  }
+  // pictures and files PRISM saved from the reply are lines of its text
+  const media = String(m.content || '').split('\n').filter(l => /^(!\[image\]|\[\u{1F4C4})/u.test(l.trim()));
+  return `<div class="site">${doc.body.innerHTML}</div>${media.length ? rich(esc(media.join('\n'))) : ''}`;
+}
+const replyHtml = (m, who) => m.meta?.html ? siteHtml(m, who) : richText(m.content, who);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state = { chats: [], view: null, tab: 'mother', platforms: null, busy: false, poll: null };
 const BUDGETS = [['full', 'Full'], ['long', 'Long'], ['medium', 'Medium'], ['short', 'Short'], ['off', 'Off']];
@@ -500,7 +545,7 @@ function meetingHtml(msgs, live) {
       const role = ROLE_LABEL[meta.role] ? `<span class="role">${ROLE_LABEL[meta.role]}</span>` : '';
       seats.push({who: meta.speaker, html: `<div class="msg">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">${esc(meta.speaker)}</span>${role}`
         + ` · ${esc(meta.model || '')} · ${meta.latency_s}s</div>`
-        + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : richText(m.content, meta.speaker))
+        + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : replyHtml(m, meta.speaker))
         + (meta.notes || []).map(n => `<div class="muted note">⚙ ${esc(meta.speaker)}: ${esc(n)}</div>`).join('')
         + '</div>'});
       continue;
@@ -530,7 +575,7 @@ function meetingHtml(msgs, live) {
     } else if (kind === 'final') {
       html += `<div class="msg final">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">Final answer</span> · ${esc(meta.speaker)}`
         + (meta.role === 'revise' ? ' (revised after review)' : '') + '</div>'
-        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : richText(m.content, meta.speaker)) + '</div>';
+        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : replyHtml(m, meta.speaker)) + '</div>';
     }
   }
   flush();
@@ -593,7 +638,7 @@ function msgHtml(m, mother) {
       ${meta.judge_rationale ? `<p><b>Judge:</b> ${esc(meta.judge_rationale)}</p>` : ''}
       ${errs ? `<ul>${errs}</ul>` : ''}${ds}</details>`;
   }
-  return `<div class="msg ${m.role}"><div class="who">${who}</div>${richText(m.content, m.meta?.speaker || '')}${extra}</div>`;
+  return `<div class="msg ${m.role}"><div class="who">${who}</div>${replyHtml(m, m.meta?.speaker || '')}${extra}</div>`;
 }
 $('tabs').onclick = e => { const t = e.target.dataset.tab; if (t) { state.tab = t; render(); } };
 $('input').onkeydown = e => {
@@ -861,7 +906,7 @@ function renderSettings(drafts = {}) {
   const creds = Object.fromEntries(credentials.map(c => [c.platform, c]));
   $('primary').innerHTML = '<option value="">Pick one…</option>' + Object.entries(catalog).map(([id, s]) =>
     `<option value="${id}" ${primary === id ? 'selected' : ''} ${creds[id] ? '' : 'disabled'}>${esc(s.label)}${creds[id] ? '' : ' (not set up)'}</option>`).join('');
-  $('plats').innerHTML = Object.entries(catalog).map(([id, s]) => {
+  $('plats').innerHTML = Object.entries(catalog).filter(([id]) => id !== 'ollama' || creds.ollama).map(([id, s]) => {
     const c = creds[id] || {model: s.default_model, enabled: true, transport: s.web ? 'browser' : 'api'};
     if (s.local) return `<div class="plat" data-p="${id}">
       <div class="plat-head"><b>@${esc(id)}</b> <span class="muted" style="font-size:12px">${esc(s.label)}</span></div>
@@ -1016,8 +1061,9 @@ function renderArt() {
   const a = state.arts[artState.i];
   if (!a) { $('artTitle').textContent = 'Nothing to preview in this chat'; $('artBody').innerHTML = ''; return; }
   $('artTitle').textContent = a.title;
-  $('artVersion').innerHTML = state.arts.map((x, n) =>
+  const opts = state.arts.map((x, n) =>
     `<option value="${n}" ${n === artState.i ? 'selected' : ''}>v${n + 1} · ${esc(x.who || 'you')} · ${esc(x.title.slice(0, 40))}</option>`).join('');
+  if (artState.opts !== opts) { artState.opts = opts; $('artVersion').innerHTML = opts; }  // not under an open dropdown
   $('artPreviewTab').classList.toggle('on', artState.tab === 'preview');
   $('artCodeTab').classList.toggle('on', artState.tab === 'code');
   const key = `${artState.i}:${artState.tab}:${a.code.length}`;
