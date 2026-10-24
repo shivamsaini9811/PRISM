@@ -220,6 +220,36 @@ _NOTICES_JS = """() => [...document.querySelectorAll('[role="dialog"], [role="al
   .filter(e => e.offsetWidth || e.offsetHeight).map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
   .filter(t => t.length > 3).join(' | ').slice(0, 300)"""
 
+# The finished reply as text, with code blocks fenced again: innerText of a rendered code
+# block is the language label and the code with no fences ("html\n<!doctype html>...").
+_REPLY_TEXT_JS = """el => {
+  const copy = el.cloneNode(true);
+  copy.style.cssText = 'position:fixed;left:-99999px;top:0;width:900px';
+  document.body.appendChild(copy);
+  try {
+    for (const pre of copy.querySelectorAll('pre')) {
+      const code = pre.querySelector('code') || pre;
+      const cls = [...code.classList, ...pre.classList].find(c => /^(language|lang)-/.test(c));
+      let lang = cls ? cls.replace(/^(language|lang)-/, '') : '';
+      if (!lang) {  // claude.ai and ChatGPT name the language in a header above the code
+        const head = pre.parentElement && pre.parentElement.querySelector(':scope > div:first-child');
+        const t = head && head !== pre ? (head.innerText || '').trim().split(/\\s/)[0].toLowerCase() : '';
+        if (/^[a-z+#]{1,12}$/.test(t)) lang = t;
+      }
+      const text = (code.innerText || code.textContent || '').replace(/\\n$/, '');
+      const box = document.createElement('div');
+      box.textContent = '\\n```' + lang + '\\n' + text + '\\n```\\n';
+      box.style.whiteSpace = 'pre';
+      // the code block's own wrapper (header with the language, Copy button) goes with it
+      let wrap = pre;
+      while (wrap.parentElement && wrap.parentElement !== copy && wrap.parentElement.querySelectorAll('pre').length === 1
+             && (wrap.parentElement.innerText || '').length < text.length + 80) wrap = wrap.parentElement;
+      wrap.replaceWith(box);
+    }
+    return copy.innerText;
+  } finally { copy.remove(); }
+}"""
+
 # For asking another assistant: the page's controls, numbered - structure only, no chat text.
 _OUTLINE_JS = """() => {
   const vis = e => { const r = e.getBoundingClientRect(); return r.width > 4 && r.height > 4; };
@@ -621,7 +651,12 @@ class SiteAdapter:
             if text != last or not text or _is_echo(text, sent):
                 last, stable_since = text, time.monotonic()
             elif (quiet >= settle_s and not streaming_now) or quiet >= stuck_s:
-                return clean_reply(text)  # done, or the site's "writing" marker got stuck
+                try:  # done, or the site's "writing" marker got stuck: read it once more, fenced
+                    if "<pre" in await loc.inner_html(timeout=5000):
+                        text = (await loc.evaluate(_REPLY_TEXT_JS)).strip() or text
+                except Exception:
+                    pass
+                return clean_reply(text)
             await asyncio.sleep(0.3)
         raise ProviderError("reply did not finish before the timeout")
 

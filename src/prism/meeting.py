@@ -46,7 +46,10 @@ MEMBER_SYSTEM = (
     "moderator. Messages from the room reach you labelled by who said them. Build on good "
     "points and challenge weak or wrong ones by name. Be concrete. Answer in plain text in this "
     "chat: don't create documents or use connected apps (email, Drive, Docs) unless the user "
-    "asks for that.{deep}"
+    "asks for that. When you make a file to look at or use (a web page, a component, an SVG, "
+    "a script), put the complete file in one fenced code block in your reply (```html, ```svg, "
+    "```jsx ...) - not in an artifact, canvas or side panel, which the room can't see; PRISM "
+    "shows it as a live preview.{deep}"
 )
 MODERATOR_SYSTEM = (
     "You moderate a group chat between a user and AI models. You see the room labelled by who "

@@ -116,6 +116,32 @@
   .note { font-size:12px; color:var(--muted); background:var(--bg); border-radius:8px; padding:8px 10px; }
   .narrow-only { display:none; }
 
+  /* code blocks in replies, and the artifact pane: live previews of what the bots build */
+  .code { margin:8px 0; border:1px solid var(--border); border-radius:8px; overflow:hidden; white-space:normal; background:var(--bg); }
+  .code-head { display:flex; align-items:center; gap:6px; padding:4px 8px; font-size:11.5px; color:var(--muted); border-bottom:1px solid var(--border); }
+  .code-head b { font-weight:600; color:var(--fg); margin-right:auto; }
+  .code-head button { font-size:11.5px; padding:1px 8px; }
+  .code-head button.primary { padding:1px 10px; }
+  .code pre { margin:0; padding:8px 10px; max-height:260px; overflow:auto; font:12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space:pre; }
+  #art { position:fixed; top:0; right:0; bottom:0; width:min(760px, 52vw); background:var(--card); border-left:1px solid var(--border);
+    display:flex; flex-direction:column; z-index:8; box-shadow:-8px 0 24px rgba(0,0,0,.12); }
+  #artHead { display:flex; align-items:center; gap:6px; padding:8px 10px; border-bottom:1px solid var(--border); flex-wrap:wrap; }
+  #artHead .title { font-weight:600; margin-right:auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:40%; }
+  #artHead select { max-width:220px; font-size:12.5px; padding:3px 6px; }
+  #artHead button { font-size:12.5px; padding:3px 9px; }
+  #artHead button.on { border-color:var(--accent); color:var(--accent); }
+  #artBody { flex:1; min-height:0; position:relative; background:#fff; }
+  #artBody iframe { border:0; width:100%; height:100%; display:block; background:#fff; }
+  #artBody pre { margin:0; height:100%; overflow:auto; padding:12px; font:12px/1.5 ui-monospace, Consolas, monospace; background:var(--bg); color:var(--fg); }
+  #artRevise { display:flex; gap:6px; padding:8px 10px; border-top:1px solid var(--border); }
+  #artRevise input { flex:1; min-width:0; }
+  @media (min-width: 901px) {  /* side by side: the chat narrows, the context panel steps aside */
+    body.art-open #app { grid-template-columns:200px 1fr; margin-right:min(760px, 52vw); }
+    body.art-open #ctx { display:none; }
+    body.art-open #art { box-shadow:none; }
+  }
+  @media (max-width: 900px) { #art { width:100vw; } }
+
   @media (max-width: 900px) {
     #app { grid-template-columns:1fr; }
     aside, #ctx { position:fixed; top:0; bottom:0; width:min(300px, 85vw); z-index:5; transform:translateX(-105%); transition:transform .2s; }
@@ -197,6 +223,24 @@
   </section>
 </div>
 
+<section id="art" class="hidden" aria-label="Preview">
+  <div id="artHead">
+    <span class="title" id="artTitle"></span>
+    <select id="artVersion" title="Every version the room has made"></select>
+    <button id="artPreviewTab" class="on">Preview</button><button id="artCodeTab">Code</button>
+    <button id="artCopy" title="Copy the code">Copy</button>
+    <button id="artDownload" title="Download as a file">Download</button>
+    <button id="artPop" title="Open the preview in a new tab">↗</button>
+    <button id="artClose" title="Close">✕</button>
+  </div>
+  <div id="artBody"></div>
+  <form id="artRevise">
+    <select id="artBot" title="Who revises it"></select>
+    <input id="artAsk" placeholder="Ask for a change - e.g. make the hero darker, add a pricing section">
+    <button class="primary">Revise</button>
+  </form>
+</section>
+
 <div class="overlay hidden" id="lock">
   <form class="modal" id="lockForm">
     <h3 id="lockTitle">Unlock PRISM</h3>
@@ -234,6 +278,38 @@ function rich(html) {  // after esc(): markdown media links become pictures and 
 const filesHtml = names => (names || []).map(n => /\.(png|jpe?g|gif|webp)$/i.test(n)
   ? `<a href="${mediaUrl(n)}" target="_blank"><img class="media-img" style="max-height:160px" src="${mediaUrl(n)}" alt=""></a>`
   : `<a class="file-link" href="${mediaUrl(n)}" download>📎 ${esc(n.split('-').slice(1).join('-'))}</a>`).join('');
+/* Fenced code in a message: shown as a code block; pages, SVG and React components get a live
+   preview. Every previewable block in the chat is a version in the artifact pane. */
+const PREVIEW = {html: 'html', htm: 'html', svg: 'svg', xml: 'svg', jsx: 'react', tsx: 'react', react: 'react'};
+const EXT = {html: 'html', svg: 'svg', react: 'jsx'};
+function artTitle(code, kind, who) {
+  const t = kind === 'react' ? code.match(/(?:function|const|class)\s+([A-Z]\w{1,40})/)
+    : code.match(/<title>([^<]{1,80})<\/title>/i) || code.match(/<h1[^>]*>([^<{]{1,80})</i);
+  return t ? t[1].trim() : `${kind === 'react' ? 'Component' : kind === 'svg' ? 'Drawing' : 'Page'} by ${who}`;
+}
+function richText(raw, who = '') {
+  const text = String(raw ?? '');
+  let html = '', at = 0;
+  const fence = /```([\w+#.-]*)[^\n]*\n([\s\S]*?)\n?```/g;
+  let m;
+  while ((m = fence.exec(text))) {
+    html += rich(esc(text.slice(at, m.index)));
+    const lang = m[1].toLowerCase(), code = m[2];
+    let kind = PREVIEW[lang];
+    if (!kind && /^\s*<(!doctype html|html)/i.test(code)) kind = 'html';
+    if (!kind && /^\s*<svg[\s>]/i.test(code)) kind = 'svg';
+    let btn = '';
+    if (kind && state.arts) {
+      const n = state.arts.push({kind, code, who, title: artTitle(code, kind, who)}) - 1;
+      btn = `<button class="primary" data-art="${n}">Preview</button>`;
+    }
+    const lines = code.split('\n').length;
+    html += `<div class="code"><div class="code-head"><b>${esc(lang || kind || 'code')}</b>${lines} line${lines === 1 ? '' : 's'}
+      ${btn}<button data-copycode>Copy</button></div><pre>${esc(code)}</pre></div>`;
+    at = fence.lastIndex;
+  }
+  return html + rich(esc(text.slice(at)));
+}
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state = { chats: [], view: null, tab: 'mother', platforms: null, busy: false, poll: null };
 const BUDGETS = [['full', 'Full'], ['long', 'Long'], ['medium', 'Medium'], ['short', 'Short'], ['off', 'Off']];
@@ -328,6 +404,7 @@ function watch() {
 /* ---------- thread ---------- */
 function render() {
   const v = state.view;
+  state.arts = [];  // filled again as the messages render
   $('ctxForm').classList.toggle('hidden', !v);
   if (!v) { $('tabs').innerHTML = ''; $('remote').classList.add('hidden'); $('composer').classList.add('hidden');
             $('meetbar').classList.add('hidden'); $('thread').innerHTML = '<div class="empty">Create or pick a chat.</div>'; $('ctxList').innerHTML = ''; return; }
@@ -348,6 +425,7 @@ function render() {
        'A group chat with your AI models. @mention one to ask it, or ask everyone and let them '
        + 'discuss in the format below. You can join in while they talk.'}</div>`;
   if (atBottom || state.busy) t.scrollTop = t.scrollHeight;
+  renderArt();
   $('composer').classList.toggle('hidden', !!d);
   renderMeetbar(!d);
   $('help').classList.toggle('hidden', !!d);
@@ -414,7 +492,7 @@ function meetingHtml(msgs, live) {
       const role = ROLE_LABEL[meta.role] ? `<span class="role">${ROLE_LABEL[meta.role]}</span>` : '';
       seats.push({who: meta.speaker, html: `<div class="msg">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">${esc(meta.speaker)}</span>${role}`
         + ` · ${esc(meta.model || '')} · ${meta.latency_s}s</div>`
-        + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : rich(esc(m.content)))
+        + (meta.error ? `<span class="err">${meta.error === 'stopped' ? 'Cut off by Stop.' : esc(meta.error)}</span>` : richText(m.content, meta.speaker))
         + (meta.notes || []).map(n => `<div class="muted note">⚙ ${esc(meta.speaker)}: ${esc(n)}</div>`).join('')
         + '</div>'});
       continue;
@@ -429,7 +507,7 @@ function meetingHtml(msgs, live) {
     }
     if (kind === 'lookup') {
       html += `<div class="msg lookup"><details><summary><b>${esc(meta.asker)}</b> asked <b>${esc(meta.speaker)}</b>'s memory: ${esc(meta.question)}</summary>`
-        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : esc(m.content.split('\n\n').slice(1).join('\n\n'))) + '</details></div>';
+        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : richText(m.content.split('\n\n').slice(1).join('\n\n'), meta.speaker)) + '</details></div>';
       continue;
     }
     if (kind === 'user') {
@@ -444,7 +522,7 @@ function meetingHtml(msgs, live) {
     } else if (kind === 'final') {
       html += `<div class="msg final">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">Final answer</span> · ${esc(meta.speaker)}`
         + (meta.role === 'revise' ? ' (revised after review)' : '') + '</div>'
-        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : rich(esc(m.content))) + '</div>';
+        + (meta.error ? `<span class="err">${esc(meta.error)}</span>` : richText(m.content, meta.speaker)) + '</div>';
     }
   }
   flush();
@@ -507,7 +585,7 @@ function msgHtml(m, mother) {
       ${meta.judge_rationale ? `<p><b>Judge:</b> ${esc(meta.judge_rationale)}</p>` : ''}
       ${errs ? `<ul>${errs}</ul>` : ''}${ds}</details>`;
   }
-  return `<div class="msg ${m.role}"><div class="who">${who}</div>${rich(esc(m.content))}${extra}</div>`;
+  return `<div class="msg ${m.role}"><div class="who">${who}</div>${richText(m.content, m.meta?.speaker || '')}${extra}</div>`;
 }
 $('tabs').onclick = e => { const t = e.target.dataset.tab; if (t) { state.tab = t; render(); } };
 $('input').onkeydown = e => {
@@ -596,6 +674,12 @@ $('ctxForm').onsubmit = async e => {
   render(); notice(`Saved - use it with #${state.view.context.at(-1)?.name ?? name}`);
 };
 $('thread').onclick = async e => {
+  if (e.target.dataset.art) return openArt(+e.target.dataset.art);
+  if (e.target.hasAttribute('data-copycode')) {
+    const code = e.target.closest('.code').querySelector('pre').textContent;
+    try { await navigator.clipboard.writeText(code); notice('Copied'); } catch { notice('Copy failed - select the code instead'); }
+    return;
+  }
   const id = e.target.dataset.save; if (!id) return;
   const m = state.view.messages.find(x => String(x.id) === id);
   const name = (prompt('Save as context named # (letters, digits, - or _):', '') || '').replace(/^#/, '').trim();
@@ -747,6 +831,115 @@ $('plats').onclick = async e => {
       out.className = 'ok'; out.textContent = 'Saved.'; detail.innerHTML = ''; return;
     }
   } catch (err) { out.className = 'err'; out.textContent = err.message; }
+};
+
+/* ---------- the artifact pane: a live, sandboxed preview of what the bots built ---------- */
+const CDN = {
+  react: 'https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js',
+  reactDom: 'https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js',
+  babel: 'https://cdn.jsdelivr.net/npm/@babel/standalone@7.29.9/babel.min.js',
+  tailwind: 'https://cdn.tailwindcss.com/3.4.17',
+};
+const SHOW_ERRORS = `<script>addEventListener('error', e => document.body.insertAdjacentHTML('beforeend',
+  '<pre style="color:#b00020;white-space:pre-wrap;padding:12px;font:12px monospace">' + String(e.message).replace(/</g, '&lt;') + '</pre>'));<\/script>`;
+function reactPage(code) {
+  // The component as the bots write it: imports from react become React's globals, the
+  // default export is what renders. Other packages aren't available in the preview.
+  const src = JSON.stringify(code).replace(/</g, '\\u003c');
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+${SHOW_ERRORS}<script src="${CDN.react}"><\/script><script src="${CDN.reactDom}"><\/script>
+<script src="${CDN.babel}"><\/script><script src="${CDN.tailwind}"><\/script>
+<style>body{margin:0;font-family:system-ui,sans-serif}</style></head><body><div id="root"></div><script>
+let src = ${src}, name = null;
+const missing = [];
+src = src.replace(/^\\s*import\\s+([\\s\\S]*?)\\s+from\\s+['"]([^'"]+)['"];?\\s*$/gm, (all, what, from) => {
+  if (from === 'react' || from === 'react-dom' || from === 'react-dom/client') return '';
+  missing.push(from); return '';
+}).replace(/^\\s*import\\s+['"][^'"]+['"];?\\s*$/gm, '');
+src = src.replace(/export\\s+default\\s+function\\s+(\\w+)/, (_, n) => (name = n, 'function ' + n))
+         .replace(/export\\s+default\\s+(\\w+)\\s*;?/, (_, n) => (name = name || n, ''))
+         .replace(/^export\\s+/gm, '');
+if (!name) { const all = [...src.matchAll(/(?:function|const|class)\\s+([A-Z]\\w*)/g)]; name = all.length ? all[all.length - 1][1] : null; }
+const pre = 'const {useState, useEffect, useRef, useMemo, useCallback, useReducer, useContext, createContext, Fragment} = React;\\n';
+try {
+  if (missing.length) console.warn('Not available in the preview: ' + missing.join(', '));
+  const out = Babel.transform(pre + src + (name ? '\\nReactDOM.createRoot(document.getElementById("root")).render(React.createElement(' + name + '));' : ''),
+    {presets: [['typescript', {isTSX: true, allExtensions: true}], 'react'], filename: 'App.tsx'}).code;
+  if (!name) throw new Error('No component found to show (export one as default).');
+  new Function(out)();
+  if (missing.length) document.body.insertAdjacentHTML('afterbegin', '<p style="font:12px system-ui;color:#8a5a00;background:#fff4d6;margin:0;padding:6px 10px">Not available in the preview: ' + missing.join(', ') + '</p>');
+} catch (e) { document.body.insertAdjacentHTML('beforeend', '<pre style="color:#b00020;white-space:pre-wrap;padding:12px;font:12px monospace">' + String(e.message || e).replace(/</g, '&lt;') + '</pre>'); }
+<\/script></body></html>`;
+}
+function artDoc(a) {
+  if (a.kind === 'react') return reactPage(a.code);
+  if (a.kind === 'svg') return `<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;height:100%}body{display:grid;place-items:center}svg{max-width:100%;max-height:100vh}</style></head><body>${a.code}</body></html>`;
+  return /<html|<body|<head/i.test(a.code) ? a.code
+    : `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body>${a.code}</body></html>`;
+}
+const SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals';  // never allow-same-origin: no access to PRISM
+const artState = {i: -1, tab: 'preview', follow: false, shown: null};
+function openArt(i, follow = false) {
+  artState.i = i; artState.follow = follow || i === state.arts.length - 1; artState.shown = null;
+  $('art').classList.remove('hidden'); document.body.classList.add('art-open');
+  renderArt();
+}
+function renderArt() {
+  if ($('art').classList.contains('hidden') || !state.arts) return;
+  if (artState.follow) artState.i = state.arts.length - 1;  // a new version arrived: show it
+  const a = state.arts[artState.i];
+  if (!a) { $('artTitle').textContent = 'Nothing to preview in this chat'; $('artBody').innerHTML = ''; return; }
+  $('artTitle').textContent = a.title;
+  $('artVersion').innerHTML = state.arts.map((x, n) =>
+    `<option value="${n}" ${n === artState.i ? 'selected' : ''}>v${n + 1} · ${esc(x.who || 'you')} · ${esc(x.title.slice(0, 40))}</option>`).join('');
+  $('artPreviewTab').classList.toggle('on', artState.tab === 'preview');
+  $('artCodeTab').classList.toggle('on', artState.tab === 'code');
+  const key = `${artState.i}:${artState.tab}:${a.code.length}`;
+  if (artState.shown === key) return;  // unchanged: don't reload the preview on every refresh
+  artState.shown = key;
+  if (artState.tab === 'code') { $('artBody').innerHTML = `<pre>${esc(a.code)}</pre>`; return; }
+  const frame = document.createElement('iframe');
+  frame.setAttribute('sandbox', SANDBOX);
+  frame.title = a.title;
+  frame.srcdoc = artDoc(a);
+  $('artBody').replaceChildren(frame);
+  const bots = (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform);
+  const pick = bots.includes(a.who) ? a.who : bots[0];
+  $('artBot').innerHTML = bots.map(b => `<option ${b === pick ? 'selected' : ''}>${esc(b)}</option>`).join('');
+}
+$('artClose').onclick = () => { $('art').classList.add('hidden'); document.body.classList.remove('art-open'); };
+$('artVersion').onchange = () => { artState.i = +$('artVersion').value; artState.follow = artState.i === state.arts.length - 1; renderArt(); };
+$('artPreviewTab').onclick = () => { artState.tab = 'preview'; renderArt(); };
+$('artCodeTab').onclick = () => { artState.tab = 'code'; renderArt(); };
+$('artCopy').onclick = async () => {
+  try { await navigator.clipboard.writeText(state.arts[artState.i].code); notice('Copied'); } catch { notice('Copy failed'); }
+};
+$('artDownload').onclick = () => {
+  const a = state.arts[artState.i]; if (!a) return;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(new Blob([a.code], {type: 'text/plain'}));
+  link.download = (a.title.replace(/[^\w.-]+/g, '-').replace(/^-|-$/g, '') || 'artifact') + '.' + EXT[a.kind];
+  link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 5000);
+};
+$('artPop').onclick = () => {  // a new tab holding only the sandboxed frame
+  const a = state.arts[artState.i], w = a && window.open('', '_blank');
+  if (!w) return;
+  w.document.write(`<!doctype html><title>${esc(a.title)}</title><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}</style><iframe sandbox="${SANDBOX}"></iframe>`);
+  w.document.close();
+  w.document.querySelector('iframe').srcdoc = artDoc(a);
+};
+$('artRevise').onsubmit = async e => {
+  e.preventDefault();
+  const a = state.arts[artState.i], ask = $('artAsk').value.trim(), bot = $('artBot').value;
+  if (!a || !ask || !bot || !state.view) return;
+  try {
+    state.view = await api(`/api/chats/${state.view.chat.id}/messages`, {method: 'POST', body: {
+      content: `@${bot} ${ask}`, format: 'chat',
+      artifact: {title: a.title, kind: a.kind, code: a.code, who: a.who, version: artState.i + 1}}});
+    $('artAsk').value = ''; artState.follow = true;
+    notice(`${bot} is revising v${artState.i + 1} - the new version opens here`);
+    render(); loadChats(); watch();
+  } catch (err) { alert(err.message); }
 };
 
 $('menuBtn').onclick = () => $('side').classList.toggle('open');

@@ -60,6 +60,20 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="PRISM", version=__version__, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def same_origin_only(request: Request, call_next):
+    """Changes come only from PRISM's own page. Another website open in the browser, or a
+    preview the bots wrote (its sandbox has the origin "null"), can still send a request to
+    127.0.0.1 - refuse it."""
+    origin = request.headers.get("origin")
+    if request.method not in ("GET", "HEAD", "OPTIONS") and origin:
+        host = request.headers.get("host", "")
+        if origin == "null" or origin.split("://", 1)[-1] != host:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail": "Not from PRISM's own page"}, status_code=403)
+    return await call_next(request)
+
+
 # The vault key lives only in this process's memory; restarting the server locks it again.
 _vault: dict[str, Fernet | None] = {"key": None}
 
@@ -421,6 +435,18 @@ class SendIn(BaseModel):
     speakers: dict[str, str] | None = None
     deep: bool | None = None
     files: list[str] = []  # ids from POST /api/media, attached to this message
+    artifact: "ArtifactIn | None" = None  # "revise this": the version on screen goes with it
+
+
+class ArtifactIn(BaseModel):
+    title: str = ""
+    kind: str = "html"     # html | svg | react
+    code: str = Field(max_length=2_000_000)
+    who: str = ""
+    version: int = 0
+
+
+SendIn.model_rebuild()
 
 
 def meeting_defaults() -> dict:
@@ -509,7 +535,8 @@ async def send(chat_id: int, body: SendIn) -> dict:
             return chat_view(chat_id)
         if not running.accepts_messages:
             raise HTTPException(409, "The final answer is being written - send again in a moment")
-        running.add_user_message(text, attach_context(chat_id, text),
+        running.add_user_message(text, attach_context(chat_id, text)
+                                 + ([attach_artifact(chat_id, body.artifact)] if body.artifact else []),
                                  [str(media_path(f)) for f in body.files])
         return chat_view(chat_id)
     await start_session(chat, text, body)
@@ -740,6 +767,24 @@ def latest_answer(chat_id: int) -> str:
     return (finals or said)[-1]["content"]
 
 
+FENCE = {"html": "html", "svg": "svg", "react": "jsx"}
+
+
+def attach_artifact(chat_id: int, art: "ArtifactIn") -> Entry:
+    """The version the user is looking at, for the bot asked to change it: the room may hold
+    it far back (or not at all in that bot's own chat)."""
+    lang = FENCE.get(art.kind, "html")
+    text = (f"The user is looking at v{art.version} of \"{art.title}\"" + (f" (by {art.who})" if art.who else "")
+            + f" and asks for a change. Here it is:\n```{lang}\n{art.code}\n```\n"
+            f"Reply with the complete revised file in one ```{lang} block (not a diff), then a "
+            "line or two on what you changed.")
+    entry = Entry("context", "context", text)
+    entry.id = store().add_message(chat_id, None, "user", text,
+                                   {"kind": "context", "name": "artifact", "speaker": "context",
+                                    "title": art.title, "version": art.version})
+    return entry
+
+
 def attach_context(chat_id: int, text: str) -> list[Entry]:
     """#names in a message: each item joins the room (and is stored) just before it."""
     s, entries = store(), []
@@ -858,6 +903,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
                              entry.text, meta)
 
     room += attach_context(chat_id, text)
+    if body.artifact:
+        room.append(attach_artifact(chat_id, body.artifact))
     topic = Entry("user", "topic", text, files=[str(media_path(f)) for f in body.files])
     topic.id = s.add_message(chat_id, None, "user", text, {
         "kind": "topic", "format": script.format, "rounds": script.rounds,

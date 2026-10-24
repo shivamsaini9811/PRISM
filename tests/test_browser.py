@@ -46,6 +46,10 @@ document.getElementById('send').onclick = () => {
     a.textContent += (i ? ' ' : '') + words[i++];
     if (i === words.length) {
       clearInterval(t); spin.remove();
+      if (q.includes('code')) {  // a rendered code block: language header, Copy button, highlighted code
+        a.insertAdjacentHTML('beforeend', '<div class="cb"><div>html</div><button>Copy</button><pre><code>'
+          + '<span>&lt;h1&gt;</span>Hi<span>&lt;/h1&gt;</span>\\n&lt;p&gt;there&lt;/p&gt;</code></pre></div><p>Done.</p>');
+      }
       if (q.includes('picture')) {  // a generated image and a file to download
         const c = document.createElement('canvas'); c.width = c.height = 120;
         c.getContext('2d').fillRect(0, 0, 120, 120);
@@ -347,3 +351,11 @@ async def test_blocked_message_box_says_what_the_page_shows(manager, tmp_path):
     with pytest.raises(PageNotReady) as e:
         await asyncio.wait_for(p.complete([{"role": "user", "content": "hello"}]), 30)
     assert "You've reached your message limit" in str(e.value) and "screenshot:" in str(e.value)
+
+
+async def test_code_blocks_come_back_fenced_with_their_language(manager):
+    p = BrowserProvider("fake", manager, SiteAdapter(CONFIG, load_timeout_s=5))
+    reply = await asyncio.wait_for(p.complete([{"role": "user", "content": "some code please"}]), 30)
+    assert "```html\n<h1>Hi</h1>\n<p>there</p>\n```" in reply, reply
+    assert reply.startswith("echo: some code please") and reply.endswith("Done.")
+    assert "Copy" not in reply

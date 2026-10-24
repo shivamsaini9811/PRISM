@@ -518,3 +518,38 @@ def test_ask_prism_searches_the_users_other_chats(client, monkeypatch):
     lookup = next(m for m in v["messages"] if m["meta"]["kind"] == "lookup")
     assert lookup["meta"]["speaker"] == "prism" and "rest my knee injury for 6 weeks" in lookup["content"]
     assert "rest my knee" in v["messages"][-1]["content"]
+
+
+def test_revise_sends_the_version_on_screen_to_the_named_bot(client, monkeypatch):
+    seen = []
+
+    class Reviser(Fake):
+        async def complete(self, messages, system=None):
+            seen.append(messages[-1]["content"])
+            return "```html\n<h1>Darker</h1>\n```\nMade it darker."
+
+    def provider(cred, **kw):
+        f = Reviser(cred["platform"]); f.thread_url = None
+        return f
+    monkeypatch.setattr(app_mod, "make_provider", provider)
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    chat = client.post("/api/chats").json()["id"]
+    r = client.post(f"/api/chats/{chat}/messages", json={
+        "content": "@gpt make the hero darker", "format": "chat",
+        "artifact": {"title": "Dilek", "kind": "html", "code": "<h1>Light</h1>", "who": "claude", "version": 2}})
+    assert r.status_code == 200, r.text
+    v = wait_meeting(client, chat)
+    assert '```html\n<h1>Light</h1>\n```' in seen[0] and "complete revised file" in seen[0]
+    ctx = [m for m in v["messages"] if m["meta"]["kind"] == "context"]
+    assert ctx and ctx[0]["meta"]["name"] == "artifact" and ctx[0]["meta"]["version"] == 2
+    assert v["messages"][-1]["content"].startswith("```html\n<h1>Darker</h1>")
+
+
+def test_changes_only_from_prisms_own_page(client):
+    # A preview the bots wrote runs in a sandbox (origin "null"); other sites have their own origin.
+    assert client.post("/api/lock", headers={"origin": "null"}).status_code == 403
+    assert client.post("/api/lock", headers={"origin": "https://evil.example"}).status_code == 403
+    assert client.post("/api/lock", headers={"origin": "http://testserver"}).status_code == 200
+    assert client.post("/api/lock").status_code == 200  # no Origin: not from a browser page
+    assert client.get("/api/status", headers={"origin": "null"}).status_code == 200
