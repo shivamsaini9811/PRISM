@@ -60,9 +60,11 @@ ASK_HELP = (" You can ask the other assistants the user uses ({askable}): each k
             "from its own saved memory and past chats, and can also give advice. Write one line "
             "`ASK @name: <question>` - or `ASK @any: <question>` to ask all of them at once when "
             "you don't know who has it - and nothing after it; the answers come back to you and "
-            "you then finish your turn. When the user mentions their own things you don't have "
-            "(a routine, a plan, past decisions, personal history), ASK before guessing. At most "
-            "{max_asks} asks per turn.{prism}")
+            "you then finish your turn. The one you ask gets a new chat with only your question - "
+            "nothing from this room - so put everything it needs in the question (to have it "
+            "build or write something, paste the full brief). When the user mentions their own "
+            "things you don't have (a routine, a plan, past decisions, personal history), ASK "
+            "before guessing. At most {max_asks} asks per turn.{prism}")
 ASK_PRISM_ONLY = (" You can search the user's past chats in this app: write one line "
                   "`ASK @prism: <keywords>` and nothing after it; the matching messages come back "
                   "to you and you then finish your turn. At most {max_asks} asks per turn.")
@@ -466,11 +468,31 @@ def _with_context(system: str, context: str) -> str:
     return f"{system}\n\n{context}" if context else system
 
 
+_SPLIT_BIT = re.compile(r"^\s*#[0-9A-Fa-f]{3,8}\b")
+
+
 def _ask_request(text: str) -> re.Match | None:
-    """An ASK counts only as the reply's last line - not when a bot quotes or narrates one."""
+    """An ASK counts only at the end of the reply - not when a bot quotes or narrates one.
+    The question may run over a few short lines (web apps break lines inside it, e.g.
+    claude.ai shows colour codes as chips on their own line)."""
     lines = [line for line in text.strip().splitlines() if line.strip()]
-    return ASK_LINE.match(lines[-1]) if lines else None
+    for i in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
+        if ASK_LINE.match(lines[i]):
+            tail = lines[i + 1:]
+            # Lines the app broke out of the question, not narration after it: they start
+            # with a colour code, or the question runs on and ends with its question mark.
+            broken = all(_SPLIT_BIT.match(x) for x in tail) or (
+                len(tail) <= 2 and not re.search(r"[.?!:]\W*$", lines[i])
+                and tail[-1].rstrip(" *_`").endswith("?"))
+            if tail and (not broken or sum(len(x) for x in tail) > 400):
+                return None
+            return ASK_LINE.match(" ".join([lines[i]] + [x.strip() for x in tail]))
+    return None
 
 
 def _err(e: Exception) -> str:
-    return f"{type(e).__name__}: {e}"
+    """Short enough to show: browser errors carry a call log that repeats the whole message
+    that was being typed."""
+    text = re.sub(r'(fill|type|insert_text)\((["\']).*?\2\)', r"\1(…)", str(e), flags=re.S)
+    text = text.split("\nCall log:")[0].strip() or text
+    return f"{type(e).__name__}: {text[:500]}"

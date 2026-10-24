@@ -16,6 +16,11 @@ FAKE_CHAT = """<!doctype html><html><body>
 if (location.hash === '#late') setTimeout(() => {  // the real message box loads slowly
   document.getElementById('composer').id = 'late';
 }, 6500);
+if (location.hash === '#readonly') document.getElementById('composer').setAttribute('aria-readonly', 'true');
+if (location.hash === '#limit') {  // a usage limit: the box is switched off and a notice says why
+  document.getElementById('composer').disabled = true;
+  document.body.insertAdjacentHTML('beforeend', '<div role="alert">You\\'ve reached your message limit. Try again later.</div>');
+}
 if (location.hash === '#input') {  // a message box that isn't a text area: nothing generic finds it
   const i = document.createElement('input'); i.type = 'text'; i.id = 'composer';
   i.style.cssText = 'width:600px;height:40px'; document.getElementById('composer').replaceWith(i);
@@ -315,3 +320,30 @@ async def test_slow_message_box_is_not_learned_as_a_new_one(manager):
     p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=20, on_learn=learned.append))
     assert await p.complete([{"role": "user", "content": "patience"}]) == "echo: patience"
     assert learned == []
+
+
+def test_clean_reply_drops_shortened_preview_and_doubled_steps():
+    raw = ("Building the homepage now from the prompt, with the conflicts resolved the way the design "
+           "system dictates; review and the decisions I made follow \u2026\n"
+           "Sketching diagrams for the sections\n\nSketching diagrams for the sections\n\n"
+           "Building the homepage now from the prompt, with the conflicts resolved the way the design "
+           "system dictates; review and the decisions I made follow the build.\n\n"
+           "Created a file, used artifacts\nCreated a file, used artifacts\n\nDone.")
+    assert clean_reply(raw) == ("Building the homepage now from the prompt, with the conflicts resolved "
+                                "the way the design system dictates; review and the decisions I made "
+                                "follow the build.\n\nCreated a file, used artifacts\n\nDone.")
+
+
+async def test_read_only_message_box_is_typed_with_the_keyboard(manager):
+    # The site marks its box read-only for automation checks but still takes keystrokes.
+    cfg = CONFIG.with_overrides({"new_chat_url": "http://fake.test/new#readonly"})
+    p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=5))
+    assert await asyncio.wait_for(p.complete([{"role": "user", "content": "still here"}]), 30) == "echo: still here"
+
+
+async def test_blocked_message_box_says_what_the_page_shows(manager, tmp_path):
+    cfg = CONFIG.with_overrides({"new_chat_url": "http://fake.test/new#limit"})
+    p = BrowserProvider("fake", manager, SiteAdapter(cfg, load_timeout_s=5, screenshot_dir=tmp_path))
+    with pytest.raises(PageNotReady) as e:
+        await asyncio.wait_for(p.complete([{"role": "user", "content": "hello"}]), 30)
+    assert "You've reached your message limit" in str(e.value) and "screenshot:" in str(e.value)

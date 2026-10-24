@@ -93,10 +93,19 @@ def clean_reply(text: str) -> str:
     # claude.ai: a preview of the first line, then thinking or tool notes ("Used Search Past
     # Conversations, ..."), then the answer itself starting with that line again.
     first = text.split("\n", 1)[0].strip()
-    again = text.find("\n" + first, len(first)) if first else -1
-    if again > 0 and (label or (again < 800 and all(len(x) < 160 for x in text[:again].splitlines()))):
+    cut = first.rstrip("\u2026.").rstrip() if first.endswith(("\u2026", "...")) else ""  # a shortened preview
+    key = cut or first
+    again = text.find("\n" + key, len(first)) if len(key) >= 8 or (key and not cut) else -1
+    if again > 0 and (label or (cut and again < 1500) or
+                      (again < 800 and all(len(x) < 160 for x in text[:again].splitlines()))):
         text = text[again + 1:]
-    lines = [_ICON_CHARS.sub("", line).rstrip() for line in text.splitlines()]
+    lines = []
+    for line in text.splitlines():
+        line = _ICON_CHARS.sub("", line).rstrip()
+        prev = next((x for x in reversed(lines) if x.strip()), None)
+        if line.strip() and line == prev and len(line) < 100:
+            continue  # claude.ai shows each step ("Searched past chats") twice
+        lines.append(line)
     while lines and (not lines[-1].strip() or _CHROME_LINE.match(lines[-1].strip())):
         lines.pop()
     return "\n".join(lines).strip()
@@ -204,6 +213,12 @@ _NAME_IT_JS = """([kind, prompt]) => {
   }
   return null;
 }"""
+
+# Why the message box is blocked: dialogs, alerts and notices the page shows (limit reached,
+# conversation too long, upgrade offers) - their text, briefly.
+_NOTICES_JS = """() => [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], [role="alert"], [role="status"], [aria-live]')]
+  .filter(e => e.offsetWidth || e.offsetHeight).map(e => (e.innerText || '').replace(/\\s+/g, ' ').trim())
+  .filter(t => t.length > 3).join(' | ').slice(0, 300)"""
 
 # For asking another assistant: the page's controls, numbered - structure only, no chat text.
 _OUTLINE_JS = """() => {
@@ -382,7 +397,7 @@ class SiteAdapter:
             await composer.focus()
         if files:
             await self._attach(page, files)
-        await composer.fill(text)
+        await self._type(page, composer, text)
         button = self._visible(page, self.cfg.send_button) if self.cfg.send_button else None
         try:
             if files:  # the send button stays disabled while the files upload
@@ -439,6 +454,42 @@ class SiteAdapter:
                     self.on_learn(learned)
                 except Exception:
                     pass
+
+    async def _type(self, page: Page, composer, text: str) -> None:
+        """Put the message in the box. When the site has marked the box read-only or covered
+        it (a dialog, a usage-limit notice), close what can be closed and type with the
+        keyboard; if nothing lands in the box, say what the page shows instead."""
+        try:
+            if await composer.is_editable(timeout=3000):
+                await composer.fill(text, timeout=30_000)
+                return
+        except Exception:
+            pass
+        try:
+            await page.keyboard.press("Escape")
+            try:
+                await composer.click(timeout=3000)
+            except Exception:
+                await composer.focus()
+            await page.keyboard.press("ControlOrMeta+A")
+            await page.keyboard.insert_text(text)
+            typed = await composer.evaluate("e => ((e.value !== undefined ? e.value : e.innerText) || '').trim().length")
+        except Exception:
+            typed = 0
+        if not typed:
+            raise await self._blocked(page)
+
+    async def _blocked(self, page: Page) -> ProviderError:
+        shot = await self._screenshot(page)
+        try:
+            shown = await page.evaluate(_NOTICES_JS)
+        except Exception:
+            shown = ""
+        return PageNotReady(
+            "the message box can't be typed into" + (f" - the page says: {shown}" if shown else "")
+            + (f" (screenshot: {shot})" if shot else "")
+            + " - a usage limit, a dialog, or a conversation that is too long; open the site "
+              "with Connect to see it")
 
     async def _dismiss_cookie_notice(self, page: Page) -> None:
         try:

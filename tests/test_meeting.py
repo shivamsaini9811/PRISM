@@ -340,3 +340,13 @@ async def test_no_ask_budget_means_no_ask_instructions():
     room.entries.append(Entry("user", "topic", "hi"))
     await s.run()
     assert "ASK" not in room.bot("claude").calls[0][1]
+
+
+def test_ask_split_over_lines_by_the_web_app_still_counts():
+    from prism.meeting import _ask_request, _err
+    q = _ask_request("Building now.\n\nASK @prism: design system canvas\n#FAFAFC plum violet\n#5146E5 One Wish")
+    assert q and q.group(1) == "prism" and q.group(2) == "design system canvas #FAFAFC plum violet #5146E5 One Wish"
+    assert _ask_request("ASK @gpt: what?\n\n" + "Then a long narration. " * 30) is None
+    assert _ask_request("ASK @gpt: what did I decide about\nmy knee?").group(2) == "what did I decide about my knee?"
+    long = Exception('Timeout 30000ms exceeded.\nCall log:\n  - fill("' + "x" * 5000 + '")')
+    assert _err(long) == "Exception: Timeout 30000ms exceeded."
