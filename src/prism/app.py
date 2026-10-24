@@ -23,6 +23,7 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
+from . import local
 from .providers import PLATFORMS, Provider, build_provider
 
 STATIC = Path(__file__).parent / "static"
@@ -122,6 +123,8 @@ def layout_advisor(platform: str):
             creds = []
         creds.sort(key=lambda c: c["transport"] != "api")
         for cred in creds:
+            if cred["transport"] == "webgpu":
+                continue  # needs an open PRISM page; this may run with none
             if cred["transport"] == "browser" and (cred["platform"] not in SITES
                                                    or browsers().lock(cred["platform"]).locked()):
                 continue
@@ -151,6 +154,8 @@ def site_adapter(platform: str, advisor: bool = True) -> SiteAdapter:
 def make_provider(cred: dict, thread_url: str | None = None, fresh: bool = False,
                   resend_system: bool = False, advisor: bool = True) -> Provider:
     """API providers are stateless; browser providers bind to a remote conversation."""
+    if cred["transport"] in LOCAL_TRANSPORTS:
+        return local.local_provider(cred, settings().request_timeout_s)
     if cred["transport"] == "browser":
         if cred["platform"] not in SITES:
             raise ValueError(f"{cred['platform']} has no web app support")
@@ -264,19 +269,45 @@ class CredentialIn(BaseModel):
     enabled: bool = True
 
 
+# Local models: "local" = Ollama / LM Studio on this computer (base_url names which), "webgpu" =
+# running inside the PRISM page. Each is a room member under a name the user picks.
+LOCAL_TRANSPORTS = ("local", "webgpu")
+LOCAL_NAME = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
+RESERVED = {"all", "any", "everyone", "moderator", "mod", "mother", "prism", "context", "user", "you"}
+
+
+def known_platform(platform: str) -> bool:
+    return platform in PLATFORMS or any(c["platform"] == platform for c in store().list_credentials())
+
+
 @app.get("/api/platforms")
 def platforms() -> dict:
     catalog = {p: {**spec, "web": p in SITES} for p, spec in PLATFORMS.items()}
+    for c in store().list_credentials():
+        if c["transport"] in LOCAL_TRANSPORTS:
+            where = "in this browser" if c["transport"] == "webgpu" else \
+                local.RUNTIMES.get(c["base_url"] or "ollama", {}).get("label", c["base_url"])
+            catalog[c["platform"]] = {"label": f"{c['platform']} (local · {c['model']} · {where})",
+                                      "kind": "local", "default_model": c["model"], "needs_secret": False,
+                                      "web": False, "local": c["transport"]}
     return {"catalog": catalog, "credentials": store().list_credentials(),
             "primary": store().get_meta("primary_platform")}
 
 
 @app.put("/api/credentials/{platform}")
 def put_credential(platform: str, c: CredentialIn) -> dict:
+    if c.transport in LOCAL_TRANSPORTS:
+        if not LOCAL_NAME.match(platform) or platform in RESERVED or platform in PLATFORMS:
+            raise HTTPException(400, f"Pick another name than {platform!r}: lowercase letters, digits "
+                                     "and -, starting with a letter, and not a platform's name")
+        if not c.model:
+            raise HTTPException(400, "Which model? Pick one of the installed models")
+        store().upsert_credential(vault(), platform, c.model, None, c.base_url or None, c.enabled, c.transport)
+        return platforms()
     if platform not in PLATFORMS:
         raise HTTPException(404, f"Unknown platform {platform!r}")
     if c.transport not in ("api", "browser"):
-        raise HTTPException(400, "transport must be 'api' or 'browser'")
+        raise HTTPException(400, "transport must be 'api', 'browser', 'local' or 'webgpu'")
     if c.transport == "browser" and platform not in SITES:
         raise HTTPException(400, f"{platform} has no web app support")
     store().upsert_credential(vault(), platform, c.model or PLATFORMS[platform]["default_model"],
@@ -355,10 +386,46 @@ class PrimaryIn(BaseModel):
 
 @app.put("/api/primary")
 def set_primary(p: PrimaryIn) -> dict:
-    if p.platform not in PLATFORMS:
+    if not known_platform(p.platform):
         raise HTTPException(404, f"Unknown platform {p.platform!r}")
     store().set_meta("primary_platform", p.platform)
     return platforms()
+
+
+# --- local models: Ollama / LM Studio on this computer, and models in the PRISM page --------
+
+@app.get("/api/local")
+async def local_models() -> dict:
+    return {"runtimes": await local.detect(), "pulls": local.pulls(), "suggested": local.SUGGESTED,
+            "free_ram_mb": local.free_ram_mb()}
+
+
+class PullIn(BaseModel):
+    model: str = Field(min_length=1, max_length=120, pattern=r"^[\w.:/-]+$")
+
+
+@app.post("/api/local/pull")
+async def pull_model(body: PullIn) -> dict:
+    """Ollama downloads the model; GET /api/local shows the progress."""
+    local.start_pull(body.model)
+    return {"pulls": local.pulls()}
+
+
+@app.get("/api/client-jobs")
+def take_client_jobs(models: str = "") -> dict:
+    """A PRISM page with in-browser models loaded takes the turns waiting for them."""
+    loaded = [m for m in models.split(",") if m]
+    return {"jobs": local.client_jobs.take(loaded), "waiting": local.client_jobs.waiting_models()}
+
+
+class JobResultIn(BaseModel):
+    text: str | None = None
+    error: str | None = None
+
+
+@app.post("/api/client-jobs/{job_id}")
+def finish_client_job(job_id: str, body: JobResultIn) -> dict:
+    return {"accepted": local.client_jobs.finish(job_id, body.text, body.error)}
 
 
 # --- chats -------------------------------------------------------------------------------

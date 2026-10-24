@@ -133,6 +133,12 @@
   #artBody { flex:1; min-height:0; position:relative; background:#fff; }
   #artBody iframe { border:0; width:100%; height:100%; display:block; background:#fff; }
   #artBody pre { margin:0; height:100%; overflow:auto; padding:12px; font:12px/1.5 ui-monospace, Consolas, monospace; background:var(--bg); color:var(--fg); }
+  #localBox h4 { margin:10px 0 4px; font-size:13px; } #localBox h4:first-child { margin-top:0; }
+  .lm { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:13px; }
+  .lm span { flex:1; } .lm button { font-size:12px; padding:1px 9px; }
+  progress { width:120px; height:8px; }
+  #webStatus { position:fixed; left:12px; bottom:12px; z-index:9; background:var(--card); border:1px solid var(--border);
+    border-radius:8px; padding:6px 10px; font-size:12px; max-width:340px; }
   #artRevise { display:flex; gap:6px; padding:8px 10px; border-top:1px solid var(--border); }
   #artRevise input { flex:1; min-width:0; }
   @media (min-width: 901px) {  /* side by side: the chat narrows, the context panel steps aside */
@@ -223,6 +229,7 @@
   </section>
 </div>
 
+<div id="webStatus" class="hidden"></div>
 <section id="art" class="hidden" aria-label="Preview">
   <div id="artHead">
     <span class="title" id="artTitle"></span>
@@ -260,6 +267,7 @@
       <select id="primary"></select>
       <div class="note">The primary moderates every meeting: after each round it writes the analysis, and at the end the final answer. It uses one extra conversation per meeting. An <b>API</b> connection makes it much faster.</div>
     </div>
+    <div id="localBox" class="plat"></div>
     <div id="plats"></div>
   </div>
 </div>
@@ -734,8 +742,119 @@ async function loadPlatforms() {
   const p = state.platforms;
   $('motherLabel').textContent = p.primary ? `Mother: ${p.primary}` : 'No primary set';
 }
-$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); };
-$('closeSettings').onclick = () => { $('settings').classList.add('hidden'); if (state.view) render(); };
+$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); };
+$('closeSettings').onclick = () => { $('settings').classList.add('hidden'); clearTimeout(state.localPoll); if (state.view) render(); };
+
+/* ---------- local models: Ollama / LM Studio on this computer, or in this browser ---------- */
+const WEBLLM = 'https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.85/+esm';
+const slug = m => (m.split('/').pop().split(':')[0].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  .replace(/^(\d)/, 'm$1').slice(0, 20)) || 'local';
+async function loadLocal() {
+  clearTimeout(state.localPoll);
+  if ($('settings').classList.contains('hidden')) return;
+  let r;
+  try { r = await api('/api/local'); } catch (err) { $('localBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  state.local = r;
+  renderLocal();
+  if (Object.values(r.pulls).some(x => !x.done)) state.localPoll = setTimeout(loadLocal, 1000);  // a download is running
+}
+function renderLocal() {
+  const r = state.local; if (!r) return;
+  const added = new Set((state.platforms?.credentials || []).map(c => `${c.transport}|${c.base_url || ''}|${c.model}`));
+  const free = r.free_ram_mb;
+  const runtime = rt => {
+    if (!rt.running) return `<h4>${esc(rt.label)} <span class="muted">· not running</span></h4>
+      <div class="muted" style="font-size:12.5px">${rt.id === 'ollama'
+        ? `<a href="${rt.install}" target="_blank" rel="noopener">Install Ollama</a> (free), open it, then press Refresh. PRISM then downloads models for you.`
+        : `If you use <a href="${rt.install}" target="_blank" rel="noopener">LM Studio</a>: load a model and start its server (Developer → Start server), then Refresh.`}</div>`;
+    const models = rt.models.map(m => {
+      const big = free && m.size_mb && m.size_mb > free * 0.8;
+      const has = added.has(`local|${rt.id}|${m.name}`);
+      return `<div class="lm"><span>${esc(m.name)} <span class="muted">${m.size_mb ? (m.size_mb / 1024).toFixed(1) + ' GB' : ''}</span>
+        ${big ? '<span class="err" title="Bigger than the free memory: it will be slow, or fail">· more than free memory</span>' : ''}</span>
+        ${has ? '<span class="ok">in the room</span>' : `<button data-addlocal="${esc(m.name)}" data-rt="${rt.id}">Add to room</button>`}</div>`;
+    }).join('') || '<div class="muted" style="font-size:12.5px">No models yet.</div>';
+    const pulls = rt.id !== 'ollama' ? '' : Object.entries(r.pulls).map(([name, p]) =>
+      `<div class="lm"><span>${esc(name)}: ${p.error ? `<span class="err">${esc(p.error)}</span>` : esc(p.status)}</span>
+        ${!p.done && p.total ? `<progress max="${p.total}" value="${p.completed}"></progress>` : ''}</div>`).join('');
+    const get = rt.id !== 'ollama' ? '' : `<div class="lm"><input id="pullName" list="pullList" placeholder="model to download, e.g. ${esc(r.suggested[0])}" style="flex:1">
+      <datalist id="pullList">${r.suggested.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
+      <button data-pull>Download</button></div>`;
+    return `<h4>${esc(rt.label)} <span class="ok">· running</span></h4>${models}${pulls}${get}`;
+  };
+  const gpu = 'gpu' in navigator;
+  $('localBox').innerHTML = `<div class="plat-head"><b>Local models</b><button data-localrefresh>Refresh</button></div>
+    <div class="muted" style="font-size:12px">Run models on this computer: private, free, offline. Each joins the room under its own @name.
+      ${free ? `Free memory now: ${(free / 1024).toFixed(1)} GB - a model needs about its size in memory.` : ''}</div>
+    ${r.runtimes.map(runtime).join('')}
+    <h4>In this browser <span class="muted">· ${gpu ? 'WebGPU available' : 'needs WebGPU (Edge or Chrome)'}</span></h4>
+    <div class="muted" style="font-size:12.5px">No install: the model runs inside this PRISM tab (small models, 1-8B). The first use downloads it (1-5 GB) and keeps it in the browser. Keep the tab open while it answers.</div>
+    ${gpu ? `<div class="lm"><select id="webModel" style="flex:1"><option value="">Pick a model…</option></select><button data-addweb>Add to room</button></div>` : ''}`;
+  if (gpu) fillWebModels();
+}
+async function fillWebModels() {
+  try {
+    const lib = await import(WEBLLM);
+    const list = lib.prebuiltAppConfig.model_list.filter(m => !/embed/i.test(m.model_id))
+      .sort((a, b) => (a.vram_required_MB || 0) - (b.vram_required_MB || 0));
+    if (!$('webModel')) return;
+    $('webModel').innerHTML = '<option value="">Pick a model…</option>' + list.map(m =>
+      `<option value="${esc(m.model_id)}">${esc(m.model_id)}${m.vram_required_MB ? ` · ${(m.vram_required_MB / 1024).toFixed(1)} GB` : ''}</option>`).join('');
+  } catch (err) { if ($('webModel')) $('webModel').outerHTML = `<span class="err">Couldn't load the model list: ${esc(err.message)}</span>`; }
+}
+async function addLocal(model, transport, runtime) {
+  const name = (prompt(`Name it in the room (you'll write @name to ask it):`, slug(model)) || '').trim().toLowerCase();
+  if (!name) return;
+  try {
+    state.platforms = await api(`/api/credentials/${encodeURIComponent(name)}`, {method: 'PUT',
+      body: {transport, model, base_url: runtime || null, enabled: true}});
+    renderSettings(); renderLocal(); notice(`@${name} joined - ask it with @${name}`);
+  } catch (err) { alert(err.message); }
+}
+$('localBox').onclick = async e => {
+  const t = e.target;
+  if (t.hasAttribute('data-localrefresh')) return loadLocal();
+  if (t.dataset.addlocal) return addLocal(t.dataset.addlocal, 'local', t.dataset.rt);
+  if (t.hasAttribute('data-addweb')) { const m = $('webModel').value; if (m) addLocal(m, 'webgpu', ''); return; }
+  if (t.hasAttribute('data-pull')) {
+    const m = $('pullName').value.trim(); if (!m) return;
+    try { await api('/api/local/pull', {method: 'POST', body: {model: m}}); loadLocal(); } catch (err) { alert(err.message); }
+  }
+};
+
+/* In-browser models: the PRISM server hands their turns to this page, which runs them. */
+const web = {engine: null, model: null, busy: false};
+function webStatus(text) { $('webStatus').textContent = text; $('webStatus').classList.toggle('hidden', !text); }
+async function webEngine(model) {
+  if (web.engine && web.model === model) return web.engine;
+  const lib = await import(WEBLLM);
+  if (web.engine) { try { await web.engine.unload(); } catch {} web.engine = null; }
+  webStatus(`Loading ${model}…`);
+  web.engine = await lib.CreateMLCEngine(model, {initProgressCallback: p => webStatus(`${model}: ${p.text}`)});
+  web.model = model;
+  return web.engine;
+}
+async function webJobs() {
+  const mine = (state.platforms?.credentials || []).filter(c => c.transport === 'webgpu' && c.enabled).map(c => c.model);
+  if (!mine.length || web.busy || !('gpu' in navigator)) return;
+  let r;
+  try { r = await (await fetch('/api/client-jobs?models=' + encodeURIComponent(mine.join(',')))).json(); } catch { return; }
+  if (!r.jobs?.length) return;
+  web.busy = true;
+  for (const job of r.jobs) {
+    let body;
+    try {
+      const engine = await webEngine(job.model);
+      webStatus(`${job.model} is answering…`);
+      const out = await engine.chat.completions.create({messages: job.messages});
+      body = {text: out.choices[0].message.content || ''};
+    } catch (err) { body = {error: String(err.message || err)}; }
+    try { await api(`/api/client-jobs/${job.id}`, {method: 'POST', body}); } catch {}
+  }
+  webStatus(web.model ? `${web.model} ready in this tab` : '');
+  web.busy = false;
+}
+setInterval(webJobs, 1500);
 
 function renderSettings(drafts = {}) {
   const {catalog, credentials, primary} = state.platforms;
@@ -744,6 +863,13 @@ function renderSettings(drafts = {}) {
     `<option value="${id}" ${primary === id ? 'selected' : ''} ${creds[id] ? '' : 'disabled'}>${esc(s.label)}${creds[id] ? '' : ' (not set up)'}</option>`).join('');
   $('plats').innerHTML = Object.entries(catalog).map(([id, s]) => {
     const c = creds[id] || {model: s.default_model, enabled: true, transport: s.web ? 'browser' : 'api'};
+    if (s.local) return `<div class="plat" data-p="${id}">
+      <div class="plat-head"><b>@${esc(id)}</b> <span class="muted" style="font-size:12px">${esc(s.label)}</span></div>
+      <select data-f="transport" class="hidden"><option value="${s.local}" selected></option></select>
+      <input data-f="model" type="hidden" value="${esc(c.model)}"><input data-f="base_url" type="hidden" value="${esc(c.base_url || '')}">
+      <div class="plat-actions"><label><input type="checkbox" data-f="enabled" ${c.enabled ? 'checked' : ''}> Enabled</label>
+        <button class="primary" data-act="save">Save</button><button data-act="remove">Remove</button>
+        <span class="muted" data-out style="font-size:12px"></span></div><div data-detail></div></div>`;
     const transport = drafts[id] || c.transport;
     const browser = transport === 'browser';
     const needsKey = s.needs_secret !== false;
@@ -790,7 +916,7 @@ $('plats').onclick = async e => {
     if (act === 'save') {
       const body = {transport: f('transport').value, model: f('model').value, enabled: f('enabled').checked,
                     base_url: f('base_url').value || null};
-      if (f('secret').value) body.secret = f('secret').value;
+      if (f('secret')?.value) body.secret = f('secret').value;
       state.platforms = await api(`/api/credentials/${p}`, {method: 'PUT', body});
       if (!state.platforms.primary) state.platforms = await api('/api/primary', {method: 'PUT', body: {platform: p}});
       await loadPlatforms(); renderSettings(); return;
