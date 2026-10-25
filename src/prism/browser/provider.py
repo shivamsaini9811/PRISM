@@ -27,6 +27,7 @@ class BrowserProvider(Provider):
         self.notes: list[str] = []
         self.last_html: str | None = None
         self._queued_at: float | None = None
+        self.research = False  # switch the site's deep research mode on for each message
 
     @property
     def last_activity(self) -> float | None:
@@ -62,7 +63,7 @@ class BrowserProvider(Provider):
             page = await self.manager.new_page()  # a tab in the shared headless browser
             try:
                 await self.adapter.open(page, None if self.fresh else self.thread_url)
-                reply = await self.adapter.send(page, text, files=files)
+                reply = await self.adapter.send(page, text, files=files, research=self.research)
                 self.notes = list(self.adapter.notes)  # the site's layout changed: what PRISM did
                 self.last_html = self.adapter.last_html  # the reply as the site showed it
                 if not self.fresh:

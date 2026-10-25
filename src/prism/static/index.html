@@ -236,6 +236,8 @@
           <select id="asks"><option>0</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label>
         <label title="Ask API models to think longer, and every speaker to reason step by step">
           <input type="checkbox" id="deep"> Deep</label>
+        <label title="Web bots switch on their site's Deep Research (Claude Research, ChatGPT deep research, Gemini Deep Research, Grok Expert). Thorough, with sources - and slow: 5-30 minutes, and it uses your plan's research allowance">
+          <input type="checkbox" id="research"> Research</label>
         <span class="muted" title="How long each speaker may talk per turn: Full = no limit (Long/Medium/Short ask for about 400/200/80 words)">Speakers:</span>
         <div id="seatsCfg"></div>
       </div>
@@ -343,7 +345,8 @@
         <div class="lib-opts" style="font-size:12.5px">
           <label><input type="checkbox" data-agtool="docs"> search your folders (ASK @docs)</label>
           <label><input type="checkbox" data-agtool="prism"> search past chats (ASK @prism)</label>
-          <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label></div>
+          <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label>
+          <label title="Web bots only: the site's Deep Research for each step (slow, uses your research allowance)"><input type="checkbox" id="agResearch"> deep research</label></div>
         <textarea id="agOutput" style="min-height:50px" placeholder="Fields PRISM reads from its reply, one per line, e.g.&#10;verdict: PASS|FIX&#10;notes: text"></textarea>
         <button class="primary">Save agent</button>
       </form>
@@ -901,7 +904,7 @@ $('agentList').onclick = async e => {
     $('agName').value = a.name; $('agModel').value = a.model; $('agInstr').value = a.instructions || '';
     $('agContext').value = (a.context || []).map(c => '#' + c).join(' ');
     $('agentForm').querySelectorAll('[data-agtool]').forEach(c => c.checked = (a.tools || []).includes(c.dataset.agtool));
-    $('agOutput').value = Object.entries(a.output || {}).map(([k, x]) => `${k}: ${x}`).join('\n');
+    $('agOutput').value = Object.entries(a.output || {}).map(([k, x]) => `${k}: ${x}`).join('\n'); $('agResearch').checked = !!a.research;
   }
 };
 $('agentForm').onsubmit = async e => {
@@ -911,7 +914,7 @@ $('agentForm').onsubmit = async e => {
     .map(([k, ...x]) => [k.trim(), x.join(':').trim() || 'text']));
   try {
     fl.agents = (await api(`/api/agents/${encodeURIComponent(name)}`, {method: 'PUT', body: {
-      model: $('agModel').value, instructions: $('agInstr').value, output,
+      model: $('agModel').value, instructions: $('agInstr').value, output, research: $('agResearch').checked,
       context: $('agContext').value.split(/[\s,]+/).filter(Boolean),
       tools: [...$('agentForm').querySelectorAll('[data-agtool]:checked')].map(c => c.dataset.agtool)}})).agents;
     renderAgents(); notice(`Saved @${name} - use it in flows, or @${name} in a chat`);
@@ -941,7 +944,7 @@ function renderMeetbar(show) {
   if (!$('rounds').options.length)
     $('rounds').innerHTML = [1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}">${n}</option>`).join('');
   if (document.activeElement?.closest('#setup')) return;  // don't reset a control being used
-  $('rounds').value = def.rounds; $('asks').value = def.asks ?? 3; $('deep').checked = def.deep; $('format').value = def.format || 'roundtable';
+  $('rounds').value = def.rounds; $('asks').value = def.asks ?? 3; $('deep').checked = def.deep; $('research').checked = !!def.research; $('format').value = def.format || 'roundtable';
   const seats = (state.platforms?.credentials || []).filter(c => c.enabled);
   $('seatsCfg').innerHTML = seats.map(c => `<label>${esc(c.platform)}<select data-seat="${esc(c.platform)}">`
     + BUDGETS.map(([k, l]) => `<option value="${k}" ${(def.speakers[c.platform] || 'full') === k ? 'selected' : ''}>${l}</option>`).join('')
@@ -982,7 +985,7 @@ $('composer').onsubmit = async e => {
   if ((!text && !files.length) || state.busy) return;
   const id = state.view.chat.id, body = {content: text, files: files.map(f => f.id)};
   if (!state.view.meeting) {  // a new meeting: send its setup (remembered for next time)
-    body.rounds = +$('rounds').value; body.asks = +$('asks').value; body.deep = $('deep').checked; body.speakers = {};
+    body.rounds = +$('rounds').value; body.asks = +$('asks').value; body.deep = $('deep').checked; body.research = $('research').checked; body.speakers = {};
     body.format = $('format').value;
     document.querySelectorAll('[data-seat]').forEach(s => body.speakers[s.dataset.seat] = s.value);
   }

@@ -42,6 +42,22 @@ class SiteConfig:
     signed_out: str = ""        # visible only when signed out (sites that still let you chat)
     file_input: str = 'input[type="file"]'  # where attachments go (hidden inputs are fine)
     attach_button: str = ""     # opens the file picker when the site has no file input yet
+    # Deep research: what to click, in order, to switch it on for the next message (steps
+    # separated by " ;; "; a last step that is a checkbox already on is not clicked again).
+    research_mode: str = ""
+    # A button the site shows mid-reply and waits on (Gemini's "Start research"): clicked.
+    continue_button: str = ""
+    # Text on the page that means research is still going, even with no Stop button
+    # (a regular expression, e.g. ChatGPT's "Deep Research has started investigating").
+    research_pending: str = ""
+    # A document the reply made, shown as a card that opens in a side panel (claude.ai's
+    # reports and artifacts): PRISM opens each card and adds the document to the reply.
+    document_card: str = ""
+    document_panel: str = ""
+    # Text that means the research finished (looked for on the page and in its frames), and
+    # an embedded frame holding the report (ChatGPT draws it in an app frame of its own).
+    research_done: str = ""
+    document_frame: str = ""
     verified: bool = False
 
     def with_overrides(self, overrides: dict | None) -> "SiteConfig":
@@ -65,6 +81,23 @@ _SR_LABEL = re.compile(r"^\w[\w .-]{0,20} responded:\s*", re.IGNORECASE)
 _STATUS_LINE = re.compile(r"^(?:Grok|ChatGPT|Claude|Gemini|"
                           r"(?:Worked|Thought|Thinking|Reasoned) for \d+\s*(?:s|sec|seconds?|m|min|minutes?)?)$",
                           re.IGNORECASE)
+
+
+# The document in a side panel: its own content area when there is one (claude.ai's
+# #markdown-artifact), else the panel without its toolbar buttons.
+_DOC_TEXT_JS = """p => { const body = p.querySelector('#markdown-artifact, [class*="markdown"], pre, code') || p;
+  const c = body.cloneNode(true); c.querySelectorAll('button, [role=toolbar], nav').forEach(x => x.remove());
+  return c.innerText; }"""
+
+RELOAD_STALLED_S = 120.0
+
+PROCEED = "No preference - use your best judgement and go ahead with the research."
+
+
+def _asks_first(reply: str) -> bool:
+    """A short reply ending in questions: deep research asking before it starts."""
+    tail = reply.strip()[-400:]
+    return len(reply) < 1500 and tail.count("?") >= 1 and tail.rstrip().endswith(("?", ":"))
 
 
 def _is_echo(text: str, sent: str) -> bool:
@@ -317,6 +350,7 @@ class SiteAdapter:
         # up after idle_s with nothing changing on the page (3x that while a Stop button still
         # shows). A Stop button that stays up with the reply unchanged for stuck_s is stale.
         self.idle_s, self.stuck_s = idle_s, stuck_s
+        self.research_settle_s = 15.0  # research replies arrive in parts: wait this long for quiet
         self.last_activity: float | None = None  # heartbeat while PRISM is still judging the reply
         self._page_mark: str | None = None
         self.load_timeout_ms = load_timeout_s * 1000
@@ -442,8 +476,19 @@ class SiteAdapter:
             return None
 
     async def send(self, page: Page, text: str, timeout_s: float | None = None,
-                   files: list[str] = ()) -> str:
-        """timeout_s: give up after this long with no activity on the page (default idle_s)."""
+                   files: list[str] = (), research: bool = False) -> str:
+        """timeout_s: give up after this long with no activity on the page (default idle_s).
+        research: switch the site's deep research mode on for this message first."""
+        self._research, self._continued = research, False
+        reply = await self._send_once(page, text, timeout_s, files, research)
+        if research and _asks_first(reply):
+            # Deep research on some sites asks clarifying questions before it starts.
+            self.notes.append("research asked questions first - told it to go ahead with its best judgement")
+            reply = await self._send_once(page, PROCEED, timeout_s)
+        return reply
+
+    async def _send_once(self, page: Page, text: str, timeout_s: float | None = None,
+                         files: list[str] = (), research: bool = False) -> str:
         idle = timeout_s or self.idle_s
         self.last_html = None
         self._beat()
@@ -460,6 +505,12 @@ class SiteAdapter:
             await composer.click(timeout=3000)
         except Exception:  # something still covers it: focus and type without clicking
             await composer.focus()
+        if research:
+            await self._research_on(page)
+            try:
+                await composer.click(timeout=3000)
+            except Exception:
+                await composer.focus()
         if files:
             await self._attach(page, files)
         await self._type(page, composer, text)
@@ -477,6 +528,7 @@ class SiteAdapter:
         changed_at = time.monotonic()
         while not await replies.count():
             self._beat()
+            await self._press_continue(page)
             if await self._page_changed(page) or await self._showing(page, marker):
                 changed_at = time.monotonic()
             elif time.monotonic() - changed_at > idle:
@@ -674,6 +726,106 @@ class SiteAdapter:
     def _beat(self) -> None:
         self.last_activity = time.monotonic()
 
+    async def _research_on(self, page: Page) -> None:
+        steps = [x.strip() for x in self.cfg.research_mode.split(";;") if x.strip()]
+        if not steps:
+            self.notes.append("this site has no research mode set up - sent as a normal message")
+            return
+        try:
+            for i, sel in enumerate(steps):
+                el = page.locator(sel).filter(visible=True).first
+                await el.wait_for(timeout=5000)
+                last = i == len(steps) - 1
+                on = await el.evaluate("e => e.getAttribute('aria-checked') || e.getAttribute('aria-pressed') || ''")
+                if last and on == "true":
+                    break  # already on
+                await el.click(timeout=3000)
+                await page.wait_for_timeout(600)
+            if await page.locator('[role="menu"]').filter(visible=True).count():
+                await page.keyboard.press("Escape")
+            self.notes.append("research mode on")
+        except Exception as e:
+            await page.keyboard.press("Escape")
+            self.notes.append(f"couldn't switch research mode on ({str(e).splitlines()[0][:80]}) - sent as a normal message")
+
+    async def _page_text(self, page: Page) -> str:
+        """The end of the conversation's text, and of each embedded frame's."""
+        parts = []
+        for f in page.frames:
+            try:
+                parts.append(await f.evaluate(
+                    "() => (document.querySelector('main') || document.body)?.innerText.slice(-4000) || ''"))
+            except Exception:
+                continue
+        return "\n".join(parts)
+
+    async def _frame_documents(self, page: Page) -> list[str]:
+        """Reports drawn inside an embedded frame (and the frames within it)."""
+        out = []
+        frames = page.locator(self.cfg.document_frame)
+        for i in range(await frames.count())[-1:]:  # the newest: older ones belong to earlier turns
+            try:
+                top = await (await frames.nth(i).element_handle(timeout=3000)).content_frame()
+                if top is None:
+                    continue
+                texts = []
+                for f in [top] + top.child_frames + [g for c in top.child_frames for g in c.child_frames]:
+                    try:
+                        texts.append(await f.evaluate("() => document.body ? document.body.innerText : ''"))
+                    except Exception:
+                        pass
+                text = max(texts, key=len, default="")
+                text = re.sub(r"(?:\n\d(?=\n)){5,}\n?", " ", text)  # animated counters: runs of digits
+                text = re.sub(r"[ \t]+\n", "\n", text).strip()
+                if len(text) > 40:
+                    out.append(text)
+                    self.notes.append("read the research report from its embedded frame")
+            except Exception as e:
+                self.notes.append(f"couldn't read the embedded report ({str(e).splitlines()[0][:80]})")
+        return out
+
+    async def _read_documents(self, page: Page, reply) -> list[str]:
+        """Open each document card in the reply and read the panel it opens; read reports
+        drawn in embedded frames."""
+        out = await self._frame_documents(page) if self.cfg.document_frame else []
+        if not (self.cfg.document_card and self.cfg.document_panel):
+            return out
+        try:
+            cards = reply.locator(self.cfg.document_card)
+            for i in range(min(await cards.count(), 5)):
+                card = cards.nth(i)
+                kind = (await card.get_attribute("data-sheet-kind")) or ""
+                await card.click(timeout=5000)
+                panel = page.locator(self.cfg.document_panel).filter(visible=True).last
+                await panel.wait_for(timeout=10_000)
+                await page.wait_for_timeout(1500)  # the document renders after the panel
+                title = ((await panel.get_attribute("aria-label")) or "").split(":", 1)[-1].strip()
+                body = (await panel.evaluate(_DOC_TEXT_JS)).strip()
+                if not body:
+                    continue
+                if kind and kind not in ("markdown", "text", "document"):
+                    lang = {"react": "jsx", "application/vnd.ant.react": "jsx"}.get(kind, kind)
+                    body = f"```{lang}\n{body}\n```"
+                out.append(f"## {title}\n\n{body}" if title and not body.startswith(title) else body)
+                self.notes.append(f"read the document \"{title or 'untitled'}\" from its panel")
+        except Exception as e:
+            self.notes.append(f"couldn't read a document the reply made ({str(e).splitlines()[0][:80]})")
+        return out
+
+    async def _press_continue(self, page: Page) -> None:
+        """The site paused for the user (Gemini shows its research plan and waits): go on."""
+        if not self.cfg.continue_button or getattr(self, "_continued", False):
+            return  # once per message: the button can stay on screen after it was used
+        try:
+            button = page.locator(self.cfg.continue_button).filter(visible=True).first
+            if await button.count():
+                label = (await button.inner_text(timeout=1000)).strip() or "continue"
+                await button.click(timeout=3000)
+                self._continued = True
+                self.notes.append(f"clicked \"{label}\" for you")
+        except Exception:
+            pass
+
     async def _showing(self, page: Page, selector: str) -> bool:
         try:
             return bool(selector) and await page.locator(selector).filter(visible=True).count() > 0
@@ -697,17 +849,29 @@ class SiteAdapter:
         nothing changed for idle_s (3x that while a Stop button shows).
         `reply` is re-resolved each time, so an echo of `sent` is skipped for the real reply;
         it may also be an async function returning the locator to read."""
-        marker = ", ".join(s for s in (self.cfg.streaming, streaming) if s)
+        research = getattr(self, "_research", False)
+        # Research mode: any Stop button counts (claude.ai marks its message done while the
+        # research card keeps working), and the reply must stay put a while before it counts.
+        marker = ", ".join(s for s in (self.cfg.streaming, streaming, _ANY_STOP if research else "") if s)
+        settle_s = max(settle_s, self.research_settle_s) if research else settle_s
+        pending = re.compile(self.cfg.research_pending, re.I) if self.cfg.research_pending else None
+        finished = re.compile(self.cfg.research_done, re.I) if self.cfg.research_done else None
         last, stable_since = None, time.monotonic()
         still_since = time.monotonic()  # the last time anything on the page changed
+        reloaded_at = time.monotonic()
         while True:
             self._beat()
+            await self._press_continue(page)
             loc = await reply() if callable(reply) else reply
             try:
                 text = (await loc.inner_text(timeout=5000)).strip()
             except Exception:  # replaced while we read it
                 text = ""
             streaming_now = await self._showing(page, marker)
+            researching = False
+            if pending and research:  # only in research mode: old research text stays on the page
+                seen = await self._page_text(page)
+                researching = bool(pending.search(seen)) and not (finished and finished.search(seen))
             now = time.monotonic()
             if text != last or not text or _is_echo(text, sent):
                 last, stable_since = text, now
@@ -716,8 +880,24 @@ class SiteAdapter:
                 still_since = now  # thinking, searching, sources arriving: still working
             quiet, still = now - stable_since, now - still_since
             usable = bool(text) and not _is_echo(text, sent)
-            done = usable and ((quiet >= settle_s and not streaming_now) or (streaming_now and still >= self.stuck_s))
-            if not done and still >= idle_s * (3 if streaming_now else 1):
+            done = usable and not researching and (
+                (quiet >= settle_s and not streaming_now) or (streaming_now and still >= self.stuck_s))
+            # Research can sit for half an hour with nothing new on the page (ChatGPT works
+            # server-side and shows the report when it is done).
+            limit = max(idle_s * 3, 5400.0) if researching else idle_s * (3 if streaming_now else 1)
+            if researching and still >= RELOAD_STALLED_S and now - reloaded_at >= RELOAD_STALLED_S:
+                # Some sites stop updating the open page while research runs (gemini.google.com
+                # makes the plan and the report but the page keeps saying "Generating research
+                # plan"): open the chat again to see where it is.
+                reloaded_at = now
+                try:
+                    await page.goto(page.url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(6000)
+                    if not any("reloaded" in n for n in self.notes):
+                        self.notes.append("the page stopped updating during research - reloaded it to follow along")
+                except Exception:
+                    pass
+            if not done and still >= limit:
                 if not usable:
                     raise ProviderError(f"no reply: nothing changed on the page for {round(still / 60)} min")
                 self.notes.append(f"the reply stopped changing for {round(still / 60)} min - took it as finished")
@@ -732,7 +912,8 @@ class SiteAdapter:
                     self.last_html = await loc.evaluate(_REPLY_HTML_JS)
                 except Exception:
                     self.last_html = None
-                return clean_reply(text)
+                docs = await self._read_documents(page, loc)
+                return clean_reply(text) + "".join(f"\n\n{d}" for d in docs)
             await asyncio.sleep(0.3 if quiet < 30 else 1.0)
 
     async def doctor(self, page: Page) -> dict:

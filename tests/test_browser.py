@@ -35,6 +35,34 @@ const mode = location.hash;  // read now: pushState drops the hash
 document.getElementById('send').onclick = () => {
   const box = document.querySelector('#composer, #late'), q = box.value; box.value = '';
   if (!location.pathname.startsWith('/c/')) history.pushState({}, '', '/c/42');
+  if (mode === '#doc') {                   // claude.ai: a summary, and the report in a card that opens a panel
+    const a = document.createElement('div'); a.className = 'assistant'; log.appendChild(a);
+    a.innerHTML = 'Summary of ' + q + '.<div data-sheet-kind="markdown">Big report</div>';
+    a.querySelector('[data-sheet-kind]').onclick = () => document.body.insertAdjacentHTML('beforeend',
+      '<div role="region" aria-label="Artifact panel: Big report"><button>Copy</button><div id="markdown-artifact">Big report\\n\\nEvery country, in full.</div></div>');
+    return;
+  }
+  if (mode === '#gptdr') {                 // chatgpt.com deep research: a placeholder, then the report in a frame
+    const a = document.createElement('div'); a.className = 'assistant'; log.appendChild(a);
+    a.textContent = 'Deep Research has started investigating ' + q + '. The findings will appear in the Deep Research report.';
+    setTimeout(() => {
+      const f = document.createElement('iframe'); f.title = 'Deep research';
+      f.srcdoc = '<body>Research completed in 1m <br>' + '0<br>1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>'.repeat(2)
+        + ' citations<h1>Report</h1><p>Poland raised its grants and Croatia started new ones.</p></body>';
+      log.insertBefore(f, a);
+    }, 2500);
+    return;
+  }
+  if (mode === '#plan') {                  // deep research: a plan first, which waits for Start
+    const a = document.createElement('div'); a.className = 'assistant'; log.appendChild(a);
+    const on = document.querySelector('[data-research]')?.getAttribute('aria-checked') === 'true';
+    a.innerHTML = on ? 'Plan: 1. search 2. read 3. write <button id="go">Start research</button>' : 'plain answer, research was off';
+    if (on) document.getElementById('go').onclick = () => {
+      a.textContent = 'Researching…'; const p = document.createElement('div'); log.appendChild(p); let k = 0;
+      const t = setInterval(() => { p.textContent = 'Sources: ' + (++k); if (k === 8) { clearInterval(t); a.textContent = 'Report: ' + q; } }, 200);
+    };
+    return;
+  }
   if (mode === '#research' || mode === '#stale' || mode === '#dead') {
     const u = document.createElement('div'); u.className = 'user'; u.textContent = q; log.appendChild(u);
     if (mode === '#dead') return;          // nothing ever comes back
@@ -78,6 +106,13 @@ document.getElementById('send').onclick = () => {
   }, 150);
   }, delay);
 };
+if (location.hash === '#plan') {  // a + menu with a Research switch, like claude.ai
+  document.body.insertAdjacentHTML('beforeend', '<button id="plus" aria-label="Add">+</button><div id="menu" role="menu" hidden>'
+    + '<div role="menuitemcheckbox" data-research aria-checked="false">Research</div></div>');
+  plus.onclick = () => { menu.hidden = !menu.hidden; };
+  document.querySelector('[data-research]').onclick = e => e.target.setAttribute('aria-checked', e.target.getAttribute('aria-checked') === 'true' ? 'false' : 'true');
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') menu.hidden = true; });
+}
 if (location.hash.startsWith('#cookies')) {  // grok.com: a cookie notice over the message box
   const b = document.createElement('div'); b.setAttribute('data-cookie-banner', '');
   b.style.cssText = 'position:fixed;inset:0;z-index:9;background:rgba(255,255,255,.5)';
@@ -425,3 +460,40 @@ async def test_wait_reply_follows_activity():
         await wait_reply(asyncio.sleep(10), None, idle_s=2, max_s=60)
     with pytest.raises(NoReply, match="still not finished"):
         await wait_reply(beating(), p, idle_s=2, max_s=1)
+
+
+async def test_research_mode_is_switched_on_and_its_plan_started(manager):
+    cfg = CONFIG.with_overrides({"research_mode": "#plus ;; [data-research]",
+                                 "continue_button": 'button:has-text("Start research")'})
+    adapter = SiteAdapter(cfg, load_timeout_s=5, idle_s=3, stuck_s=2)
+    page = await manager.new_page()
+    await page.goto("http://fake.test/new#plan")
+    assert await adapter.send(page, "battery subsidies", research=True) == "Report: battery subsidies"
+    assert "research mode on" in adapter.notes and any("Start research" in n for n in adapter.notes)
+    assert await page.locator("[data-research]").get_attribute("aria-checked") == "true"
+    await page.goto("http://fake.test/new#plan")
+    assert await adapter.send(page, "quick one") == "plain answer, research was off"
+    await page.close()
+
+
+async def test_documents_in_panels_and_frames_are_read(manager):
+    cfg = CONFIG.with_overrides({"document_card": "[data-sheet-kind]",
+                                 "document_panel": '[role="region"][aria-label^="Artifact panel"]'})
+    adapter = SiteAdapter(cfg, load_timeout_s=5)
+    page = await manager.new_page()
+    await page.goto("http://fake.test/new#doc")
+    reply = await adapter.send(page, "batteries")
+    # The reply's own text (summary + card title), then the document from the panel - without its buttons.
+    assert reply == "Summary of batteries.\nBig report\n\nBig report\n\nEvery country, in full."
+    assert 'read the document "Big report" from its panel' in adapter.notes
+
+    # ChatGPT deep research: the placeholder is not the answer; the report comes from its frame.
+    cfg = CONFIG.with_overrides({"research_pending": "Deep Research has started", "research_done": "Research completed in",
+                                 "document_frame": 'iframe[title="Deep research"]'})
+    adapter = SiteAdapter(cfg, load_timeout_s=5, idle_s=20)
+    adapter.research_settle_s = 1
+    await page.goto("http://fake.test/new#gptdr")
+    reply = await adapter.send(page, "subsidies", research=True)
+    assert "Poland raised its grants" in reply and "0\n1\n2" not in reply
+    assert "read the research report from its embedded frame" in adapter.notes
+    await page.close()

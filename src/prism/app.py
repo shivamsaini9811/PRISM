@@ -508,7 +508,8 @@ _session_tasks: dict[int, asyncio.Task] = {}
 _queued: dict[int, list["SendIn"]] = {}  # @mentioned messages waiting for the running session
 
 # speakers: platform -> budget | "off"; format: how @all (or no mention) is run.
-DEFAULTS = {"rounds": 3, "speakers": {}, "deep": False, "format": "roundtable", "asks": 3}
+DEFAULTS = {"rounds": 3, "speakers": {}, "deep": False, "format": "roundtable", "asks": 3,
+            "research": False}
 MENTION = re.compile(r"(?<![\w.])@([A-Za-z][\w-]*)")
 CONTEXT_REF = re.compile(r"(?<![\w&#])#([A-Za-z][\w-]*)")   # "C#" and "#1" are not references
 COMMAND = re.compile(r"^/(save|save-global|forget)\s+#([A-Za-z][\w-]*)\s*(.*)$", re.S)
@@ -531,6 +532,7 @@ class SendIn(BaseModel):
     asks: int | None = Field(None, ge=0, le=5)  # advice budget: ASKs per bot per turn
     speakers: dict[str, str] | None = None
     deep: bool | None = None
+    research: bool | None = None  # web bots switch on their site's deep research mode
     files: list[str] = []  # ids from POST /api/media, attached to this message
     artifact: "ArtifactIn | None" = None  # "revise this": the version on screen goes with it
 
@@ -986,7 +988,7 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
     s, f = store(), vault()
     chat_id = chat["id"]
     opts = meeting_defaults()
-    for key in ("format", "rounds", "speakers", "deep", "asks"):
+    for key in ("format", "rounds", "speakers", "deep", "asks", "research"):
         if getattr(body, key) is not None:
             opts[key] = getattr(body, key)
     if opts["format"] not in FORMATS:
@@ -1034,6 +1036,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
     def tune(p: Provider) -> Provider:
         if opts["deep"] and hasattr(p, "effort"):
             p.effort = "high"  # API models with a thinking-effort setting think longer
+        if opts.get("research") and isinstance(p, BrowserProvider):
+            p.research = True  # the site's own deep research (can take 5-30 min)
         return p
 
     room = load_room(s.thread(chat_id))
@@ -1302,6 +1306,7 @@ class AgentIn(BaseModel):
     context: list[str] = []      # #names it always gets
     tools: list[str] = []        # ask | docs | prism
     output: dict[str, str] = {}  # field: A|B, or text
+    research: bool = False       # web bots: the site's deep research mode for each step
 
 
 @app.get("/api/agents")
@@ -1447,7 +1452,10 @@ class AppRunEnv(flows.RunEnv):
         if not cred:
             raise flows.StepError(f"@{platform} (for {agent['name']}) is not set up or is switched off")
         url = memory.get("thread_url")
-        return make_provider(cred, thread_url=url, fresh=not url)
+        p = make_provider(cred, thread_url=url, fresh=not url)
+        if agent.get("research") and isinstance(p, BrowserProvider):
+            p.research = True
+        return p
 
     async def context(self, agent: dict, prompt: str) -> str:
         s, parts = store(), []

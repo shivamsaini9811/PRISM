@@ -691,7 +691,7 @@ def test_agents_answer_by_name_in_a_chat(client, monkeypatch):
     r = client.put("/api/agents/critic", json={"model": "gpt", "instructions": "Find what is wrong.",
                                                "context": ["#spec"], "output": {}})
     assert r.json()["agents"] == [{"name": "critic", "model": "@gpt", "instructions": "Find what is wrong.",
-                                   "context": ["spec"], "tools": [], "output": {}}]
+                                   "context": ["spec"], "tools": [], "output": {}, "research": False}]
     systems = []
     real = app_mod.make_provider
 

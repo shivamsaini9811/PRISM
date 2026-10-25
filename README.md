@@ -86,6 +86,14 @@ and pauses rather than fails when one runs out. Each run is its own chat: a card
 tab per agent, the graph lit up as it goes; notes you type reach the steps still to come.
 State is saved after every step, so a run continues after PRISM restarts.
 
+**Research** (the checkbox under the message box, or "deep research" on an agent): web bots
+switch on their site's own deep research - Claude Research, ChatGPT deep research, Gemini Deep
+Research, Grok Expert - for the message. PRISM clicks the plan's Start for you, answers
+"go ahead" when it asks clarifying questions first, waits through placeholders like "Deep
+Research has started…", reloads a page that stops updating (Gemini), and brings back the
+full report: from Claude's document panel, ChatGPT's report frame, Gemini's report panel.
+Checked against all four sites on 2026-10-25: 1 min (Grok) to 37 min (Gemini).
+
 **No fixed time limit on a reply**: PRISM waits while the model shows it is working - the
 site's Stop button, progress or text still changing, a local model still streaming - so long
 research is not cut off. It gives up after 20 minutes with nothing changing on the page
