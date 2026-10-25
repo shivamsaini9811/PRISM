@@ -863,3 +863,9 @@ def test_bot_runs_a_program_after_approval(client, monkeypatch):
     mid = s.add_message(chat, None, "assistant", "", {"kind": "run_request", "status": "pending", "id": "x"})
     app_mod.recover_runs()
     assert next(m for m in s.thread(chat) if m["id"] == mid)["meta"]["status"] == "expired"
+
+
+def test_the_page_is_never_shown_from_an_old_cache(client):
+    r = client.get("/")
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
+    assert 'id="openKg"' in r.text and 'id="openFlows"' in r.text

@@ -181,7 +181,9 @@ def make_provider(cred: dict, thread_url: str | None = None, fresh: bool = False
 
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(STATIC / "index.html")
+    # Every PRISM version is served at the same address: without this, a browser may keep
+    # showing the page of an older version from its cache after an update.
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 # --- media: files the user attaches, and pictures and files saved from replies ------------
