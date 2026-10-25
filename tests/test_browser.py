@@ -500,3 +500,22 @@ async def test_documents_in_panels_and_frames_are_read(manager):
     assert "read the research report from its embedded frame" in adapter.notes
     assert "<h1>Report</h1>" in adapter.last_documents[0]["html"]
     await page.close()
+
+
+async def test_short_reply_with_code_keeps_its_text(manager):
+    """grok.com: "RUN @python" and one line of code, the language as a label beside the code's
+    box. The code block's wrapper must not swallow the RUN line (it did: the text became ```)."""
+    from prism.browser.adapter import _REPLY_TEXT_JS
+    page = await manager.new_page()
+    await page.set_content(
+        '<div id="r"><div><p>RUN @python</p><div><div><div><span>Python</span><div></div></div>'
+        '<div><pre><code><span>print</span><span>("Hello, World!")</span></code></pre></div></div></div></div></div>')
+    text = clean_reply((await page.locator("#r").evaluate(_REPLY_TEXT_JS)).strip())
+    assert text == 'RUN @python\n\n\n```python\nprint("Hello, World!")\n```'
+    # claude.ai: a sentence, RUN @python and the code - the RUN line went missing the same way.
+    await page.set_content(
+        '<div id="r"><div><p>Running it now.</p>\n<p>RUN @python</p>\n<div><div><div><div></div></div><div>python</div>'
+        '<div><pre><code class="language-python">print(1)</code></pre></div></div></div></div><div><time>just now</time></div></div>')
+    text = clean_reply((await page.locator("#r").evaluate(_REPLY_TEXT_JS)).strip())
+    assert text == 'Running it now.\n\nRUN @python\n\n\n```python\nprint(1)\n```'
+    await page.close()

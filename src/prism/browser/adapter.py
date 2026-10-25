@@ -286,13 +286,27 @@ _REPLY_TEXT_JS = """el => {
         if (/^[a-z+#]{1,12}$/.test(t)) lang = t;
       }
       const text = (code.innerText || code.textContent || '').replace(/\\n$/, '');
+      // The code block's own wrapper (a header naming the language, a Copy button) goes with
+      // it - but only while everything beside it is such chrome: short, no paragraphs. A short
+      // reply ("RUN @python" + one line of code) must keep its text.
+      const chrome = (parent, keep) => [...parent.children].every(ch => ch === keep || (
+        !/^(P|LI|UL|OL|H[1-6]|TABLE|BLOCKQUOTE)$/.test(ch.tagName)
+        && !ch.querySelector('p, li, h1, h2, h3, h4, h5, h6, table, blockquote')
+        && (ch.innerText || '').trim().length <= 40));
+      let wrap = pre;
+      while (wrap.parentElement && wrap.parentElement !== copy && wrap.parentElement.querySelectorAll('pre').length === 1
+             && chrome(wrap.parentElement, wrap)) {
+        if (!lang) {  // grok.com: the language is a label beside the code's own box
+          for (const ch of wrap.parentElement.children) {
+            const t = ch === wrap ? '' : (ch.innerText || '').trim().split(/\\s/)[0].toLowerCase();
+            if (/^[a-z+#]{1,12}$/.test(t) && t !== 'copy') { lang = t; break; }
+          }
+        }
+        wrap = wrap.parentElement;
+      }
       const box = document.createElement('div');
       box.textContent = '\\n```' + lang + '\\n' + text + '\\n```\\n';
       box.style.whiteSpace = 'pre';
-      // the code block's own wrapper (header with the language, Copy button) goes with it
-      let wrap = pre;
-      while (wrap.parentElement && wrap.parentElement !== copy && wrap.parentElement.querySelectorAll('pre').length === 1
-             && (wrap.parentElement.innerText || '').length < text.length + 80) wrap = wrap.parentElement;
       wrap.replaceWith(box);
     }
     return copy.innerText;

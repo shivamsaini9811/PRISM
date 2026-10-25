@@ -47,6 +47,7 @@ PIP_TIMEOUT_S = 900.0
 
 RUN_LINE = re.compile(r"^[\s*_`>-]*RUN\s*(?:@([\w.+-]+))?[*_`]*\s*:?[\s*_`]*$", re.I)
 FENCE = re.compile(r"```([\w.+-]*)[^\n]*\n(.*?)\n?```\s*$", re.S)
+LABEL = re.compile(r"^\s*(python3?|py|code|copy|copy code)?\s*$", re.I)
 PIP_LINE = re.compile(r"^\s*#\s*pip\s*:\s*(.+)$", re.I | re.M)
 # A requirement as pip takes it - a name, extras and a version - and nothing else: no
 # options, paths or URLs (they could point pip anywhere).
@@ -109,6 +110,8 @@ def parse_request(text: str, who: str) -> Request | None:
     if not fence:
         return None
     before = body[:fence.start()].rstrip().splitlines()
+    while before and LABEL.match(before[-1]):  # a site's code header left as text ("Python", "Copy")
+        before.pop()
     m = RUN_LINE.match(before[-1]) if before else None
     lang = ((m.group(1) if m else "") or fence.group(1) or "").lower()
     if not m or lang not in ("python", "py", "python3", ""):

@@ -15,6 +15,7 @@ def test_parse_run_requests():
     r = parse_request("Let me check.\nRUN @python\n```python\n# pip: rapidfuzz pandas>=2\nprint(6 * 7)\n```", "claude")
     assert (r.who, r.code.splitlines()[-1], r.packages) == ("claude", "print(6 * 7)", ["rapidfuzz", "pandas>=2"])
     assert parse_request("**RUN @python**\n```\nprint(1)\n```", "a").code == "print(1)"
+    assert parse_request("RUN @python\n\nPython\nCopy\n```\nprint(2)\n```", "grok").code == "print(2)"
     assert parse_request("RUN: git log --oneline -3", "gpt") is None          # Python only now
     assert parse_request("RUN @node\n```js\nconsole.log(1)\n```", "a") is None
     assert parse_request("RUN @python\n```python\nx\n```\nand then I explain more", "a") is None  # not at the end
