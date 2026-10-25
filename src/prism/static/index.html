@@ -149,6 +149,25 @@
   .lm { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:13px; }
   .lm span { flex:1; } .lm button { font-size:12px; padding:1px 9px; }
   progress { width:120px; height:8px; }
+  .modal.flows { max-width:1180px; }
+  .ftabs { display:flex; gap:6px; margin-right:auto; margin-left:16px; } .ftabs button.on { border-color:var(--accent); color:var(--accent); }
+  .flow-grid { display:grid; grid-template-columns:190px 1fr; gap:14px; }
+  .flow-list button { display:block; width:100%; text-align:left; margin-bottom:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .flow-list button.on { border-color:var(--accent); }
+  #flowSrc { width:100%; min-height:250px; font:12.5px/1.5 ui-monospace, Consolas, monospace; resize:vertical; tab-size:2; }
+  #flowErrors { font-size:12.5px; margin:4px 0; } #flowErrors li { color:var(--err); }
+  .graph { overflow-x:auto; margin:6px 0; } .graph svg { display:block; max-width:100%; height:auto; }
+  .graph text { font:12px system-ui, sans-serif; fill:var(--fg); } .graph .sub { font-size:10.5px; fill:var(--muted); }
+  .graph .edge { fill:none; stroke:var(--muted); stroke-width:1.2; } .graph .elabel { font-size:10.5px; fill:var(--muted); }
+  .graph rect { fill:var(--card); stroke:var(--border); stroke-width:1.2; }
+  .graph .done rect { stroke:var(--ok); } .graph .queued rect { stroke:var(--accent); stroke-width:2; }
+  .graph .waiting rect { stroke:#d48a00; stroke-width:2; }
+  #runbar { max-width:852px; width:100%; margin:6px auto 0; padding:8px 16px; font-size:13px; }
+  #runbar .plat-actions { margin-top:4px; }
+  .msg.step .fields { margin-top:6px; } .msg.ask { border-left:3px solid #d48a00; }
+  .msg.ask textarea { width:100%; min-height:50px; margin-top:6px; }
+  #agentForm { display:grid; gap:6px; margin-top:12px; } #agentForm textarea { min-height:80px; }
+  @media (max-width: 900px) { .flow-grid { grid-template-columns:1fr; } }
   #readersBox h4 { margin:10px 0 4px; font-size:13px; } #readersBox h4:first-child { margin-top:0; }
   #readersBox select { flex:1; font-size:12.5px; }
   #ctxMode { display:flex; gap:6px; padding:8px 12px 0; border-top:1px solid var(--border); flex-shrink:0; }
@@ -185,6 +204,7 @@
     <div class="pad" style="padding-top:0"><button class="primary" style="width:100%" id="newChat">+ New chat</button></div>
     <div id="chats"></div>
     <div class="side-foot">
+      <button id="openFlows" title="Agents and flows: steps that run on their own">Flows</button>
       <button id="openSettings">Settings</button>
       <button id="lockBtn">Lock</button>
       <button id="quitBtn" title="Stop PRISM and its browser">Quit</button>
@@ -199,6 +219,7 @@
       <button class="narrow-only" id="ctxBtn" style="margin-bottom:6px">Context</button>
     </div>
     <div id="remote" class="muted hidden"></div>
+    <div id="runbar" class="hidden"></div>
     <div id="thread"><div class="empty">Create or pick a chat.</div></div>
     <div id="meetbar" class="hidden">
       <div id="setup" style="display:contents">
@@ -289,6 +310,45 @@
     <p class="err" id="lockErr"></p>
     <button class="primary" style="width:100%" id="lockSubmit">Unlock</button>
   </form>
+</div>
+
+<div class="overlay hidden" id="flowsDlg">
+  <div class="modal wide flows">
+    <div class="plat-head"><h3>Flows</h3>
+      <div class="ftabs"><button type="button" data-ftab="flows" class="on">Flows</button><button type="button" data-ftab="agents">Agents</button></div>
+      <button id="closeFlows">Close</button></div>
+    <div id="flowsPane">
+      <div class="muted" style="font-size:12.5px;margin-bottom:8px">A flow is steps that run on their own: agents answer, results pass along the arrows, a review can send work back (at most <i>max_rounds</i> times), and it can stop to ask you. Each run gets its own chat, where you can watch, add notes, or stop it.</div>
+      <div class="flow-grid">
+        <div class="flow-list"><button type="button" class="primary" id="newFlow">+ New flow</button><div id="flowList"></div></div>
+        <div>
+          <div class="lm"><input id="draftText" placeholder="Or describe it, e.g. research a topic, write a brief, review until it passes, then ask me" style="flex:1"><button type="button" id="draftBtn" title="Your primary LLM writes the flow">Draft it</button></div>
+          <textarea id="flowSrc" spellcheck="false"></textarea>
+          <ul id="flowErrors"></ul>
+          <div id="flowGraph" class="graph"></div>
+          <div class="plat-actions"><button type="button" class="primary" id="saveFlow">Save</button><button type="button" id="runFlow">Run…</button><button type="button" id="delFlow">Delete</button></div>
+          <form id="runForm" class="hidden" style="display:grid;gap:6px;margin-top:10px"></form>
+        </div>
+      </div>
+    </div>
+    <div id="agentsPane" class="hidden">
+      <div class="muted" style="font-size:12.5px">An agent is a role on one of your models. Use it in flows by name, or @name it in any chat.</div>
+      <div id="agentList" style="margin-top:8px"></div>
+      <form id="agentForm">
+        <b style="font-size:13px">Add or change an agent</b>
+        <input id="agName" placeholder="name, e.g. critic (you'll write @critic)" required>
+        <label class="muted" style="font-size:12px">Model <select id="agModel"></select></label>
+        <textarea id="agInstr" placeholder="Its role, e.g. Find what is wrong or missing in the work you're given. Be specific."></textarea>
+        <input id="agContext" placeholder="Context it always gets: #names, e.g. #spec #research">
+        <div class="lib-opts" style="font-size:12.5px">
+          <label><input type="checkbox" data-agtool="docs"> search your folders (ASK @docs)</label>
+          <label><input type="checkbox" data-agtool="prism"> search past chats (ASK @prism)</label>
+          <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label></div>
+        <textarea id="agOutput" style="min-height:50px" placeholder="Fields PRISM reads from its reply, one per line, e.g.&#10;verdict: PASS|FIX&#10;notes: text"></textarea>
+        <button class="primary">Save agent</button>
+      </form>
+    </div>
+  </div>
 </div>
 
 <div class="overlay hidden" id="settings">
@@ -459,7 +519,7 @@ function watch() {
   clearTimeout(state.poll);
   const v = state.view;
   const recalling = v?.messages.some(m => m.meta?.pending);
-  const reading = v?.context.some(c => c.status?.busy);
+  const reading = v?.context.some(c => c.status?.busy) || v?.run?.live || v?.run?.status === 'running';
   if (!v?.meeting && !recalling && !v?.profile?.updating && !reading) return;
   state.poll = setTimeout(async () => {
     if (state.view?.chat.id !== v.chat.id) return;
@@ -468,7 +528,8 @@ function watch() {
       if (state.view?.chat.id !== v.chat.id) return;
       const sig = x => JSON.stringify([x.messages.length, x.meeting, x.daughters.map(d => d.messages.length),
                                        x.context.length, x.messages.filter(m => m.meta?.pending).length, x.profile,
-                                       x.context.map(c => c.status ? [c.status.busy, c.status.job?.files, c.status.chunks, c.content] : 0)]);
+                                       x.context.map(c => c.status ? [c.status.busy, c.status.job?.files, c.status.chunks, c.content] : 0),
+                                       x.run && [x.run.status, x.run.live, x.run.steps, x.run.queue.join()]]);
       const changed = sig(fresh) !== sig(v);
       state.view = fresh;
       if (changed) render();
@@ -507,6 +568,7 @@ function render() {
   renderArt();
   $('composer').classList.toggle('hidden', !!d);
   renderMeetbar(!d);
+  renderRunbar(!d);
   $('help').classList.toggle('hidden', !!d);
 
   const pr = v.profile || {mode: 'off'};
@@ -559,6 +621,39 @@ function meetingHtml(msgs, live) {
   for (const m of msgs) {
     const meta = m.meta || {}, kind = meta.kind;
     if (!kind) { flush(); html += msgHtml(m, true); continue; }  // a chat from before meetings
+    if (kind === 'topic' && meta.run) {
+      flush(); group = null;
+      html += `<div class="msg topic"><div class="who"><b>You</b> started a flow</div>${esc(m.content)}</div>`;
+      continue;
+    }
+    if (kind === 'step') {
+      flush();
+      const fields = Object.entries(meta.fields || {}).map(([k, x]) => `<span class="chip">${esc(k)}: ${esc(String(x).slice(0, 80))}</span>`).join('');
+      html += `<div class="msg step">${meta.error ? '' : saveBtn(m.id)}<div class="who"><span class="speaker-name">${esc(meta.node)}</span>`
+        + ` · ${meta.type === 'tool' ? 'tool ' : ''}${esc(meta.speaker)}${meta.model ? ` (${esc(meta.model)})` : ''}`
+        + `${meta.round > 1 ? ` · round ${meta.round}` : ''}${meta.latency_s != null ? ` · ${meta.latency_s}s` : ''}</div>`
+        + replyHtml(m, meta.speaker) + (fields ? `<div class="fields">${fields}</div>` : '')
+        + (meta.error ? `<div class="err">${esc(meta.error)}</div>` : '')
+        + (meta.notes || []).map(n => `<div class="muted note">⚙ ${esc(n)}</div>`).join('') + '</div>';
+      continue;
+    }
+    if (kind === 'ask_you') {
+      flush();
+      const run = state.view.run, open = !meta.answer && run?.waiting === meta.node && run.id === meta.run;
+      html += `<div class="msg ask"><div class="who"><span class="speaker-name">${esc(meta.node)}</span> · asks you</div><b>${esc(meta.question)}</b>`
+        + (m.content ? `<details ${open ? 'open' : ''}><summary>What it's about</summary>${richText(m.content, '')}</details>` : '')
+        + (open ? `<textarea data-answertext="${esc(meta.node)}" placeholder="Optional: a note or a change, passed on to the next steps"></textarea>
+             <div class="plat-actions"><button class="primary" data-answer="yes" data-node="${esc(meta.node)}">Approve</button><button data-answer="no" data-node="${esc(meta.node)}">Reject</button></div>`
+          : meta.answer ? `<div class="muted">You answered: ${meta.answer === 'yes' ? 'approved' : 'rejected'}${meta.answer_text ? ` - ${esc(meta.answer_text)}` : ''}</div>` : '')
+        + '</div>';
+      continue;
+    }
+    if (kind === 'run') {
+      flush();
+      const what = {done: 'The flow finished.', stopped: 'Stopped.', paused: 'Paused: ', failed: 'Failed: '}[meta.status] || meta.status;
+      html += `<div class="msg"><em class="${meta.status === 'done' ? 'ok' : 'muted'}">${esc(what)}${meta.status === 'paused' || meta.status === 'failed' ? esc(meta.error || '') : ''}</em></div>`;
+      continue;
+    }
     if (kind === 'topic') {
       flush(); group = null; order = meta.speakers || []; fmt = meta.format || 'chat'; rounds = meta.rounds || 1;
       const to = (meta.mentions || []).length ? meta.mentions.map(x => '@' + x).join(' ') : '@all';
@@ -628,6 +723,201 @@ function meetingHtml(msgs, live) {
   }
   return html;
 }
+
+/* ---------- flows ---------- */
+function drawGraph(g, st = null) {
+  if (!g || !g.nodes.length) return '';
+  const W = 150, H = 46, GX = 120, GY = 20, P = 14, TOP = 16;
+  const cols = {}; g.nodes.forEach(n => (cols[n.level] ||= []).push(n));
+  const pos = {}; let rows = 0;
+  for (const [lv, ns] of Object.entries(cols)) ns.forEach((n, i) => { pos[n.id] = {x: P + lv * (W + GX), y: TOP + i * (H + GY)}; rows = Math.max(rows, i + 1); });
+  const levels = Math.max(...g.nodes.map(n => n.level)) + 1;
+  const backs = g.edges.filter(e => e.back);
+  const base = TOP + rows * (H + GY) - GY;
+  const width = P * 2 + levels * (W + GX) - GX, height = base + (backs.length ? 18 + backs.length * 18 : 0) + P;
+  const short = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;
+  let out = `<svg viewBox="0 0 ${width} ${height}" width="${width}" role="img" aria-label="Flow ${esc(g.name)}"><defs><marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  g.edges.forEach(e => {
+    const a = pos[e.src], b = pos[e.dst]; if (!a || !b) return;
+    const lab = [e.when, e.max_rounds ? `max ${e.max_rounds}` : ''].filter(Boolean).join(' · ');
+    if (e.back) {
+      const y = base + 18 + backs.indexOf(e) * 18;
+      out += `<path class="edge" d="M${a.x + W / 2} ${a.y + H}V${y}H${b.x + W / 2}V${b.y + H + 2}" marker-end="url(#fa)" stroke-dasharray="4 3"/>`;
+      if (lab) out += `<text class="elabel" x="${(a.x + b.x + W) / 2}" y="${y - 4}" text-anchor="middle">${esc(short(lab, 40))}</text>`;
+    } else {
+      const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x - 2, y2 = b.y + H / 2, mx = (x1 + x2) / 2;
+      out += `<path class="edge" d="M${x1} ${y1}C${mx} ${y1} ${mx} ${y2} ${x2} ${y2}" marker-end="url(#fa)"/>`;
+      if (lab) out += `<text class="elabel" x="${mx}" y="${Math.min(y1, y2) - 6}" text-anchor="middle">${esc(short(lab, 20))}</text>`;
+    }
+  });
+  const KIND = {agent: '', tool: 'tool ', ask_you: 'asks you: ', wait: 'wait ', flow: 'flow '};
+  g.nodes.forEach(n => {
+    const p = pos[n.id];
+    const cls = !st ? '' : st.waiting === n.id ? 'waiting' : st.queue.includes(n.id) ? 'queued' : st.done.includes(n.id) ? 'done' : '';
+    out += `<g class="${cls}"><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="8"/>`
+      + `<text x="${p.x + 10}" y="${p.y + 19}" font-weight="600">${esc(short(n.id, 20))}${n.join ? ' ⋈' : ''}</text>`
+      + `<text class="sub" x="${p.x + 10}" y="${p.y + 35}">${esc(short(KIND[n.type] + n.label, 24))}</text></g>`;
+  });
+  return out + '</svg>';
+}
+function renderRunbar(show) {
+  const r = state.view?.run;
+  $('runbar').classList.toggle('hidden', !show || !r);
+  if (!show || !r) return;
+  const active = ['running', 'waiting', 'paused'].includes(r.status);
+  const label = {running: r.live ? 'running' : 'starting', waiting: 'waiting for your answer', paused: 'paused', done: 'finished', stopped: 'stopped', failed: 'failed'}[r.status] || r.status;
+  $('runbar').innerHTML = `<b>Flow ${esc(r.flow)}</b> · ${esc(label)} · ${r.steps} step${r.steps === 1 ? '' : 's'}`
+    + (r.error && r.status === 'paused' ? `<div class="err">${esc(r.error)}</div>` : '')
+    + `<div class="graph">${drawGraph(r.graph, r)}</div>`
+    + (active ? `<div class="plat-actions">${r.status === 'paused' ? '<button class="primary" data-runact="resume">Continue</button>' : ''}<button data-runact="stop">Stop the run</button></div>` : '');
+  if (active) {
+    $('setup').classList.add('hidden');  // the run decides who speaks
+    $('input').placeholder = 'Add a note for the steps still to come (they see it in their next prompt)…';
+    $('send').textContent = 'Add';
+  }
+}
+$('runbar').onclick = async e => {
+  const act = e.target.dataset.runact; if (!act) return;
+  e.target.disabled = true;
+  try { state.view = await api(`/api/runs/${state.view.run.id}/${act}`, {method: 'POST', body: {}}); render(); watch(); }
+  catch (err) { alert(err.message); e.target.disabled = false; }
+};
+$('thread').addEventListener('click', async e => {
+  const ans = e.target.dataset.answer; if (!ans) return;
+  const node = e.target.dataset.node, text = document.querySelector(`[data-answertext="${CSS.escape(node)}"]`)?.value || '';
+  e.target.disabled = true;
+  try { state.view = await api(`/api/runs/${state.view.run.id}/answer`, {method: 'POST', body: {node, approved: ans === 'yes', text}}); render(); watch(); }
+  catch (err) { alert(err.message); e.target.disabled = false; }
+});
+
+const NEW_FLOW = `name: my-flow
+inputs: {topic: text}
+agents:                       # or make reusable ones under Agents
+  writer: {model: "@MODEL", instructions: "Write clearly and concretely."}
+  critic: {model: "@MODEL", instructions: "Find what is wrong or missing.", output: {verdict: PASS|FIX, notes: text}}
+nodes:
+  draft:  {agent: writer, prompt: "Write a short brief on {{input.topic}}. Fix if asked: {{review.notes}}"}
+  review: {agent: critic, prompt: "Review this brief: {{draft.text}}"}
+  ok:     {ask_you: "Happy with this brief?", show: "{{draft.text}}"}
+edges:
+  - draft -> review
+  - review -> draft: {when: "verdict == FIX", max_rounds: 2}
+  - review -> ok:    {when: "verdict == PASS or rounds_done"}
+`;
+const fl = {list: [], agents: [], current: null, graph: null, timer: null};
+async function openFlows() {
+  await loadPlatforms();
+  const r = await api('/api/flows'); fl.list = r.flows; fl.agents = r.agents;
+  $('flowsDlg').classList.remove('hidden');
+  if (!fl.current || !fl.list.some(f => f.name === fl.current)) pickFlow(fl.list[0]?.name || null);
+  else renderFlowList();
+  renderAgents();
+}
+function renderFlowList() {
+  $('flowList').innerHTML = fl.list.map(f => `<button type="button" data-flow="${esc(f.name)}" class="${f.name === fl.current ? 'on' : ''}" title="${f.ok ? '' : 'has problems'}">${esc(f.name)}${f.ok ? '' : ' ⚠'}</button>`).join('')
+    || '<div class="muted" style="font-size:12px;margin-top:6px">No flows yet.</div>';
+}
+function pickFlow(name) {
+  fl.current = name;
+  const f = fl.list.find(x => x.name === name);
+  const model = (state.platforms?.credentials || []).find(c => c.enabled)?.platform || 'claude';
+  $('flowSrc').value = f ? f.source : NEW_FLOW.replaceAll('@MODEL', '@' + model);
+  $('runForm').classList.add('hidden');
+  renderFlowList(); checkFlow();
+}
+async function checkFlow() {
+  const r = await api('/api/flows/validate', {method: 'POST', body: {source: $('flowSrc').value}});
+  fl.graph = r.graph;
+  $('flowErrors').innerHTML = r.errors.map(x => `<li>${esc(x)}</li>`).join('');
+  $('flowGraph').innerHTML = drawGraph(r.graph);
+  return r;
+}
+$('flowSrc').oninput = () => { clearTimeout(fl.timer); fl.timer = setTimeout(checkFlow, 400); };
+$('flowSrc').onkeydown = e => {  // Tab indents (YAML needs spaces)
+  if (e.key !== 'Tab') return;
+  e.preventDefault(); const t = e.target, at = t.selectionStart;
+  t.value = t.value.slice(0, at) + '  ' + t.value.slice(t.selectionEnd); t.selectionStart = t.selectionEnd = at + 2;
+};
+$('openFlows').onclick = () => openFlows().catch(err => alert(err.message));
+$('closeFlows').onclick = () => $('flowsDlg').classList.add('hidden');
+$('newFlow').onclick = () => pickFlow(null);
+$('flowList').onclick = e => { if (e.target.dataset.flow) pickFlow(e.target.dataset.flow); };
+async function saveFlow() {
+  const r = await api('/api/flows', {method: 'POST', body: {source: $('flowSrc').value}});
+  fl.list = r.flows; fl.current = r.saved; renderFlowList();
+  return r.saved;
+}
+$('saveFlow').onclick = async () => { try { notice(`Saved ${await saveFlow()}`); } catch (err) { alert(err.message); } };
+$('delFlow').onclick = async () => {
+  if (!fl.current || !confirm(`Delete the flow ${fl.current}? Runs already made keep their chats.`)) return;
+  fl.list = (await api(`/api/flows/${encodeURIComponent(fl.current)}`, {method: 'DELETE'})).flows; pickFlow(fl.list[0]?.name || null);
+};
+$('runFlow').onclick = async () => {
+  const r = await checkFlow(); if (!r.ok) return alert('Fix the problems listed first.');
+  const inputs = Object.keys(r.graph.inputs);
+  $('runForm').innerHTML = inputs.map(k => `<label class="muted" style="font-size:12px">${esc(k)}<textarea data-input="${esc(k)}" style="width:100%;min-height:44px" required></textarea></label>`).join('')
+    + `<button class="primary">${inputs.length ? 'Start the run' : 'Start the run (no inputs)'}</button>`;
+  $('runForm').classList.remove('hidden');
+  $('runForm').querySelector('textarea, button').focus();
+};
+$('runForm').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    const name = await saveFlow();
+    const inputs = Object.fromEntries([...$('runForm').querySelectorAll('[data-input]')].map(t => [t.dataset.input, t.value]));
+    state.view = await api(`/api/flows/${encodeURIComponent(name)}/runs`, {method: 'POST', body: {inputs}});
+    $('flowsDlg').classList.add('hidden'); state.tab = 'mother';
+    await loadChats(); render(); watch();
+  } catch (err) { alert(err.message); }
+};
+$('draftBtn').onclick = async () => {
+  const description = $('draftText').value.trim(); if (!description) return $('draftText').focus();
+  $('draftBtn').disabled = true; $('draftBtn').textContent = 'Drafting…';
+  try {
+    const r = await api('/api/flows/draft', {method: 'POST', body: {description}});
+    fl.current = null; renderFlowList();
+    $('flowSrc').value = r.source; await checkFlow();
+    notice(r.errors.length ? 'Drafted - fix the problems listed, then Save' : 'Drafted - check it, then Save');
+  } catch (err) { alert(err.message); }
+  $('draftBtn').disabled = false; $('draftBtn').textContent = 'Draft it';
+};
+document.querySelector('.ftabs').onclick = e => {
+  const t = e.target.dataset.ftab; if (!t) return;
+  for (const b of e.currentTarget.children) b.classList.toggle('on', b.dataset.ftab === t);
+  $('flowsPane').classList.toggle('hidden', t !== 'flows'); $('agentsPane').classList.toggle('hidden', t !== 'agents');
+};
+function renderAgents() {
+  $('agModel').innerHTML = (state.platforms?.credentials || []).map(c => `<option value="@${esc(c.platform)}">@${esc(c.platform)}${c.enabled ? '' : ' (off)'}</option>`).join('');
+  $('agentList').innerHTML = fl.agents.map(a => `<div class="ctx-item"><b><span>@${esc(a.name)} <span class="tag">${esc(a.model)}</span></span>
+    <span><button type="button" data-agedit="${esc(a.name)}" title="Edit">✎</button><button type="button" data-agdel="${esc(a.name)}" title="Delete">✕</button></span></b>
+    <p>${esc(a.instructions || '')}</p>${(a.tools || []).length || Object.keys(a.output || {}).length ? `<p class="muted">${esc([...(a.tools || []).map(t => 'tool: ' + t), ...Object.entries(a.output || {}).map(([k, x]) => `${k}: ${x}`)].join(' · '))}</p>` : ''}</div>`).join('')
+    || '<div class="muted" style="font-size:12px">No agents yet.</div>';
+}
+$('agentList').onclick = async e => {
+  const del = e.target.dataset.agdel, edit = e.target.dataset.agedit;
+  if (del && confirm(`Delete @${del}?`)) { fl.agents = (await api(`/api/agents/${del}`, {method: 'DELETE'})).agents; renderAgents(); }
+  if (edit) {
+    const a = fl.agents.find(x => x.name === edit);
+    $('agName').value = a.name; $('agModel').value = a.model; $('agInstr').value = a.instructions || '';
+    $('agContext').value = (a.context || []).map(c => '#' + c).join(' ');
+    $('agentForm').querySelectorAll('[data-agtool]').forEach(c => c.checked = (a.tools || []).includes(c.dataset.agtool));
+    $('agOutput').value = Object.entries(a.output || {}).map(([k, x]) => `${k}: ${x}`).join('\n');
+  }
+};
+$('agentForm').onsubmit = async e => {
+  e.preventDefault();
+  const name = $('agName').value.trim().replace(/^@/, '').toLowerCase();
+  const output = Object.fromEntries($('agOutput').value.split('\n').map(l => l.split(':')).filter(p => p.length > 1 && p[0].trim())
+    .map(([k, ...x]) => [k.trim(), x.join(':').trim() || 'text']));
+  try {
+    fl.agents = (await api(`/api/agents/${encodeURIComponent(name)}`, {method: 'PUT', body: {
+      model: $('agModel').value, instructions: $('agInstr').value, output,
+      context: $('agContext').value.split(/[\s,]+/).filter(Boolean),
+      tools: [...$('agentForm').querySelectorAll('[data-agtool]:checked')].map(c => c.dataset.agtool)}})).agents;
+    renderAgents(); notice(`Saved @${name} - use it in flows, or @${name} in a chat`);
+    $('agentForm').reset();
+  } catch (err) { alert(err.message); }
+};
 
 function renderMeetbar(show) {
   const v = state.view, live = v.meeting, def = v.meeting_defaults;

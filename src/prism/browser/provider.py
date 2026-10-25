@@ -1,5 +1,8 @@
 """Provider that talks to a platform through its web app instead of its API."""
 
+import asyncio
+import time
+
 from ..providers.base import Message, Provider
 from .adapter import SiteAdapter
 from .manager import BrowserManager
@@ -23,6 +26,19 @@ class BrowserProvider(Provider):
         self.resend_system = resend_system
         self.notes: list[str] = []
         self.last_html: str | None = None
+        self._queued_at: float | None = None
+
+    @property
+    def last_activity(self) -> float | None:
+        """Waiting for the site's tab (another chat is using it) counts as activity; so does
+        the adapter still judging the reply."""
+        beats = [b for b in (self._queued_at, self.adapter.last_activity) if b]
+        return max(beats) if beats else None
+
+    async def _alive_while_queued(self) -> None:
+        while True:
+            self._queued_at = time.monotonic()
+            await asyncio.sleep(2)
 
     async def complete(self, messages: list[Message], system: str | None = None) -> str:
         return await self.complete_with_files(messages, system)
@@ -35,7 +51,14 @@ class BrowserProvider(Provider):
         if system and (new_chat or self.resend_system):
             text = f"{system}\n\n---\n\n{text}"
 
-        async with self.manager.lock(self.name):
+        lock = self.manager.lock(self.name)
+        beat = asyncio.create_task(self._alive_while_queued())  # one message at a time per site
+        try:
+            await lock.acquire()
+        finally:
+            beat.cancel()
+            self._queued_at = None
+        try:
             page = await self.manager.new_page()  # a tab in the shared headless browser
             try:
                 await self.adapter.open(page, None if self.fresh else self.thread_url)
@@ -48,3 +71,5 @@ class BrowserProvider(Provider):
                 return reply
             finally:
                 await page.close()
+        finally:
+            lock.release()

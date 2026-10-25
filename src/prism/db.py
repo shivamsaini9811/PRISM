@@ -111,6 +111,28 @@ MIGRATIONS = [
     # v4: a context item can be a library source (folder / web pages), searched per message.
     """
     ALTER TABLE context_items ADD COLUMN library INTEGER REFERENCES library_sources(id) ON DELETE CASCADE;
+    """,    # v5: agents (a role on a model), flows (YAML graphs of steps) and their runs.
+    """
+    CREATE TABLE agents (
+        name       TEXT PRIMARY KEY,
+        spec       TEXT NOT NULL,          -- JSON: model, instructions, context, tools, output
+        updated_at REAL NOT NULL
+    );
+    CREATE TABLE flows (
+        name       TEXT PRIMARY KEY,
+        source     TEXT NOT NULL,          -- the YAML as written
+        updated_at REAL NOT NULL
+    );
+    CREATE TABLE runs (
+        id         INTEGER PRIMARY KEY,
+        flow       TEXT NOT NULL,
+        source     TEXT NOT NULL,          -- the flow as it was when the run started
+        chat_id    INTEGER REFERENCES chats(id) ON DELETE SET NULL,
+        status     TEXT NOT NULL,
+        state      TEXT NOT NULL,          -- JSON RunState, saved after every step
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
     """,
 ]
 
@@ -350,6 +372,60 @@ class Store:
 
     def set_context_content(self, library: int, content: str) -> None:
         self._q("UPDATE context_items SET content = ? WHERE library = ?", (content, library))
+
+    # --- agents, flows, runs -------------------------------------------------------------
+
+    def list_agents(self) -> list[dict]:
+        return [{**json.loads(r["spec"]), "name": r["name"]}
+                for r in self._q("SELECT * FROM agents ORDER BY name")]
+
+    def get_agent(self, name: str) -> dict | None:
+        rows = self._q("SELECT * FROM agents WHERE name = ?", (name,))
+        return {**json.loads(rows[0]["spec"]), "name": name} if rows else None
+
+    def put_agent(self, name: str, spec: dict) -> None:
+        self._q("INSERT INTO agents VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+                " spec = excluded.spec, updated_at = excluded.updated_at",
+                (name, json.dumps({k: v for k, v in spec.items() if k != "name"}), time.time()))
+
+    def delete_agent(self, name: str) -> None:
+        self._q("DELETE FROM agents WHERE name = ?", (name,))
+
+    def list_flows(self) -> list[dict]:
+        return [dict(r) for r in self._q("SELECT * FROM flows ORDER BY name")]
+
+    def get_flow(self, name: str) -> str | None:
+        rows = self._q("SELECT source FROM flows WHERE name = ?", (name,))
+        return rows[0]["source"] if rows else None
+
+    def put_flow(self, name: str, source: str) -> None:
+        self._q("INSERT INTO flows VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+                " source = excluded.source, updated_at = excluded.updated_at", (name, source, time.time()))
+
+    def delete_flow(self, name: str) -> None:
+        self._q("DELETE FROM flows WHERE name = ?", (name,))
+
+    def add_run(self, flow: str, source: str, chat_id: int, state: dict) -> int:
+        now = time.time()
+        return self._insert("INSERT INTO runs (flow, source, chat_id, status, state, created_at, updated_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (flow, source, chat_id, state["status"], json.dumps(state), now, now))
+
+    def save_run(self, run_id: int, state: dict) -> None:
+        self._q("UPDATE runs SET status = ?, state = ?, updated_at = ? WHERE id = ?",
+                (state["status"], json.dumps(state), time.time(), run_id))
+
+    def get_run(self, run_id: int) -> dict | None:
+        rows = self._q("SELECT * FROM runs WHERE id = ?", (run_id,))
+        return {**dict(rows[0]), "state": json.loads(rows[0]["state"])} if rows else None
+
+    def run_for_chat(self, chat_id: int) -> dict | None:
+        rows = self._q("SELECT id FROM runs WHERE chat_id = ? ORDER BY id DESC LIMIT 1", (chat_id,))
+        return self.get_run(rows[0]["id"]) if rows else None
+
+    def runs_with_status(self, *statuses: str) -> list[dict]:
+        marks = ", ".join("?" * len(statuses))
+        return [self.get_run(r["id"]) for r in self._q(f"SELECT id FROM runs WHERE status IN ({marks})", statuses)]
 
     # --- library ------------------------------------------------------------------------
 

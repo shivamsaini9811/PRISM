@@ -655,3 +655,161 @@ def test_readers_settings(client, monkeypatch):
     assert client.post("/api/readers/download", json={"what": "evil"}).status_code == 400
     assert client.post("/api/local/import", json={"path": "/no/such/model.gguf"}).status_code == 400
     assert client.post("/api/local/import", json={"path": "/x/model.bin"}).json()["detail"].startswith("Point at a .gguf")
+
+
+def wait_run(client, chat_id: int, until=("done", "waiting", "paused", "stopped")) -> dict:
+    for _ in range(300):
+        v = client.get(f"/api/chats/{chat_id}").json()
+        if v["run"] and v["run"]["status"] in until and not v["run"]["live"]:
+            return v
+        time.sleep(0.02)
+    raise AssertionError(f"run did not reach {until}: {v['run']}")
+
+
+FLOW = """
+name: brief
+inputs: {topic: text}
+agents:
+  checker: {model: "@gpt", output: {verdict: PASS|FIX}}
+nodes:
+  write:  {agent: critic, prompt: "Write about {{input.topic}}."}
+  check:  {agent: checker, prompt: "Check {{write.text}}"}
+  ok:     {ask_you: "Publish it?", show: "{{write.text}}"}
+edges:
+  - write -> check
+  - check -> write: {when: "verdict == FIX", max_rounds: 1}
+  - check -> ok:    {when: "verdict == PASS or rounds_done"}
+"""
+
+
+def test_agents_answer_by_name_in_a_chat(client, monkeypatch):
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    assert client.put("/api/agents/gpt", json={"model": "@gpt"}).status_code == 400       # a platform's name
+    assert client.put("/api/agents/critic", json={"model": "@nobody"}).status_code == 400
+    assert client.put("/api/agents/critic", json={"model": "@gpt", "tools": ["shell"]}).status_code == 400
+    r = client.put("/api/agents/critic", json={"model": "gpt", "instructions": "Find what is wrong.",
+                                               "context": ["#spec"], "output": {}})
+    assert r.json()["agents"] == [{"name": "critic", "model": "@gpt", "instructions": "Find what is wrong.",
+                                   "context": ["spec"], "tools": [], "output": {}}]
+    systems = []
+    real = app_mod.make_provider
+
+    def capture(cred, **kw):
+        f = real(cred, **kw)
+        orig = f.complete
+        async def complete(messages, system=None):
+            systems.append(system)
+            return await orig(messages, system)
+        f.complete = complete
+        return f
+    monkeypatch.setattr(app_mod, "make_provider", capture)
+    chat = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@critic is this plan sound?", "format": "chat"})
+    v = wait_meeting(client, chat)
+    said = [m for m in v["messages"] if m["meta"]["kind"] == "speaker"]
+    assert said[0]["meta"]["speaker"] == "critic" and "Your role here, set by the user: Find what is wrong." in systems[0]
+    assert [d["platform"] for d in v["daughters"]] == ["critic"]
+
+
+def test_flow_runs_in_its_own_room_with_notes_and_approval(client, monkeypatch):
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    client.put("/api/agents/critic", json={"model": "@gpt", "instructions": "Write well."})
+    bad = client.post("/api/flows/validate", json={"source": FLOW.replace("max_rounds: 1", "")}).json()
+    assert not bad["ok"] and "has no limit" in bad["errors"][0]
+    good = client.post("/api/flows/validate", json={"source": FLOW}).json()
+    assert good["ok"] and [n["id"] for n in good["graph"]["nodes"]] == ["write", "check", "ok"]
+    assert client.post("/api/flows", json={"source": "name: x\nnodes: {}"}).status_code == 400
+    assert client.post("/api/flows", json={"source": FLOW}).json()["saved"] == "brief"
+    assert client.post("/api/flows/brief/runs", json={"inputs": {}}).status_code == 400  # topic missing
+
+    sent = []
+
+    class Writer:
+        def __init__(self):
+            self.name, self.model, self.thread_url, self.n = "gpt", "gpt-fake", None, 0
+
+        async def complete(self, messages, system=None):
+            sent.append((system, messages[-1]["content"]))
+            self.n += 1
+            if "Check" in messages[-1]["content"]:
+                return "Fine.\nVERDICT: " + ("FIX" if self.n < 3 else "PASS")
+            return f"draft {self.n}"
+    writer = Writer()
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: writer)
+
+    v = client.post("/api/flows/brief/runs", json={"inputs": {"topic": "tides"}}).json()
+    chat = v["chat"]["id"]
+    assert v["chat"]["title"] == "Run: brief"
+    v = wait_run(client, chat)
+    run = v["run"]
+    assert run["status"] == "waiting" and run["waiting"] == "ok" and run["done"] == ["write", "check"]
+    kinds = [(m["meta"]["kind"], m["meta"].get("node")) for m in v["messages"]]
+    assert kinds == [("topic", None), ("step", "write"), ("step", "check"), ("step", "write"),
+                     ("step", "check"), ("ask_you", "ok")]
+    assert v["messages"][2]["meta"]["fields"] == {"verdict": "FIX"}
+    assert "Write well." in sent[0][0] and sent[0][1].startswith("Write about tides.")
+    assert {d["platform"] for d in v["daughters"]} == {"critic", "checker"}  # a tab per agent
+
+    # Said while it waits: kept for the next steps.
+    client.post(f"/api/chats/{chat}/messages", json={"content": "make it shorter"})
+    r = client.post(f"/api/runs/{run['id']}/answer", json={"node": "ok", "approved": True, "text": "go"}).json()
+    v = wait_run(client, chat)
+    assert v["run"]["status"] == "done"
+    ask = next(m for m in v["messages"] if m["meta"]["kind"] == "ask_you")
+    assert ask["meta"]["answer"] == "yes"
+    assert v["messages"][-1]["meta"] == {**v["messages"][-1]["meta"], "kind": "run", "status": "done"}
+    assert client.post(f"/api/runs/{run['id']}/answer", json={"node": "ok", "approved": True}).status_code == 409
+
+
+def test_run_stops_and_resumes_after_a_restart(client, monkeypatch):
+    import asyncio
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    client.post("/api/flows", json={"source": "name: slow\nagents: {w: {model: '@gpt'}}\nnodes: {a: {agent: w}, b: {agent: w}}\nedges: [a -> b]"})
+
+    class Hang:
+        name, model, thread_url = "gpt", "gpt-fake", None
+
+        async def complete(self, messages, system=None):
+            await asyncio.sleep(30)
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: Hang())
+    chat = client.post("/api/flows/slow/runs", json={}).json()["chat"]["id"]
+    run_id = client.get(f"/api/chats/{chat}").json()["run"]["id"]
+    assert client.delete(f"/api/chats/{chat}").status_code == 409
+    v = client.post(f"/api/runs/{run_id}/stop").json()
+    assert v["run"]["status"] == "stopped" and v["messages"][-1]["meta"]["status"] == "stopped"
+
+    # A run that was going when PRISM closed comes back paused, and continues from its step.
+    s = app_mod.store()
+    state = s.get_run(run_id)["state"]
+    s.save_run(run_id, {**state, "status": "running", "queue": ["a"]})   # as if PRISM died mid-step
+    app_mod._live_runs.pop(run_id, None)
+    app_mod.recover_runs()
+    assert s.get_run(run_id)["status"] == "paused"
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: __import__("test_meeting").Fake("gpt"))
+    assert client.post(f"/api/runs/{run_id}/resume", json={}).status_code == 200
+    v = wait_run(client, chat)
+    assert v["run"]["status"] == "done" and v["run"]["done"] == ["a", "b"]
+
+
+def test_draft_flow_is_checked_and_fixed_once(client, monkeypatch):
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/claude", json={"secret": "k"})
+    client.put("/api/primary", json={"platform": "claude"})
+    prompts = []
+
+    class Drafter:
+        name, model, thread_url = "claude", "c", None
+
+        async def complete(self, messages, system=None):
+            prompts.append(messages[-1]["content"])
+            if len(prompts) == 1:  # forgets the loop limit
+                return "```yaml\nname: d\nagents: {w: {model: '@claude'}}\nnodes: {a: {agent: w}, b: {agent: w}}\nedges: [a -> b, b -> a]\n```"
+            return "```yaml\nname: d\nagents: {w: {model: '@claude'}}\nnodes: {a: {agent: w}, b: {agent: w}}\nstart: a\nedges: [a -> b, {b -> a: {max_rounds: 2}}]\n```"
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: Drafter())
+    r = client.post("/api/flows/draft", json={"description": "write then check, twice"}).json()
+    assert "write then check, twice" in prompts[0] and "{{input.name}}" in prompts[0] and "@claude" in prompts[0]
+    assert "has no limit" in prompts[1]
+    assert r["errors"] == [] and r["source"].startswith("name: d")

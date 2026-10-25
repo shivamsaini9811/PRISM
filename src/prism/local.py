@@ -222,7 +222,8 @@ def start_import(path: str) -> str:
 
 class OllamaProvider(Provider):
     """Ollama's own chat API: unlike its OpenAI-style one, it lets PRISM set the context
-    window, so a long room isn't silently cut from the front (where the instructions are)."""
+    window, so a long room isn't silently cut from the front (where the instructions are).
+    The reply streams in, so a slow model counts as working while it writes."""
 
     def __init__(self, name: str, model: str, base_url: str | None = None):
         self.name, self.model = name, model
@@ -230,17 +231,26 @@ class OllamaProvider(Provider):
 
     async def complete(self, messages: list[Message], system: str | None = None) -> str:
         body = {"model": self.model, "messages": fit(messages, system, LOCAL_MAX_CHARS),
-                "stream": False, "options": {"num_ctx": OLLAMA_CTX}}
+                "stream": True, "options": {"num_ctx": OLLAMA_CTX}}
+        parts: list[str] = []
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=900)) as http:
-                r = await http.post(f"{self.base_url}/api/chat", json=body)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None)) as http:
+                async with http.stream("POST", f"{self.base_url}/api/chat", json=body) as r:
+                    if r.status_code == 404:
+                        raise ProviderError(f"Ollama doesn't have {self.model} - download it in Settings → Local models")
+                    if r.status_code != 200:
+                        raise ProviderError(f"Ollama answered {r.status_code}: {(await r.aread())[:200]!r}")
+                    async for line in r.aiter_lines():
+                        self.last_activity = time.monotonic()
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        if ev.get("error"):
+                            raise ProviderError(f"Ollama: {ev['error']}")
+                        parts.append((ev.get("message") or {}).get("content", ""))
         except httpx.ConnectError:
             raise ProviderError("Ollama isn't running - start it (or open Settings → Local models)")
-        if r.status_code == 404:
-            raise ProviderError(f"Ollama doesn't have {self.model} - download it in Settings → Local models")
-        if r.status_code != 200:
-            raise ProviderError(f"Ollama answered {r.status_code}: {r.text[:200]}")
-        return r.json().get("message", {}).get("content", "")
+        return "".join(parts)
 
 
 class LMStudioProvider(Provider):
@@ -250,15 +260,27 @@ class LMStudioProvider(Provider):
         self.base_url = base if base.endswith("/v1") else base + "/v1"
 
     async def complete(self, messages: list[Message], system: str | None = None) -> str:
-        body = {"model": self.model, "messages": fit(messages, system, LOCAL_MAX_CHARS)}
+        body = {"model": self.model, "messages": fit(messages, system, LOCAL_MAX_CHARS), "stream": True}
+        parts, raw = [], []
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=900)) as http:
-                r = await http.post(f"{self.base_url}/chat/completions", json=body)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None)) as http:
+                async with http.stream("POST", f"{self.base_url}/chat/completions", json=body) as r:
+                    if r.status_code != 200:
+                        raise ProviderError(f"LM Studio answered {r.status_code}: {(await r.aread())[:200]!r}")
+                    async for line in r.aiter_lines():  # server-sent events: data: {...}
+                        self.last_activity = time.monotonic()
+                        if not line.startswith("data:"):
+                            raw.append(line)
+                            continue
+                        data = line[5:].strip()
+                        if data and data != "[DONE]":
+                            delta = json.loads(data)["choices"][0].get("delta") or {}
+                            parts.append(delta.get("content") or "")
         except httpx.ConnectError:
             raise ProviderError("LM Studio's server isn't running - start it in LM Studio (Developer → Start server)")
-        if r.status_code != 200:
-            raise ProviderError(f"LM Studio answered {r.status_code}: {r.text[:200]}")
-        return r.json()["choices"][0]["message"]["content"] or ""
+        if not parts and raw:  # a server that ignored stream: one JSON body
+            return json.loads("".join(raw))["choices"][0]["message"]["content"] or ""
+        return "".join(parts)
 
 
 # --- models running in the PRISM page --------------------------------------------------------

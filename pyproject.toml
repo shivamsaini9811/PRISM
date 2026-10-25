@@ -1,6 +1,6 @@
 [project]
 name = "prism"
-version = "0.7.1"
+version = "0.8.0"
 description = "PRISM - Parallel Routing, Inter-model Scoring & Merging across multiple AI models"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = [
     "playwright>=1.47",
     "pypdf>=5.0",
     "pillow>=10.4",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

@@ -28,7 +28,13 @@ def tags():
 async def chat(request: Request):
     body = await request.json()
     seen.append(body)
-    return {"message": {"role": "assistant", "content": f"local answer to {body['messages'][-1]['content'][-20:]}"}}
+    words = f"local answer to {body['messages'][-1]['content'][-20:]}".split(" ")
+
+    async def chunks():  # Ollama streams one JSON object per line
+        for i, w in enumerate(words):
+            yield json.dumps({"message": {"role": "assistant", "content": (" " if i else "") + w}, "done": False}) + "\n"
+        yield json.dumps({"message": {"role": "assistant", "content": ""}, "done": True}) + "\n"
+    return StreamingResponse(chunks(), media_type="application/x-ndjson")
 
 
 @fake.post("/api/pull")
@@ -105,7 +111,8 @@ async def test_ollama_provider_sets_the_window_and_trims(ollama):
     reply = await p.complete([{"role": "user", "content": "a" * 60_000}, {"role": "user", "content": "hello"}], "SYS")
     assert reply == "local answer to hello"
     body = seen[0]
-    assert body["options"]["num_ctx"] == local.OLLAMA_CTX and body["stream"] is False
+    assert body["options"]["num_ctx"] == local.OLLAMA_CTX and body["stream"] is True
+    assert p.last_activity is not None  # it counted as working while the reply streamed
     assert body["messages"][0] == {"role": "system", "content": "SYS"}
     assert [m["content"] for m in body["messages"][1:]] == ["hello"]  # the huge one didn't fit
 

@@ -16,4 +16,8 @@ class Settings(BaseSettings):
     prism_profiles_dir: Path = data_dir() / "profiles"   # one shared browser profile, all platforms
     prism_browser_headless: bool = True   # False: a real window parked off-screen
     prism_browser_channel: str | None = None  # msedge | chrome | bundled; default: first that works
-    request_timeout_s: float = 900.0  # one bot turn; deep answers on the web can take minutes
+    # A turn has no fixed time limit: it runs while the model shows it is working (the site's
+    # Stop button, text or progress still changing, a local model still streaming). It gives up
+    # after this long with no sign of activity, or after reply_max_s in all.
+    request_timeout_s: float = 1200.0
+    reply_max_s: float = 4 * 3600.0

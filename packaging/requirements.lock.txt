@@ -115,7 +115,9 @@ python-dotenv==1.2.4
     #   pydantic-settings
     #   uvicorn
 pyyaml==6.0.3
-    # via uvicorn
+    # via
+    #   prism
+    #   uvicorn
 requests==2.34.2
     # via
     #   google-auth

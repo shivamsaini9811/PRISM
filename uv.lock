@@ -1238,7 +1238,7 @@ wheels = [
 
 [[package]]
 name = "prism"
-version = "0.7.1"
+version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
@@ -1252,6 +1252,7 @@ dependencies = [
     { name = "pydantic-settings", version = "2.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pydantic-settings", version = "2.16.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pypdf" },
+    { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -1273,6 +1274,7 @@ requires-dist = [
     { name = "playwright", specifier = ">=1.47" },
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "pypdf", specifier = ">=5.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 

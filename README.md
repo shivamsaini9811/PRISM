@@ -57,6 +57,40 @@ marked *always* are sent with every message instead of only when named.
 A round takes as long as its slowest model plus the moderator: seconds over APIs, 1-2 minutes
 with web platforms.
 
+**Agents and flows - work that runs on its own**
+
+An **agent** (Flows → Agents) is a role on one of your models: instructions, the #context it
+always gets, what it may look up (`ASK @docs`, `@prism`, your other assistants) and fields
+PRISM reads from its reply (`verdict: PASS|FIX`). `@critic` in any chat makes it answer.
+
+A **flow** is a graph of steps, written in YAML (or drafted from a description by the
+primary model) and drawn as you type:
+
+```yaml
+name: market-brief
+inputs: {topic: text}
+nodes:
+  draft:  {agent: writer, prompt: "Write a brief on {{input.topic}}. Fix: {{review.notes}}"}
+  review: {agent: critic, prompt: "Review {{draft.text}}"}
+  ok:     {ask_you: "Publish it?", show: "{{draft.text}}"}
+edges:
+  - draft -> review
+  - review -> draft: {when: "verdict == FIX", max_rounds: 2}
+  - review -> ok:    {when: "verdict == PASS or rounds_done"}
+```
+
+Steps: `agent`, `tool` (docs, prism, fetch), `ask_you` (pauses with Approve / Reject), `wait`
+(e.g. `10m`), `flow` (another flow inside this one); `join: all` waits for every step that
+leads in. Every loop needs `max_rounds`; a run also has a step and time budget (`budget:`),
+and pauses rather than fails when one runs out. Each run is its own chat: a card per step, a
+tab per agent, the graph lit up as it goes; notes you type reach the steps still to come.
+State is saved after every step, so a run continues after PRISM restarts.
+
+**No fixed time limit on a reply**: PRISM waits while the model shows it is working - the
+site's Stop button, progress or text still changing, a local model still streaming - so long
+research is not cut off. It gives up after 20 minutes with nothing changing on the page
+(`REQUEST_TIMEOUT_S`), or 4 hours in all (`REPLY_MAX_S`).
+
 **Folders and web pages - your documents as context**
 
 In the Context panel, **Add a folder or web pages** gives a folder (or a list of URLs) a
@@ -145,6 +179,7 @@ src/prism/
   __main__.py      launcher: starts the server, opens the UI
   app.py           FastAPI: vault, credentials, chats, context, browser connect/check
   meeting.py       the room: bookmarks, formats as scripts, sessions, moderator
+  flows.py         agents in a graph: parsing, checks, conditions, runs with saved state
   library.py       folders / web pages: scanning, passages, search (#name, ASK @docs)
   readers.py       files of every kind to text
   enrich.py        reader models: images and scans, transcription, embeddings

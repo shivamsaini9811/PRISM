@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from .providers import Message, Provider
+from .providers import Message, Provider, wait_reply
 
 # How long each bot may talk per turn (words; 0 = no limit). A prompt instruction - web apps
 # can't enforce it.
@@ -119,6 +119,7 @@ class Member:
     words: int = BUDGETS["full"]
     history: list[Message] = field(default_factory=list)  # its own thread so far
     seen: int = 0  # room entries [:seen] have been sent to it
+    role: str = ""  # a saved agent's instructions: what this member is for
 
 
 def render(entries: list[Entry], limit: int = DELTA_CHARS) -> str:
@@ -213,11 +214,14 @@ Ask = Callable[[str, str], Awaitable[str]]
 class Session:
     def __init__(self, room: list[Entry], members: dict[str, Member], script: Script, emit: Emit,
                  context: str = "", timeout: float = 300.0, deep: bool = False,
-                 ask: Ask | None = None, askable: list[str] = (), max_asks: int = MAX_ASKS):
+                 ask: Ask | None = None, askable: list[str] = (), max_asks: int = MAX_ASKS,
+                 max_s: float = 4 * 3600.0):
         if script.moderated and MODERATOR not in members:
             raise ValueError("a moderated format needs the moderator")
         self.room, self.members, self.script, self.emit = room, members, script, emit
-        self.context, self.timeout, self.deep = context, timeout, deep
+        # timeout: give up on a turn after this long with no sign the model is working;
+        # max_s: in all. A model that keeps working (long research) is not cut off.
+        self.context, self.timeout, self.deep, self.max_s = context, timeout, deep, max_s
         self.ask, self.askable, self.max_asks = ask, list(askable), max_asks
         self.rounds = script.rounds
         self.round = 0
@@ -315,7 +319,7 @@ class Session:
                 msgs = m.history + [{"role": "user", "content": st.prompt}]
                 first = (m.provider.complete_with_files(list(msgs), self._system(m), files[t.speaker])
                          if files[t.speaker] else m.provider.complete(list(msgs), self._system(m)))
-                st.text = await asyncio.wait_for(first, self.timeout)
+                st.text = await wait_reply(first, m.provider, self.timeout, self.max_s)
                 msgs.append({"role": "assistant", "content": st.text})
                 asks = 0
                 while (q := _ask_request(st.text)) and (targets := self._targets(m, q.group(1))):
@@ -326,8 +330,8 @@ class Session:
                         asks += 1
                         answer = await self._lookup(m.name, targets, q.group(2).strip())
                     msgs.append({"role": "user", "content": answer})
-                    st.text = await asyncio.wait_for(m.provider.complete(list(msgs), self._system(m)),
-                                                     self.timeout)
+                    st.text = await wait_reply(m.provider.complete(list(msgs), self._system(m)),
+                                               m.provider, self.timeout, self.max_s)
                     msgs.append({"role": "assistant", "content": st.text})
                     if answer.startswith("[No asks left"):
                         break
@@ -400,7 +404,7 @@ class Session:
         """One ASK, to one platform or several at once; each exchange joins the room."""
         async def one(target: str) -> str:
             try:
-                answer = await asyncio.wait_for(self.ask(target, question), self.timeout)
+                answer = await wait_reply(self.ask(target, question), None, self.timeout, self.max_s)
                 error = None
             except Exception as e:
                 answer, error = "", _err(e)
@@ -430,8 +434,9 @@ class Session:
                  ASK_HELP.format(askable=", ".join(assistants), max_asks=self.max_asks,
                                  prism=tools) if assistants else
                  ASK_TOOLS_ONLY.format(max_asks=self.max_asks, tools=tools) if askable else "")
+        role = f" Your role here, set by the user: {m.role}" if m.role else ""
         return _with_context(MEMBER_SYSTEM.format(name=m.name, others=others,
-                                                  deep=(DEEP if self.deep else "") + help_),
+                                                  deep=role + (DEEP if self.deep else "") + help_),
                              self.context)
 
     async def _moderate(self, kind: str, instruction: str) -> None:
@@ -447,7 +452,7 @@ class Session:
         try:
             msgs = m.history + [{"role": "user", "content": prompt}]
             system = _with_context(MODERATOR_SYSTEM, self.context)
-            text = await asyncio.wait_for(m.provider.complete(msgs, system), self.timeout)
+            text = await wait_reply(m.provider.complete(msgs, system), m.provider, self.timeout, self.max_s)
             m.history += [{"role": "user", "content": prompt}, {"role": "assistant", "content": text}]
             self._mark_seen(m, snapshot)
             if html := getattr(m.provider, "last_html", None):

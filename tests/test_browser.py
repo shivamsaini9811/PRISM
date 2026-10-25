@@ -31,9 +31,25 @@ const delay = location.hash === '#slow' ? 3000 : 400, virtual = location.hash ==
 document.getElementById('composer').onkeydown = e => {  // Enter sends, like real chat sites
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); document.getElementById('send').click(); }
 };
+const mode = location.hash;  // read now: pushState drops the hash
 document.getElementById('send').onclick = () => {
   const box = document.querySelector('#composer, #late'), q = box.value; box.value = '';
   if (!location.pathname.startsWith('/c/')) history.pushState({}, '', '/c/42');
+  if (mode === '#research' || mode === '#stale' || mode === '#dead') {
+    const u = document.createElement('div'); u.className = 'user'; u.textContent = q; log.appendChild(u);
+    if (mode === '#dead') return;          // nothing ever comes back
+    const a = document.createElement('div'); a.className = 'assistant'; log.appendChild(a);
+    const stop = document.createElement('button'); stop.setAttribute('aria-label', 'Stop response'); stop.textContent = 'Stop';
+    document.body.appendChild(stop);
+    if (mode === '#stale') { a.textContent = 'final answer'; return; }  // its Stop button never goes away
+    a.textContent = 'Researching…';         // a deep-research reply: the text waits while progress moves elsewhere
+    const p = document.createElement('div'); log.appendChild(p); let k = 0;
+    const t = setInterval(() => {
+      p.textContent = 'Sources read: ' + (++k);
+      if (k === 20) { clearInterval(t); a.textContent = 'Report: ' + q; stop.remove(); }
+    }, 200);
+    return;
+  }
   if (remount) log.querySelectorAll('.assistant').forEach(e => e.replaceWith(e.cloneNode(true)));  // React re-draws old replies
   const u = document.createElement('div'); u.className = 'user'; u.textContent = q; log.appendChild(u);
   setTimeout(() => {                       // the reply box shows up a moment after the question
@@ -367,3 +383,45 @@ async def test_reply_keeps_the_sites_formatting_without_its_scripts(manager):
     html = p.last_html
     assert "<pre><code" in html and "&lt;h1&gt;" in html and "<p>Done.</p>" in html
     assert "<button" not in html and "Copy" not in html and "class=" not in html.replace('class="language-', '')
+
+
+async def test_long_research_is_waited_for_and_a_dead_page_gives_up(manager):
+    """No fixed time limit: a reply whose text sits on "Researching…" while the page keeps
+    moving is waited for well past the idle and stale-marker limits; a page that does nothing
+    gives up after the idle time; a Stop button left up over a finished reply is stale."""
+    cfg = CONFIG.with_overrides({"streaming": 'button[aria-label="Stop response"]'})
+    adapter = SiteAdapter(cfg, load_timeout_s=5, idle_s=2, stuck_s=1)
+    page = await manager.new_page()
+    await page.goto("http://fake.test/new#research")
+    start = asyncio.get_running_loop().time()
+    assert await adapter.send(page, "solar market") == "Report: solar market"
+    assert asyncio.get_running_loop().time() - start > 3.5  # 4 s of research, longer than both limits
+
+    await page.goto("http://fake.test/new#stale")
+    assert await adapter.send(page, "q") == "final answer"
+
+    await page.goto("http://fake.test/new#dead")
+    with pytest.raises(Exception, match="no reply appeared"):
+        await adapter.send(page, "q")
+    await page.close()
+
+
+async def test_wait_reply_follows_activity():
+    from prism.providers import NoReply, wait_reply
+
+    class Busy:
+        last_activity = None
+
+    p = Busy()
+    import time as _t
+
+    async def beating():  # takes 5 s, longer than idle_s, but shows it is alive throughout
+        for _ in range(10):
+            p.last_activity = _t.monotonic()
+            await asyncio.sleep(0.5)
+        return "done"
+    assert await wait_reply(beating(), p, idle_s=2, max_s=60) == "done"
+    with pytest.raises(NoReply, match="no sign of activity"):
+        await wait_reply(asyncio.sleep(10), None, idle_s=2, max_s=60)
+    with pytest.raises(NoReply, match="still not finished"):
+        await wait_reply(beating(), p, idle_s=2, max_s=1)

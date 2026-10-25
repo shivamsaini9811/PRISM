@@ -126,6 +126,11 @@ _ANY_COMPOSER = 'textarea, [contenteditable="true"], [role="textbox"]'
 # Every chat site shows a Stop button while it writes; used when the reply had to be found
 # by watching the page (its own "writing" marker may be gone too).
 _ANY_STOP = 'button[aria-label*="Stop" i], button[data-testid*="stop" i]'
+# How much the conversation shows: changes while a model thinks, searches or writes (progress
+# lines, sources, the reply), even when the reply's own text does not.
+_ACTIVITY_JS = """() => { const m = document.querySelector('main') || document.body, t = m.innerText;
+  let h = 0; for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+  return t.length + ':' + h + ':' + m.getElementsByTagName('*').length; }"""
 
 # --- finding things when the site changed its layout -----------------------------------
 # The message box: the biggest visible text box, the lower the better (the composer sits at
@@ -306,8 +311,14 @@ class SiteAdapter:
                  screenshot_dir: Path | None = None, media_dir: Path | None = None,
                  on_learn: Callable[[dict], None] | None = None,
                  advisor: Callable[[str], Awaitable[str]] | None = None,
-                 fallback_after_s: float = 30.0):
+                 fallback_after_s: float = 30.0, idle_s: float = 1200.0, stuck_s: float = 300.0):
         self.cfg = config
+        # No fixed time for a reply: PRISM waits while the site shows it is working, and gives
+        # up after idle_s with nothing changing on the page (3x that while a Stop button still
+        # shows). A Stop button that stays up with the reply unchanged for stuck_s is stale.
+        self.idle_s, self.stuck_s = idle_s, stuck_s
+        self.last_activity: float | None = None  # heartbeat while PRISM is still judging the reply
+        self._page_mark: str | None = None
         self.load_timeout_ms = load_timeout_s * 1000
         self.screenshot_dir = screenshot_dir
         self.media_dir = media_dir  # images in replies are saved here
@@ -430,9 +441,12 @@ class SiteAdapter:
         except Exception:
             return None
 
-    async def send(self, page: Page, text: str, timeout_s: float = 840.0,
+    async def send(self, page: Page, text: str, timeout_s: float | None = None,
                    files: list[str] = ()) -> str:
+        """timeout_s: give up after this long with no activity on the page (default idle_s)."""
+        idle = timeout_s or self.idle_s
         self.last_html = None
+        self._beat()
         await self._mark_old_replies(page)
         # The new reply is the one not marked: counting fails on sites that drop old messages
         # from the page as new ones arrive (long chats on claude.ai).
@@ -457,12 +471,16 @@ class SiteAdapter:
         except Exception:  # no send button configured, or it was renamed: Enter sends
             await composer.press("Enter")
 
-        deadline = time.monotonic() + timeout_s
         watch_from = time.monotonic() + self.fallback_after_s
         watching = False
+        marker = ", ".join(x for x in (self.cfg.streaming, _ANY_STOP) if x)
+        changed_at = time.monotonic()
         while not await replies.count():
-            if time.monotonic() > deadline:
-                raise ProviderError("no reply appeared")
+            self._beat()
+            if await self._page_changed(page) or await self._showing(page, marker):
+                changed_at = time.monotonic()
+            elif time.monotonic() - changed_at > idle:
+                raise ProviderError(f"no reply appeared, and the page showed no activity for {round(idle / 60)} min")
             # The site may have renamed its replies: read whatever the page added instead.
             if time.monotonic() > watch_from and await page.evaluate(_FIND_REPLY_JS, text):
                 watching = True
@@ -474,12 +492,12 @@ class SiteAdapter:
                     return replies.last
                 await page.evaluate(_FIND_REPLY_JS, text)
                 return page.locator("[data-prism-reply]")
-            text_out = await self._wait_until_stable(page, current, deadline, text, settle_s=5.0,
+            text_out = await self._wait_until_stable(page, current, idle, text, settle_s=5.0,
                                                      streaming=_ANY_STOP)
             reply = await current()
         else:
             reply = replies.last
-            text_out = await self._wait_until_stable(page, reply, deadline, text)
+            text_out = await self._wait_until_stable(page, reply, idle, text)
         await self._learn(page, text, watching and not await replies.count())
         return "\n\n".join([text_out] + await self._save_media(page, reply))
 
@@ -653,26 +671,59 @@ class SiteAdapter:
                 continue
         return saved
 
-    async def _wait_until_stable(self, page: Page, reply, deadline: float, sent: str = "",
-                                 settle_s: float = 1.5, stuck_s: float = 60.0,
-                                 streaming: str = "") -> str:
-        """The reply is done when nothing is streaming and its text stopped changing.
+    def _beat(self) -> None:
+        self.last_activity = time.monotonic()
+
+    async def _showing(self, page: Page, selector: str) -> bool:
+        try:
+            return bool(selector) and await page.locator(selector).filter(visible=True).count() > 0
+        except Exception:
+            return False
+
+    async def _page_changed(self, page: Page) -> bool:
+        try:
+            mark = await page.evaluate(_ACTIVITY_JS)
+        except Exception:
+            return False
+        changed, self._page_mark = mark != self._page_mark, mark
+        return changed
+
+    async def _wait_until_stable(self, page: Page, reply, idle_s: float, sent: str = "",
+                                 settle_s: float = 1.5, streaming: str = "") -> str:
+        """The reply is done when the site no longer shows it is working (its Stop button or
+        streaming marker is gone) and the text stopped changing. There is no time limit while
+        the page keeps changing - deep research can take an hour. It ends early only when:
+        the Stop button stays up but nothing at all changed for stuck_s (a stale marker), or
+        nothing changed for idle_s (3x that while a Stop button shows).
         `reply` is re-resolved each time, so an echo of `sent` is skipped for the real reply;
         it may also be an async function returning the locator to read."""
         marker = ", ".join(s for s in (self.cfg.streaming, streaming) if s)
         last, stable_since = None, time.monotonic()
-        while time.monotonic() < deadline:
+        still_since = time.monotonic()  # the last time anything on the page changed
+        while True:
+            self._beat()
             loc = await reply() if callable(reply) else reply
             try:
                 text = (await loc.inner_text(timeout=5000)).strip()
             except Exception:  # replaced while we read it
                 text = ""
-            streaming_now = bool(marker) and await page.locator(marker).filter(visible=True).count() > 0
-            quiet = time.monotonic() - stable_since
+            streaming_now = await self._showing(page, marker)
+            now = time.monotonic()
             if text != last or not text or _is_echo(text, sent):
-                last, stable_since = text, time.monotonic()
-            elif (quiet >= settle_s and not streaming_now) or quiet >= stuck_s:
-                try:  # done, or the site's "writing" marker got stuck: read it once more, fenced
+                last, stable_since = text, now
+                still_since = now
+            elif await self._page_changed(page):
+                still_since = now  # thinking, searching, sources arriving: still working
+            quiet, still = now - stable_since, now - still_since
+            usable = bool(text) and not _is_echo(text, sent)
+            done = usable and ((quiet >= settle_s and not streaming_now) or (streaming_now and still >= self.stuck_s))
+            if not done and still >= idle_s * (3 if streaming_now else 1):
+                if not usable:
+                    raise ProviderError(f"no reply: nothing changed on the page for {round(still / 60)} min")
+                self.notes.append(f"the reply stopped changing for {round(still / 60)} min - took it as finished")
+                done = True
+            if done:
+                try:  # read it once more, with code blocks fenced
                     if "<pre" in await loc.inner_html(timeout=5000):
                         text = (await loc.evaluate(_REPLY_TEXT_JS)).strip() or text
                 except Exception:
@@ -682,8 +733,7 @@ class SiteAdapter:
                 except Exception:
                     self.last_html = None
                 return clean_reply(text)
-            await asyncio.sleep(0.3)
-        raise ProviderError("reply did not finish before the timeout")
+            await asyncio.sleep(0.3 if quiet < 30 else 1.0)
 
     async def doctor(self, page: Page) -> dict:
         """Report how many elements each configured selector matches on the new-chat page."""

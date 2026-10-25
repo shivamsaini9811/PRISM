@@ -1,6 +1,6 @@
 """Platform catalog and provider construction from stored credentials."""
 
-from .base import Message, Provider, ProviderError
+from .base import Message, NoReply, Provider, ProviderError, wait_reply
 
 # kind -> which adapter; needs_secret=False for local runtimes.
 PLATFORMS: dict[str, dict] = {
@@ -32,4 +32,4 @@ def build_provider(platform: str, model: str, secret: str | None,
     return p
 
 
-__all__ = ["Message", "PLATFORMS", "Provider", "ProviderError", "build_provider"]
+__all__ = ["Message", "NoReply", "PLATFORMS", "Provider", "ProviderError", "build_provider", "wait_reply"]

@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+import httpx
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
@@ -24,9 +25,9 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import enrich, local
+from . import enrich, flows, local, readers
 from .library import Library, attachable, passages_text
-from .providers import PLATFORMS, Provider, build_provider
+from .providers import PLATFORMS, Provider, build_provider, wait_reply
 
 STATIC = Path(__file__).parent / "static"
 log = logging.getLogger(__name__)
@@ -60,10 +61,11 @@ def library() -> Library:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    recover_runs()
     yield
-    for task in _session_tasks.values():
+    for task in list(_session_tasks.values()) + list(_run_tasks.values()):
         task.cancel()
-    await asyncio.gather(*_session_tasks.values(), return_exceptions=True)
+    await asyncio.gather(*_session_tasks.values(), *_run_tasks.values(), return_exceptions=True)
     await browsers().close()
 
 
@@ -164,7 +166,7 @@ def make_provider(cred: dict, thread_url: str | None = None, fresh: bool = False
                   resend_system: bool = False, advisor: bool = True) -> Provider:
     """API providers are stateless; browser providers bind to a remote conversation."""
     if cred["transport"] in LOCAL_TRANSPORTS:
-        return local.local_provider(cred, settings().request_timeout_s)
+        return local.local_provider(cred, settings().reply_max_s)
     if cred["transport"] == "browser":
         if cred["platform"] not in SITES:
             raise ValueError(f"{cred['platform']} has no web app support")
@@ -479,6 +481,7 @@ def chat_view(chat_id: int) -> dict:
         "queued": [q.content for q in _queued.get(chat_id, [])],
         "meeting_defaults": meeting_defaults(),
         "profile": profile_state(),
+        "run": run_view(chat_id),
     }
 
 
@@ -492,6 +495,8 @@ def delete_chat(chat_id: int) -> dict:
     m = _sessions.get(chat_id)
     if m and m.phase != "done":
         raise HTTPException(409, "Stop the meeting before deleting the chat")
+    if (r := store().run_for_chat(chat_id)) and r["id"] in _run_tasks:
+        raise HTTPException(409, "Stop the run before deleting its chat")
     store().delete_chat(chat_id)
     return {"ok": True}
 
@@ -619,9 +624,20 @@ async def send(chat_id: int, body: SendIn) -> dict:
     if cmd := COMMAND.match(text):
         notice = context_command(chat_id, *cmd.groups())
         return {**chat_view(chat_id), "notice": notice}
+    r = store().run_for_chat(chat_id)
+    if r and r["status"] in ("running", "waiting", "paused"):
+        # A run's room: what the user says goes to the steps still to come.
+        store().add_message(chat_id, None, "user", text, {"kind": "user", "run": r["id"]})
+        if run := _live_runs.get(r["id"]):
+            run.add_note(text)
+            store().save_run(r["id"], run.state.to_dict())
+        else:
+            store().save_run(r["id"], {**r["state"], "notes": r["state"].get("notes", []) + [text]})
+        return chat_view(chat_id)
     running = _sessions.get(chat_id)
     if running and running.phase != "done":
-        if parse_mentions(text, [c["platform"] for c in store().list_credentials() if c["enabled"]]):
+        enabled = [c["platform"] for c in store().list_credentials() if c["enabled"]]
+        if parse_mentions(text, enabled + [a["name"] for a in store().list_agents()]):
             # Addressed to someone: its own turn, once the running one has finished.
             _queued.setdefault(chat_id, []).append(body.model_copy(update={"content": text}))
             return chat_view(chat_id)
@@ -693,9 +709,9 @@ def start_recall(chat_id: int, platform: str, name: str, direction: str) -> str:
         meta = {"kind": "recall", "speaker": platform, "model": provider.model, "name": name,
                 "direction": direction}
         try:
-            text = await asyncio.wait_for(provider.complete(
+            text = await wait_reply(provider.complete(
                 [{"role": "user", "content": RECALL_PROMPT.format(direction=direction)}]),
-                settings().request_timeout_s)
+                provider, settings().request_timeout_s, settings().reply_max_s)
             s.add_context(None, f"{name} (recalled from {platform})", text, name=name)
             meta["chars"] = len(text)
         except Exception as e:
@@ -785,8 +801,8 @@ def maybe_update_profile(force: bool = False) -> bool:
 
     async def run() -> None:
         try:
-            text = (await asyncio.wait_for(provider.complete([{"role": "user", "content": prompt}]),
-                                           settings().request_timeout_s)).strip()
+            text = (await wait_reply(provider.complete([{"role": "user", "content": prompt}]), provider,
+                                     settings().request_timeout_s, settings().reply_max_s)).strip()
         except Exception as e:
             log.warning("profile update failed: %s", e)
             n = 1 if force else failures + 1
@@ -978,10 +994,11 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
     s.set_meta("meeting_defaults", json.dumps(opts))
 
     creds = {c["platform"]: c for c in s.enabled_credentials(f)}
+    agents = room_agents(creds)  # saved agents answer when @named, on their model
     primary = s.get_meta("primary_platform")
-    mentions = parse_mentions(text, list(creds))
+    mentions = parse_mentions(text, list(creds) + list(agents))
     named = [m for m in mentions if m not in ("all", MODERATOR)]
-    plan = parse_plan(text, list(creds))
+    plan = parse_plan(text, list(creds) + list(agents))
     if plan:
         fmt = "plan"
         speakers = list(dict.fromkeys(name for step in plan for name, _ in step))
@@ -1020,7 +1037,7 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         return p
 
     room = load_room(s.thread(chat_id))
-    seats = {p: creds[p] for p in speakers}
+    seats = {p: creds[p] if p in creds else creds[agent_platform(agents[p])] for p in speakers}
     if script.moderated:
         seats[MODERATOR] = creds[primary]  # the primary, in its own moderator conversation
     members: dict[str, Member] = {}
@@ -1034,7 +1051,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
             budget = opts["speakers"].get(name, "full")
             members[name] = Member(name, provider, BUDGETS.get(budget, BUDGETS["full"]),
                                    _roles(s.thread(chat_id, daughter_ids[name])),
-                                   seen_index(room, d.get("seen_message_id")))
+                                   seen_index(room, d.get("seen_message_id")),
+                                   role=agents[name].get("instructions", "") if name in agents else "")
     except Exception as e:
         raise HTTPException(400, f"Could not set up the meeting: {e}") from e
 
@@ -1081,7 +1099,7 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
     askable = ([PRISM_BOT] + ([DOCS_BOT] if any(c.get("library") for c in s.context_for(chat_id)) else [])
                + [p for p, c in creds.items() if c["transport"] == "browser"])
     session = Session(room, members, script, emit, context=context_block(context_items),
-                      timeout=settings().request_timeout_s, deep=opts["deep"],
+                      timeout=settings().request_timeout_s, max_s=settings().reply_max_s, deep=opts["deep"],
                       ask=ask, askable=askable, max_asks=opts["asks"])
     _sessions[chat_id] = session
     if chat["title"] == "New chat":
@@ -1262,3 +1280,399 @@ async def download_tool(body: DownloadIn) -> dict:
         raise HTTPException(400, f"Unknown download {body.what!r}")
     enrich.start_download(body.what, data_dir())
     return {"downloads": enrich.downloads()}
+
+
+# --- agents and flows ------------------------------------------------------------------------
+
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
+
+
+def agent_platform(agent: dict) -> str:
+    return str(agent.get("model") or "").strip().lstrip("@").lower()
+
+
+def room_agents(creds: dict) -> dict[str, dict]:
+    """Saved agents whose model is set up and switched on."""
+    return {a["name"]: a for a in store().list_agents() if agent_platform(a) in creds}
+
+
+class AgentIn(BaseModel):
+    model: str = Field(min_length=1, max_length=40)
+    instructions: str = Field("", max_length=20_000)
+    context: list[str] = []      # #names it always gets
+    tools: list[str] = []        # ask | docs | prism
+    output: dict[str, str] = {}  # field: A|B, or text
+
+
+@app.get("/api/agents")
+def list_agents() -> dict:
+    return {"agents": store().list_agents()}
+
+
+@app.put("/api/agents/{name}")
+def put_agent(name: str, body: AgentIn) -> dict:
+    name = name.lower()
+    platforms = {c["platform"] for c in store().list_credentials()}
+    if not AGENT_NAME.match(name) or name in RESERVED or known_platform(name) or name in platforms:
+        raise HTTPException(400, f"@{name} can't be an agent's name: use 2-24 lowercase letters, digits or -, "
+                                 "not a platform's or a room member's name")
+    if agent_platform({"model": body.model}) not in platforms:
+        raise HTTPException(400, f"No room member {body.model} - set it up in Settings first")
+    bad = [t for t in body.tools if t not in ("ask", "docs", "prism")]
+    if bad:
+        raise HTTPException(400, f"Unknown tools {bad} - use ask, docs, prism")
+    spec = body.model_dump()
+    spec["model"] = "@" + agent_platform(spec)
+    spec["context"] = [context_name(c.lstrip("#")) for c in body.context if c.strip("# ")]
+    store().put_agent(name, spec)
+    return list_agents()
+
+
+@app.delete("/api/agents/{name}")
+def delete_agent(name: str) -> dict:
+    store().delete_agent(name)
+    return list_agents()
+
+
+def parse_flow(source: str) -> flows.Flow:
+    return flows.parse(source, agents=store().get_agent, flows=store().get_flow)
+
+
+class FlowIn(BaseModel):
+    source: str = Field(max_length=200_000)
+
+
+@app.post("/api/flows/validate")
+def validate_flow(body: FlowIn) -> dict:
+    try:
+        return {"ok": True, "errors": [], "graph": parse_flow(body.source).to_json()}
+    except flows.FlowError as e:
+        return {"ok": False, "errors": e.errors, "graph": None}
+
+
+@app.get("/api/flows")
+def list_flows() -> dict:
+    out = []
+    for f in store().list_flows():
+        v = validate_flow(FlowIn(source=f["source"]))
+        out.append({**f, "ok": v["ok"], "errors": v["errors"]})
+    return {"flows": out, "agents": store().list_agents()}
+
+
+@app.post("/api/flows")
+def save_flow(body: FlowIn) -> dict:
+    try:
+        flow = parse_flow(body.source)
+    except flows.FlowError as e:
+        raise HTTPException(400, "Not saved: " + "; ".join(e.errors)) from e
+    store().put_flow(flow.name, body.source)
+    return {**list_flows(), "saved": flow.name}
+
+
+@app.delete("/api/flows/{name}")
+def delete_flow(name: str) -> dict:
+    store().delete_flow(name)
+    return list_flows()
+
+
+DRAFT_PROMPT = (
+    "Write a workflow for PRISM, an app that runs AI agents step by step. The user wants:\n\n"
+    "{description}\n\nThe format, with an example:\n```yaml\n{example}\n```\n"
+    "Rules: node types are agent (a model answers its prompt), tool (docs = search the user's "
+    "files, prism = search past chats, fetch = read a web page; give query: or url:), ask_you "
+    "(pause for the user's approval), wait (e.g. 10m), flow (another saved flow). `join: all` on "
+    "a node waits for every node leading into it. Prompts read earlier results as "
+    "{{{{node.text}}}} or {{{{node.field}}}} and inputs as {{{{input.name}}}}. Every loop needs "
+    "max_rounds on one of its edges. Agents you may use as they are: {agents}. New agents go "
+    "under agents: with model one of: {models}. Reply with only the YAML in one ```yaml block.")
+DRAFT_EXAMPLE = flows.__doc__.split("    name: market-brief", 1)[1].split("\n\nNode types", 1)[0]
+
+
+class DraftIn(BaseModel):
+    description: str = Field(min_length=3, max_length=5000)
+
+
+@app.post("/api/flows/draft")
+async def draft_flow(body: DraftIn) -> dict:
+    """The primary model writes the YAML; PRISM checks it and asks once more to fix errors."""
+    creds = {c["platform"]: c for c in store().enabled_credentials(vault())}
+    primary = store().get_meta("primary_platform")
+    if primary not in creds:
+        raise HTTPException(400, "Pick a primary LLM in Settings first - it drafts the flow")
+    provider = make_provider(creds[primary], fresh=True)
+    example = "name: market-brief" + "\n".join(line[4:] for line in DRAFT_EXAMPLE.splitlines())
+    agents = ", ".join(f"{a['name']} ({a['model']})" for a in store().list_agents()) or "none yet"
+    msgs = [{"role": "user", "content": DRAFT_PROMPT.format(
+        description=body.description, example=example, agents=agents,
+        models=", ".join("@" + p for p in creds))}]
+    source, errors = "", []
+    for _ in range(2):
+        try:
+            reply = await wait_reply(provider.complete(list(msgs)), provider,
+                                     settings().request_timeout_s, settings().reply_max_s)
+        except Exception as e:
+            raise HTTPException(502, f"{primary} could not draft it: {e}") from e
+        m = re.search(r"```(?:ya?ml)?\s*\n(.*?)```", reply, re.S)
+        source = (m.group(1) if m else reply).strip() + "\n"
+        errors = validate_flow(FlowIn(source=source))["errors"]
+        if not errors:
+            break
+        msgs += [{"role": "assistant", "content": reply},
+                 {"role": "user", "content": "PRISM found these problems - reply with the whole corrected "
+                                             "YAML:\n- " + "\n- ".join(errors)}]
+    return {"source": source, "errors": errors}
+
+
+# --- runs: a flow running in its own chat room -----------------------------------------------
+
+_live_runs: dict[int, flows.Run] = {}
+_run_tasks: dict[int, asyncio.Task] = {}
+FETCH_MAX = 20_000
+
+
+class AppRunEnv(flows.RunEnv):
+    def __init__(self, run_id: int, chat_id: int):
+        self.run_id, self.chat_id = run_id, chat_id
+        self.timeout, self.max_s = settings().request_timeout_s, settings().reply_max_s
+
+    def _creds(self) -> dict:
+        return {c["platform"]: c for c in store().enabled_credentials(vault())}
+
+    def agent(self, name: str) -> dict | None:
+        return store().get_agent(name)
+
+    def provider(self, agent: dict, memory: dict) -> Provider:
+        platform = agent_platform(agent)
+        cred = self._creds().get(platform)
+        if not cred:
+            raise flows.StepError(f"@{platform} (for {agent['name']}) is not set up or is switched off")
+        url = memory.get("thread_url")
+        return make_provider(cred, thread_url=url, fresh=not url)
+
+    async def context(self, agent: dict, prompt: str) -> str:
+        s, parts = store(), []
+        items = [c for c in s.context_for(self.chat_id) if c["always"] and c["chat_id"] is None and not c.get("library")]
+        for name in agent.get("context") or []:
+            item = s.find_context(self.chat_id, name)
+            if not item:
+                continue
+            if item.get("library"):
+                hits = await library().retrieve([item["library"]], prompt)
+                if hits:
+                    parts.append(f"#{name} - passages that match this step:\n" + passages_text(hits))
+            elif item not in items:
+                items.append(item)
+        if items:
+            parts.insert(0, context_block(items))
+        return "\n\n".join(parts)
+
+    def askable(self, agent: dict) -> list[str]:
+        tools = agent.get("tools") or []
+        out = [t for t in ("docs", "prism") if t in tools or "ask" in tools]
+        if "ask" in tools:
+            out += [p for p, c in self._creds().items() if c["transport"] == "browser"]
+        return out
+
+    async def ask(self, target: str, question: str) -> str:
+        if target == PRISM_BOT:
+            return search_history(question, self.chat_id)
+        if target == DOCS_BOT:
+            return await search_docs(question, self.chat_id)
+        return await make_provider(self._creds()[target], fresh=True).complete(
+            [{"role": "user", "content": ASK_PROMPT.format(question=question)}])
+
+    async def tool(self, name: str, query: str) -> str:
+        if name == "docs":
+            return await search_docs(query, self.chat_id)
+        if name == "prism":
+            return search_history(query, self.chat_id)
+        url = query.strip()
+        if not re.match(r"https?://", url):
+            raise flows.StepError(f"fetch needs a web address, got {url[:80]!r}")
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0 PRISM"}) as http:
+            r = await http.get(url)
+        if r.status_code != 200:
+            raise flows.StepError(f"{url} answered {r.status_code}")
+        text = readers.html_text(r.text) if "html" in r.headers.get("content-type", "html") else r.text
+        return text[:FETCH_MAX]
+
+    def emit(self, kind: str, **data) -> int | None:
+        s, base = store(), {"run": self.run_id}
+        if kind == "run":
+            if data["status"] in ("running", "waiting"):
+                return None  # the room shows the run's state (a question shows as its own card)
+            return s.add_message(self.chat_id, None, "assistant", data.get("error") or "", {
+                **base, "kind": "run", "speaker": "prism", "status": data["status"], "error": data.get("error")})
+        if kind == "ask_you":
+            return s.add_message(self.chat_id, None, "assistant", data["show"], {
+                **base, "kind": "ask_you", "speaker": "you", "node": data["node"], "question": data["question"]})
+        if kind == "lookup":
+            return s.add_message(self.chat_id, None, "assistant",
+                                 f"{data['node']} asked: {data['question']}\n\n{data['text']}", {
+                **base, "kind": "lookup", "speaker": data["target"], "asker": data["node"], "question": data["question"]})
+        provider = data.get("provider")
+        meta = {**base, "kind": "step", "node": data["node"], "type": data["type"], "speaker": data["label"],
+                "round": data["round"], "latency_s": data.get("latency_s"), "error": data.get("error"),
+                "fields": data.get("fields") or {}}
+        if provider is not None:
+            meta["model"] = provider.model
+            if notes := getattr(provider, "notes", None):
+                meta["notes"] = list(notes)
+            if html := getattr(provider, "last_html", None):
+                meta["html"] = html
+            # Each agent has its own tab, like a bot in a meeting.
+            d = s.bind_daughter(self.chat_id, data["label"], provider.model)
+            s.add_message(self.chat_id, d, "user", data["prompt"])
+            s.add_message(self.chat_id, d, "assistant", data["text"], {"html": meta["html"]} if meta.get("html") else None)
+            if url := getattr(provider, "thread_url", None):
+                s.set_remote_url(d, url)
+        return s.add_message(self.chat_id, None, "assistant", data["text"], meta)
+
+    def save(self, state: flows.RunState) -> None:
+        store().save_run(self.run_id, state.to_dict())
+
+
+def recover_runs() -> None:
+    """Runs that were going when PRISM closed wait to be continued."""
+    for r in store().runs_with_status("running"):
+        if r["id"] not in _run_tasks:
+            store().save_run(r["id"], {**r["state"], "status": "paused",
+                                       "error": "interrupted when PRISM closed - continue to pick up where it stopped"})
+
+
+def load_run(run_id: int) -> flows.Run:
+    if run := _live_runs.get(run_id):
+        return run
+    r = store().get_run(run_id)
+    if not r:
+        raise HTTPException(404, "No such run")
+    try:
+        flow = parse_flow(r["source"])
+    except flows.FlowError as e:
+        raise HTTPException(400, "The flow can't be read any more: " + "; ".join(e.errors)) from e
+    run = flows.Run(flow, flows.RunState.from_dict(r["state"]), AppRunEnv(run_id, r["chat_id"]))
+    _live_runs[run_id] = run
+    return run
+
+
+def launch(run_id: int, run: flows.Run) -> None:
+    if (t := _run_tasks.get(run_id)) and not t.done():
+        raise HTTPException(409, "It is already running")
+
+    async def go() -> None:
+        try:
+            await run.run()
+        except asyncio.CancelledError:
+            pass  # stopped, or PRISM is closing: the state is saved
+        except Exception as e:
+            log.exception("run %s failed", run_id)
+            run.state.status, run.state.error = "paused", f"PRISM error: {e}"
+            run.env.save(run.state)
+        finally:
+            _run_tasks.pop(run_id, None)
+
+    _run_tasks[run_id] = asyncio.create_task(go())
+
+
+def run_view(chat_id: int) -> dict | None:
+    r = store().run_for_chat(chat_id)
+    if not r:
+        return None
+    st = r["state"]
+    try:
+        graph = parse_flow(r["source"]).to_json()
+    except flows.FlowError:
+        graph = None
+    return {"id": r["id"], "flow": r["flow"], "status": r["status"], "error": st.get("error"),
+            "waiting": st.get("waiting"), "steps": st.get("steps", 0), "budget": st.get("budget"),
+            "queue": st.get("queue", []), "done": list(st.get("outputs", {})), "graph": graph,
+            "live": r["id"] in _run_tasks}
+
+
+class RunIn(BaseModel):
+    inputs: dict[str, str] = {}
+
+
+@app.post("/api/flows/{name}/runs")
+async def start_run(name: str, body: RunIn) -> dict:
+    vault()
+    source = store().get_flow(name)
+    if source is None:
+        raise HTTPException(404, f"No flow named {name}")
+    try:
+        flow = parse_flow(source)
+    except flows.FlowError as e:
+        raise HTTPException(400, "Fix the flow first: " + "; ".join(e.errors)) from e
+    missing = [k for k in flow.inputs if not body.inputs.get(k, "").strip()]
+    if missing:
+        raise HTTPException(400, "Fill in: " + ", ".join(missing))
+    s = store()
+    chat_id = s.create_chat(f"Run: {name}")
+    run_id = s.add_run(name, source, chat_id, flows.RunState({}).to_dict())
+    run = flows.Run.start(flow, body.inputs, AppRunEnv(run_id, chat_id))
+    run.env.save(run.state)
+    shown = "\n".join(f"{k}: {v}" for k, v in run.state.inputs.items())
+    s.add_message(chat_id, None, "user", f"Run {name}" + (f"\n{shown}" if shown else ""),
+                  {"kind": "topic", "run": run_id, "format": "flow", "mentions": [], "speakers": []})
+    _live_runs[run_id] = run
+    launch(run_id, run)
+    return chat_view(chat_id)
+
+
+@app.post("/api/runs/{run_id}/stop")
+async def stop_run(run_id: int) -> dict:
+    r = store().get_run(run_id)
+    if not r:
+        raise HTTPException(404, "No such run")
+    if run := _live_runs.get(run_id):
+        run.stop()
+    if task := _run_tasks.get(run_id):
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    r = store().get_run(run_id)
+    if r["status"] not in ("done", "stopped"):
+        store().save_run(run_id, {**r["state"], "status": "stopped"})
+        store().add_message(r["chat_id"], None, "assistant", "", {"kind": "run", "run": run_id,
+                                                                   "speaker": "prism", "status": "stopped"})
+    _live_runs.pop(run_id, None)
+    return chat_view(r["chat_id"])
+
+
+class ResumeIn(BaseModel):
+    more_budget: bool = False
+
+
+@app.post("/api/runs/{run_id}/resume")
+async def resume_run(run_id: int, body: ResumeIn) -> dict:
+    vault()
+    run = load_run(run_id)
+    if run.state.status in ("done", "stopped"):
+        raise HTTPException(400, f"The run is {run.state.status}")
+    if run.state.waiting:
+        raise HTTPException(400, "It is waiting for your answer above")
+    run.resume(more_budget=body.more_budget or (run.state.error or "").startswith("budget"))
+    launch(run_id, run)
+    return chat_view(run.env.chat_id)
+
+
+class AnswerIn(BaseModel):
+    node: str
+    approved: bool
+    text: str = ""
+
+
+@app.post("/api/runs/{run_id}/answer")
+async def answer_run(run_id: int, body: AnswerIn) -> dict:
+    vault()
+    run = load_run(run_id)
+    if not run.answer(body.node, body.approved, body.text.strip()):
+        raise HTTPException(409, "That question was already answered")
+    s, chat_id = store(), run.env.chat_id
+    for m in reversed(s.thread(chat_id)):
+        meta = m["meta"] or {}
+        if meta.get("kind") == "ask_you" and meta.get("node") == body.node and "answer" not in meta:
+            s.update_message(m["id"], {**meta, "answer": "yes" if body.approved else "no", "answer_text": body.text.strip()})
+            break
+    launch(run_id, run)
+    return chat_view(chat_id)
