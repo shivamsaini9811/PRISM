@@ -49,6 +49,24 @@ async def pull(request: Request):
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
+@fake.get("/v1/models")
+async def oai_models(request: Request):
+    if request.headers.get("authorization") != "Bearer test-key":
+        return StreamingResponse(iter([b"{}"]), status_code=401)
+    return {"data": [{"id": "qwen3-32b"}, {"id": "nomic-embed"}]}
+
+
+@fake.post("/v1/chat/completions")
+async def oai_chat(request: Request):
+    body = await request.json()
+    seen.append(body)
+    async def sse():  # server-sent events, as llama.cpp / vLLM stream them
+        for w in ["from ", "your ", "server"]:
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": w}}]}) + "\n\n"
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(sse(), media_type="text/event-stream")
+
+
 @pytest.fixture(scope="module")
 def ollama():
     sock = socket.socket(); sock.bind(("127.0.0.1", 0)); port = sock.getsockname()[1]; sock.close()
@@ -140,3 +158,20 @@ async def test_in_browser_model_with_no_page_fails_clearly(monkeypatch):
     monkeypatch.setattr(local, "CLAIM_TIMEOUT_S", 0.2)
     with pytest.raises(local.ProviderError, match="no PRISM page is running"):
         await local.ClientJobs().run("m", [{"role": "user", "content": "hi"}], timeout=5)
+
+
+async def test_any_openai_compatible_server_by_address(ollama):
+    assert await local.server_models(ollama, "test-key") == [{"name": "qwen3-32b", "size_mb": None}]
+    with pytest.raises(local.ProviderError, match="does it need a key"):
+        await local.server_models(ollama)
+    with pytest.raises(local.ProviderError, match="Type the server's address"):
+        await local.server_models("my-server:8080")
+    p = local.local_provider({"transport": "local", "platform": "big", "model": "qwen3-32b",
+                              "base_url": ollama, "secret": "test-key"})
+    assert isinstance(p, local.LMStudioProvider) and p.base_url == ollama + "/v1"
+    seen.clear()
+    assert await p.complete([{"role": "user", "content": "hi"}], "SYS") == "from your server"
+    assert seen[0]["stream"] is True and seen[0]["messages"][0]["content"] == "SYS"
+    # Ollama's own port, or no address, still goes to Ollama.
+    assert isinstance(local.local_provider({"transport": "local", "platform": "q", "model": "m",
+                                            "base_url": "http://localhost:11434"}), local.OllamaProvider)

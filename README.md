@@ -94,6 +94,39 @@ Research has started…", reloads a page that stops updating (Gemini), and bring
 full report: from Claude's document panel, ChatGPT's report frame, Gemini's report panel.
 Checked against all four sites on 2026-10-25: 1 min (Grok) to 37 min (Gemini).
 
+**Running programs**: a bot (or a flow agent with the *run* tool) can end its reply with
+`RUN @python` and a code block, or `RUN: <command>`. The chat shows a card with the exact code,
+the folder and the tool: **Run once**, **Always allow <tool> in this chat**, **Always allow
+<tool>**, or **Don't run**. It runs in the chat's work folder (`~/.prism/work/`), stops after 5
+minutes (`RUN_TIMEOUT_S`), gets none of PRISM's saved keys, and what it prints - plus files it
+made, downloadable from the card - goes back to the bot. It is not a sandbox: an approved
+program has your account's rights. Settings → Running programs switches it off and lists the
+allow rules ("Ask again" removes one). Flows also have a `tool: run` step (`command:`, or
+`code:` + `lang:`).
+
+**Catalog - tools and models from your own server, signed by you**
+
+```bash
+prism-publish keygen --out ~/prism-keys          # once; keep the .key file off the server
+prism-publish new catalog.json --name "My tools"
+prism-publish add catalog.json --name python --version 3.12.7 \
+    --file windows-x64=python-win.zip --file macos-arm64=python-mac.tar.gz --command python=python.exe
+prism-publish add catalog.json --name qwen-7b --version q4 --kind model --file any=qwen.gguf --as qwen
+prism-publish sign catalog.json --key ~/prism-keys/prism-publisher.key   # bumps version, 90-day expiry
+```
+
+Upload `catalog.json`, `catalog.json.sig` and the files next to each other (https). In PRISM,
+Settings → Catalog: the address and your public key (`ed25519:…`, printed by keygen; or ship
+it in a build as `src/prism/publisher.pub`). PRISM installs nothing without a key, and only
+from a catalog whose signature matches, whose version isn't older than the last one it took,
+and that hasn't expired; every download must match its SHA-256 and archives can't write
+outside their folder. Toolchains go to `~/.prism/toolchains/` and their commands become
+available to RUN; models are handed to Ollama and join the room under their `as` name.
+
+**Local models by address**: Settings → Local models → *A server by address* takes any
+OpenAI-compatible server (llama.cpp's `llama-server`, vLLM, LocalAI, Jan, a GPU box) with an
+optional key, lists its models and adds them to the room.
+
 **No fixed time limit on a reply**: PRISM waits while the model shows it is working - the
 site's Stop button, progress or text still changing, a local model still streaming - so long
 research is not cut off. It gives up after 20 minutes with nothing changing on the page
@@ -191,7 +224,10 @@ src/prism/
   library.py       folders / web pages: scanning, passages, search (#name, ASK @docs)
   readers.py       files of every kind to text
   enrich.py        reader models: images and scans, transcription, embeddings
-  local.py         Ollama / LM Studio / in-browser models, .gguf import
+  local.py         Ollama / LM Studio / OpenAI-compatible servers / in-browser models, .gguf import
+  runner.py        RUN: approval, work folders, running programs for bots and flows
+  catalog.py       the signed catalog: verify, install toolchains and models
+  publish.py       prism-publish: keys, checksums, signing
   db.py            SQLite store + migrations
   crypto.py        master-password vault
   providers/       API adapters (Anthropic, OpenAI-compatible, Gemini)

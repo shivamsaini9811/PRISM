@@ -26,7 +26,7 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import enrich, flows, local, readers
+from . import catalog, enrich, flows, local, readers
 from .library import Library, attachable, passages_text
 from . import runner as runner_mod
 from .providers import PLATFORMS, Provider, build_provider, wait_reply
@@ -316,7 +316,7 @@ def put_credential(platform: str, c: CredentialIn) -> dict:
                                      "and -, starting with a letter, and not a platform's name")
         if not c.model:
             raise HTTPException(400, "Which model? Pick one of the installed models")
-        store().upsert_credential(vault(), platform, c.model, None, c.base_url or None, c.enabled, c.transport)
+        store().upsert_credential(vault(), platform, c.model, c.secret or None, c.base_url or None, c.enabled, c.transport)
         return platforms()
     if platform not in PLATFORMS:
         raise HTTPException(404, f"Unknown platform {platform!r}")
@@ -437,6 +437,15 @@ async def import_model(body: ImportIn) -> dict:
     except local.ProviderError as e:
         raise HTTPException(400, str(e)) from e
     return {"model": model, "pulls": local.pulls()}
+
+
+@app.get("/api/local/server")
+async def server_models(url: str, key: str = "") -> dict:
+    """An OpenAI-compatible server by address (llama.cpp, vLLM, LocalAI, Jan...): its models."""
+    try:
+        return {"url": url, "models": await local.server_models(url, key or None)}
+    except local.ProviderError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @app.get("/api/client-jobs")
@@ -1798,3 +1807,129 @@ def put_runner(body: RunnerIn) -> dict:
     if body.rules is not None:
         store().set_meta("run_rules", json.dumps(body.rules))
     return runner_settings()
+
+
+# --- catalog: toolchains and models from the user's own server, signed ------------------------
+
+def catalog_keys() -> list[str]:
+    return catalog.bundled_keys() + json.loads(store().get_meta("catalog_keys") or "[]")
+
+
+def installed() -> dict:
+    return json.loads(store().get_meta("installed") or "{}")
+
+
+def catalog_view() -> dict:
+    progress = catalog.installs()  # first: an install finishing meanwhile is then also in `have`
+    doc = json.loads(store().get_meta("catalog") or "null")
+    have = installed()
+    entries = []
+    for e in (doc or {}).get("entries", []):
+        f = catalog.file_for(e)
+        entries.append({**{k: e.get(k) for k in ("name", "version", "kind", "description", "as", "needs")},
+                        "size": (f or {}).get("size"), "available": bool(f),
+                        "installed": (have.get(e["name"]) or {}).get("version")})
+    return {"url": store().get_meta("catalog_url") or "",
+            "keys": [{"key": k, "fingerprint": catalog.fingerprint(k), "bundled": k in catalog.bundled_keys()}
+                     for k in catalog_keys()],
+            "name": (doc or {}).get("name"), "version": (doc or {}).get("version"),
+            "expires": (doc or {}).get("expires"), "checked": store().get_meta("catalog_checked"),
+            "error": store().get_meta("catalog_error"), "platform": catalog.platform_key(),
+            "entries": entries, "installed": have, "installs": progress}
+
+
+@app.get("/api/catalog")
+def get_catalog() -> dict:
+    return catalog_view()
+
+
+class CatalogIn(BaseModel):
+    url: str | None = None
+    add_key: str | None = None
+    remove_key: str | None = None
+
+
+@app.put("/api/catalog")
+def put_catalog(body: CatalogIn) -> dict:
+    s = store()
+    if body.url is not None:
+        url = body.url.strip()
+        if url and not re.match(r"https://", url) and not re.match(r"http://(localhost|127\.0\.0\.1)[:/]", url):
+            raise HTTPException(400, "Use an https:// address (http only for this computer)")
+        if url != (s.get_meta("catalog_url") or ""):
+            s.set_meta("catalog_url", url)
+            s.set_meta("catalog", "null")  # another server: its catalog is checked afresh
+            s.set_meta("catalog_version", "")
+    keys = json.loads(s.get_meta("catalog_keys") or "[]")
+    if body.add_key:
+        try:
+            catalog.parse_key(body.add_key)
+        except catalog.CatalogError as e:
+            raise HTTPException(400, str(e)) from e
+        keys = list(dict.fromkeys(keys + [body.add_key.strip()]))
+    if body.remove_key:
+        keys = [k for k in keys if k != body.remove_key.strip()]
+    s.set_meta("catalog_keys", json.dumps(keys))
+    return catalog_view()
+
+
+@app.post("/api/catalog/refresh")
+async def refresh_catalog() -> dict:
+    s = store()
+    url = s.get_meta("catalog_url")
+    if not url:
+        raise HTTPException(400, "Set your catalog's address first")
+    last = s.get_meta("catalog_version")
+    try:
+        doc, _raw = await catalog.fetch(url, catalog_keys(), int(last) if last else None)
+    except (catalog.CatalogError, httpx.HTTPError) as e:
+        s.set_meta("catalog_error", str(e))
+        raise HTTPException(400, str(e)) from e
+    s.set_meta("catalog", json.dumps(doc))
+    s.set_meta("catalog_version", str(doc["version"]))
+    s.set_meta("catalog_checked", time.strftime("%Y-%m-%d %H:%M"))
+    s.set_meta("catalog_error", "")
+    return catalog_view()
+
+
+class InstallIn(BaseModel):
+    name: str
+
+
+@app.post("/api/catalog/install")
+async def install_entry(body: InstallIn) -> dict:
+    s = store()
+    doc = json.loads(s.get_meta("catalog") or "null")
+    if not doc or not catalog_keys():
+        raise HTTPException(400, "Add your publisher key and check the catalog first - nothing installs unsigned")
+    entry = next((e for e in doc["entries"] if e["name"] == body.name), None)
+    if not entry:
+        raise HTTPException(404, f"{body.name} isn't in the catalog")
+
+    def done(name: str, record: dict) -> None:
+        have = installed()
+        if (old := have.get(name)) and old.get("path") != record.get("path"):
+            catalog.remove(old)
+        have[name] = record
+        s.set_meta("installed", json.dumps(have))
+        if record["kind"] == "model":  # it joins the room under its @name, like other local models
+            name_ = context_name(record["as"])[:24].lower()
+            if name_ not in PLATFORMS and name_ not in RESERVED:
+                try:
+                    s.upsert_credential(vault(), name_, record["ollama"], None, "ollama", True, "local")
+                except Exception:
+                    log.warning("could not add %s to the room", name_)
+    try:
+        catalog.start_install(entry, s.get_meta("catalog_url"), data_dir(), done)
+    except catalog.CatalogError as e:
+        raise HTTPException(400, str(e)) from e
+    return catalog_view()
+
+
+@app.delete("/api/catalog/{name}")
+def remove_entry(name: str) -> dict:
+    have = installed()
+    if name in have:
+        catalog.remove(have.pop(name))
+        store().set_meta("installed", json.dumps(have))
+    return catalog_view()

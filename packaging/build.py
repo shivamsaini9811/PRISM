@@ -76,6 +76,8 @@ def main() -> None:
            "--add-data", f"{ROOT / 'src/prism/static'}{sep}prism/static",
            "--collect-data", "playwright",
            "--collect-submodules", "uvicorn"]
+    if (ROOT / "src/prism/publisher.pub").is_file():  # the catalog publisher's key, trusted out of the box
+        cmd += ["--add-data", f"{ROOT / 'src/prism/publisher.pub'}{sep}prism"]
     for pkg in PACKAGES_WITH_METADATA:
         cmd += ["--copy-metadata", pkg]
     mac = platform.system() == "Darwin"

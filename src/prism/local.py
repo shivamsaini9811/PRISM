@@ -254,19 +254,23 @@ class OllamaProvider(Provider):
 
 
 class LMStudioProvider(Provider):
-    def __init__(self, name: str, model: str, base_url: str | None = None):
-        self.name, self.model = name, model
-        base = (base_url or RUNTIMES["lmstudio"]["url"]).rstrip("/")
-        self.base_url = base if base.endswith("/v1") else base + "/v1"
+    """LM Studio - and any server that speaks the OpenAI chat API (llama.cpp's server, vLLM,
+    LocalAI, Jan, a model on your own server), with an optional key."""
+
+    def __init__(self, name: str, model: str, base_url: str | None = None, api_key: str | None = None):
+        self.name, self.model, self.api_key = name, model, api_key
+        self.base_url = v1(base_url or RUNTIMES["lmstudio"]["url"])
+        self.label = "LM Studio" if base_url is None or ":1234" in (base_url or "") else self.base_url
 
     async def complete(self, messages: list[Message], system: str | None = None) -> str:
         body = {"model": self.model, "messages": fit(messages, system, LOCAL_MAX_CHARS), "stream": True}
         parts, raw = [], []
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None)) as http:
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None), headers=headers) as http:
                 async with http.stream("POST", f"{self.base_url}/chat/completions", json=body) as r:
                     if r.status_code != 200:
-                        raise ProviderError(f"LM Studio answered {r.status_code}: {(await r.aread())[:200]!r}")
+                        raise ProviderError(f"{self.label} answered {r.status_code}: {(await r.aread())[:200]!r}")
                     async for line in r.aiter_lines():  # server-sent events: data: {...}
                         self.last_activity = time.monotonic()
                         if not line.startswith("data:"):
@@ -277,7 +281,8 @@ class LMStudioProvider(Provider):
                             delta = json.loads(data)["choices"][0].get("delta") or {}
                             parts.append(delta.get("content") or "")
         except httpx.ConnectError:
-            raise ProviderError("LM Studio's server isn't running - start it in LM Studio (Developer → Start server)")
+            raise ProviderError("LM Studio's server isn't running - start it in LM Studio (Developer → Start server)"
+                                if self.label == "LM Studio" else f"nothing answers at {self.base_url} - is the server running?")
         if not parts and raw:  # a server that ignored stream: one JSON body
             return json.loads("".join(raw))["choices"][0]["message"]["content"] or ""
         return "".join(parts)
@@ -359,12 +364,38 @@ class BrowserModelProvider(Provider):
         return await client_jobs.run(self.model, fit(messages, system, BROWSER_MAX_CHARS), self.timeout)
 
 
+def v1(url: str) -> str:
+    base = url.strip().rstrip("/")
+    return base if base.endswith("/v1") else base + "/v1"
+
+
+async def server_models(url: str, api_key: str | None = None) -> list[dict]:
+    if not re.match(r"https?://", url.strip()):
+        raise ProviderError("Type the server's address, e.g. http://192.168.1.20:8080")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=headers) as http:
+            r = await http.get(f"{v1(url)}/models")
+    except httpx.HTTPError as e:
+        raise ProviderError(f"nothing answers at {url} ({type(e).__name__})") from e
+    if r.status_code != 200:
+        raise ProviderError(f"{url} answered {r.status_code}" + (" - does it need a key?" if r.status_code in (401, 403) else ""))
+    try:
+        data = r.json().get("data", [])
+    except ValueError as e:
+        raise ProviderError(f"{url} isn't an OpenAI-compatible server") from e
+    return [{"name": m["id"], "size_mb": None} for m in data if "embed" not in m["id"]]
+
+
 def local_provider(cred: dict, timeout: float = 900) -> Provider:
     runtime = (cred.get("base_url") or "").strip()
     if cred["transport"] == "webgpu":
         return BrowserModelProvider(cred["platform"], cred["model"], timeout)
     if runtime.startswith("lmstudio") or ":1234" in runtime:
         return LMStudioProvider(cred["platform"], cred["model"],
-                                None if runtime.startswith("lmstudio") else runtime)
-    return OllamaProvider(cred["platform"], cred["model"],
-                          None if runtime in ("", "ollama") else runtime)
+                                None if runtime.startswith("lmstudio") else runtime, cred.get("secret"))
+    if runtime in ("", "ollama") or ":11434" in runtime:
+        return OllamaProvider(cred["platform"], cred["model"],
+                              None if runtime in ("", "ollama") else runtime)
+    # Any other address: a server that speaks the OpenAI chat API.
+    return LMStudioProvider(cred["platform"], cred["model"], runtime, cred.get("secret"))

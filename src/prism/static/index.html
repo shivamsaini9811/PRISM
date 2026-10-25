@@ -374,6 +374,7 @@
     <div id="localBox" class="plat"></div>
     <div id="readersBox" class="plat"></div>
     <div id="runnerBox" class="plat"></div>
+    <div id="catalogBox" class="plat"></div>
     <div id="plats"></div>
   </div>
 </div>
@@ -1015,6 +1016,45 @@ $('runnerBox').onclick = async e => {
   await api('/api/runner', {method: 'PUT', body: {rules}}); loadRunner();
 };
 
+/* Catalog: toolchains and models from your own server, installed only when signed by your key. */
+async function loadCatalog() {
+  clearTimeout(state.catalogPoll);
+  if ($('settings').classList.contains('hidden')) return;
+  let c;
+  try { c = await api('/api/catalog'); } catch (err) { $('catalogBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  const mb = n => n == null ? '' : n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1e6)) + ' MB';
+  const row = e => {
+    const p = c.installs[e.name], busy = p && !p.done;
+    const prog = busy ? `<progress max="${p.total || 1}" value="${p.completed}"></progress> <span class="muted">${esc(p.status)}</span>`
+      : p?.error ? `<span class="err">${esc(p.error)}</span>` : '';
+    const action = !e.available ? '<span class="muted">not for this computer</span>'
+      : busy ? '' : e.installed === e.version ? `<button data-uninstall="${esc(e.name)}">Remove</button>`
+      : `<button data-install="${esc(e.name)}">${e.installed ? 'Update' : 'Install'}</button>`;
+    return `<div class="lm"><span><b>${esc(e.name)}</b> ${esc(e.version)} <span class="muted">· ${e.kind === 'model' ? 'model' + (e.as ? ' @' + esc(e.as) : '') : 'tool'} · ${mb(e.size)}${e.installed ? ' · installed ' + esc(e.installed) : ''}</span>
+      ${e.description ? `<br><span class="muted" style="font-size:12px">${esc(e.description)}</span>` : ''} ${prog}</span>${action}</div>`;
+  };
+  $('catalogBox').innerHTML = `<div class="plat-head"><b>Catalog</b>${c.url && c.keys.length ? '<button data-catrefresh>Check for updates</button>' : ''}</div>
+    <div class="muted" style="font-size:12px">Tools and models from your own server. PRISM installs only what is signed with your publisher key, checks every download's checksum, and refuses an older or expired catalog. Make the key and sign with <code>prism-publish</code>.</div>
+    <div class="lm"><input id="catUrl" value="${esc(c.url)}" placeholder="https://lib.example.com/catalog.json" style="flex:1"><button data-caturl>Save address</button></div>
+    <h4 style="margin:10px 0 4px;font-size:13px">Publisher keys</h4>
+    ${c.keys.map(k => `<div class="lm"><span><code>${esc(k.fingerprint)}</code>${k.bundled ? ' <span class="muted">(built in)</span>' : ''}</span>${k.bundled ? '' : `<button data-rmkey="${esc(k.key)}">Remove</button>`}</div>`).join('')
+      || '<div class="muted" style="font-size:12.5px">None yet - nothing can be installed until you add yours.</div>'}
+    <div class="lm"><input id="catKey" placeholder="ed25519:… (prism-publish keygen prints it)" style="flex:1"><button data-addkey>Add key</button></div>
+    ${c.error ? `<div class="err" style="font-size:12.5px">${esc(c.error)}</div>` : ''}
+    ${c.name ? `<h4 style="margin:10px 0 4px;font-size:13px">${esc(c.name)} <span class="muted">· version ${c.version} · checked ${esc(c.checked || '')} · valid until ${esc((c.expires || '').slice(0, 10))} · this computer: ${esc(c.platform)}</span></h4>${c.entries.map(row).join('') || '<div class="muted">Empty.</div>'}` : ''}`;
+  if (Object.values(c.installs).some(p => !p.done)) state.catalogPoll = setTimeout(loadCatalog, 1000);
+}
+$('catalogBox').onclick = async e => {
+  const t = e.target, call = async (path, opts) => { try { await api(path, opts); } catch (err) { alert(err.message); } loadCatalog(); };
+  if (t.hasAttribute('data-caturl')) return call('/api/catalog', {method: 'PUT', body: {url: $('catUrl').value.trim()}});
+  if (t.hasAttribute('data-addkey')) return call('/api/catalog', {method: 'PUT', body: {add_key: $('catKey').value.trim()}});
+  if (t.dataset.rmkey && confirm('Remove this key? Nothing signed with it will install any more.'))
+    return call('/api/catalog', {method: 'PUT', body: {remove_key: t.dataset.rmkey}});
+  if (t.hasAttribute('data-catrefresh')) return call('/api/catalog/refresh', {method: 'POST'});
+  if (t.dataset.install) return call('/api/catalog/install', {method: 'POST', body: {name: t.dataset.install}});
+  if (t.dataset.uninstall && confirm(`Remove ${t.dataset.uninstall}?`)) return call(`/api/catalog/${encodeURIComponent(t.dataset.uninstall)}`, {method: 'DELETE'});
+};
+
 function renderMeetbar(show) {
   const v = state.view, live = v.meeting, def = v.meeting_defaults;
   $('meetbar').classList.toggle('hidden', !show);
@@ -1239,7 +1279,7 @@ async function loadPlatforms() {
   const p = state.platforms;
   $('motherLabel').textContent = p.primary ? `Mother: ${p.primary}` : 'No primary set';
 }
-$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); loadReaders(); loadRunner(); };
+$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); loadReaders(); loadRunner(); loadCatalog(); };
 $('closeSettings').onclick = () => { $('settings').classList.add('hidden'); clearTimeout(state.localPoll); if (state.view) render(); };
 
 /* ---------- local models: Ollama / LM Studio on this computer, or in this browser ---------- */
@@ -1288,7 +1328,10 @@ function renderLocal() {
     ${r.runtimes.map(runtime).join('')}
     <h4>In this browser <span class="muted">· ${gpu ? 'WebGPU available' : 'needs WebGPU (Edge or Chrome)'}</span></h4>
     <div class="muted" style="font-size:12.5px">No install: the model runs inside this PRISM tab (small models, 1-8B). The first use downloads it (1-5 GB) and keeps it in the browser. Keep the tab open while it answers.</div>
-    ${gpu ? `<div class="lm"><select id="webModel" style="flex:1"><option value="">Pick a model…</option></select><button data-addweb>Add to room</button></div>` : ''}`;
+    ${gpu ? `<div class="lm"><select id="webModel" style="flex:1"><option value="">Pick a model…</option></select><button data-addweb>Add to room</button></div>` : ''}
+    <h4>A server by address <span class="muted">· llama.cpp, vLLM, LocalAI, Jan, your own server</span></h4>
+    <div class="lm"><input id="srvUrl" placeholder="http://192.168.1.20:8080" style="flex:2"><input id="srvKey" placeholder="key (if it needs one)" style="flex:1"><button data-srvlist>List models</button></div>
+    <div id="srvModels"></div>`;
   if (gpu) fillWebModels();
 }
 async function fillWebModels() {
@@ -1301,12 +1344,12 @@ async function fillWebModels() {
       `<option value="${esc(m.model_id)}">${esc(m.model_id)}${m.vram_required_MB ? ` · ${(m.vram_required_MB / 1024).toFixed(1)} GB` : ''}</option>`).join('');
   } catch (err) { if ($('webModel')) $('webModel').outerHTML = `<span class="err">Couldn't load the model list: ${esc(err.message)}</span>`; }
 }
-async function addLocal(model, transport, runtime) {
+async function addLocal(model, transport, runtime, secret = '') {
   const name = (prompt(`Name it in the room (you'll write @name to ask it):`, slug(model)) || '').trim().toLowerCase();
   if (!name) return;
   try {
     state.platforms = await api(`/api/credentials/${encodeURIComponent(name)}`, {method: 'PUT',
-      body: {transport, model, base_url: runtime || null, enabled: true}});
+      body: {transport, model, base_url: runtime || null, enabled: true, ...(secret ? {secret} : {})}});
     renderSettings(); renderLocal(); notice(`@${name} joined - ask it with @${name}`);
   } catch (err) { alert(err.message); }
 }
@@ -1315,6 +1358,16 @@ $('localBox').onclick = async e => {
   if (t.hasAttribute('data-localrefresh')) return loadLocal();
   if (t.dataset.addlocal) return addLocal(t.dataset.addlocal, 'local', t.dataset.rt);
   if (t.hasAttribute('data-addweb')) { const m = $('webModel').value; if (m) addLocal(m, 'webgpu', ''); return; }
+  if (t.hasAttribute('data-srvlist')) {
+    const url = $('srvUrl').value.trim(), key = $('srvKey').value.trim(); if (!url) return;
+    try {
+      const r = await api(`/api/local/server?url=${encodeURIComponent(url)}&key=${encodeURIComponent(key)}`);
+      $('srvModels').innerHTML = r.models.map(m => `<div class="lm"><span>${esc(m.name)}</span><button data-srvadd="${esc(m.name)}">Add to room</button></div>`).join('')
+        || '<div class="muted" style="font-size:12.5px">It has no models loaded.</div>';
+    } catch (err) { $('srvModels').innerHTML = `<div class="err" style="font-size:12.5px">${esc(err.message)}</div>`; }
+    return;
+  }
+  if (t.dataset.srvadd) return addLocal(t.dataset.srvadd, 'local', $('srvUrl').value.trim(), $('srvKey').value.trim());
   if (t.hasAttribute('data-import')) {
     const path = $('importPath').value.trim(); if (!path) return;
     try { const r = await api('/api/local/import', {method: 'POST', body: {path}}); notice(`Importing as ${r.model}…`); loadLocal(); }

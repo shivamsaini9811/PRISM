@@ -1,6 +1,6 @@
 [project]
 name = "prism"
-version = "0.8.1"
+version = "0.8.2"
 description = "PRISM - Parallel Routing, Inter-model Scoring & Merging across multiple AI models"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 prism = "prism.__main__:main"
+prism-publish = "prism.publish:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "pytest-asyncio>=0.24", "pyinstaller>=6.10"]
