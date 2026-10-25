@@ -13,7 +13,7 @@ from test_meeting import Fake
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PRISM_HOME", str(tmp_path))
     monkeypatch.setenv("PRISM_DB_PATH", str(tmp_path / "t.db"))
-    for fn in (app_mod.settings, app_mod.store, app_mod.browsers):
+    for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library):
         fn.cache_clear()
     app_mod._vault["key"] = None
 
@@ -553,3 +553,105 @@ def test_changes_only_from_prisms_own_page(client):
     assert client.post("/api/lock", headers={"origin": "http://testserver"}).status_code == 200
     assert client.post("/api/lock").status_code == 200  # no Origin: not from a browser page
     assert client.get("/api/status", headers={"origin": "null"}).status_code == 200
+
+
+def wait_library(client, chat_id: int) -> dict:
+    for _ in range(300):
+        v = client.get(f"/api/chats/{chat_id}").json()
+        if all(not c.get("status", {}).get("busy") for c in v["context"]):
+            return v
+        time.sleep(0.02)
+    raise AssertionError("the folder was not read")
+
+
+def test_folder_passages_files_and_ask_docs(client, monkeypatch, tmp_path):
+    from test_library import pdf
+    from test_meeting import Asker
+    folder = tmp_path / "Trip"
+    folder.mkdir()
+    (folder / "hotels.md").write_text("We booked the Alfama hotel in Lisbon for three nights.")
+    (folder / "visa.pdf").write_bytes(pdf(["Visa: none needed for stays under ninety days"]))
+    (folder / "budget.txt").write_text("Food budget is forty euros per day.")
+
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"transport": "browser"})
+    client.put("/api/credentials/grok", json={"secret": "k"})
+    chat = client.post("/api/chats").json()["id"]
+    assert client.post(f"/api/chats/{chat}/library", json={"name": "trip", "location": str(tmp_path / "nope")}
+                       ).status_code == 400
+    r = client.post(f"/api/chats/{chat}/library", json={"name": "#trip", "location": str(folder)})
+    assert r.status_code == 200
+    v = wait_library(client, chat)
+    item = v["context"][0]
+    assert item["name"] == "trip" and item["status"]["files"] == 3 and "3 files" in item["content"]
+
+    got, systems = [], []
+    real = app_mod.make_provider
+
+    class DocsAsker(Asker):
+        async def complete(self, messages, system=None):
+            self.calls.append((messages, system))
+            systems.append(system)
+            if len(self.calls) == 1:
+                return "ASK @docs: food budget per day"
+            return "grok used: " + messages[-1]["content"]
+
+    def capture(cred, **kw):
+        if cred["platform"] == "grok":
+            f = DocsAsker("grok")
+            f.thread_url = None
+            return f
+        f = real(cred, **kw)
+        async def with_files(messages, system=None, files=()):
+            got.append((messages[-1]["content"], list(files)))
+            return "gpt read it"
+        f.complete_with_files = with_files
+        return f
+    monkeypatch.setattr(app_mod, "make_provider", capture)
+
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt do I need a visa for Lisbon? #trip", "format": "chat"})
+    v = wait_meeting(client, chat)
+    ctx = next(m for m in v["messages"] if m["meta"]["kind"] == "context")
+    assert ctx["meta"]["library"] and ctx["meta"]["sources"][0]["path"] == "visa.pdf"
+    assert "[1] visa.pdf, p.1\nVisa: none needed" in ctx["content"]
+    assert ctx["meta"]["attached"] == ["visa.pdf"]
+    prompt, files = got[0]
+    assert "Visa: none needed" in prompt and files == [str(folder / "visa.pdf")]
+
+    # The same file is not uploaded again in this chat.
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt and the visa rules again? #trip", "format": "chat"})
+    wait_meeting(client, chat)
+    assert len(got) == 1  # no files this time, so a plain turn
+    again = [m for m in client.get(f"/api/chats/{chat}").json()["messages"] if m["meta"]["kind"] == "context"][-1]
+    assert "Visa: none needed" in again["content"] and "attached" not in again["meta"]
+
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@grok how much can I spend on food?", "format": "chat"})
+    v = wait_meeting(client, chat)
+    assert "ASK @docs" in systems[0]
+    lookup = next(m for m in v["messages"] if m["meta"]["kind"] == "lookup")
+    assert lookup["meta"]["speaker"] == "docs" and "forty euros per day" in lookup["content"]
+
+    # Always: searched for every message without #trip.
+    client.delete(f"/api/context/{item['id']}")
+    assert client.get(f"/api/chats/{chat}").json()["context"] == []
+    client.post(f"/api/chats/{chat}/library", json={"name": "trip", "location": str(folder), "always": True})
+    wait_library(client, chat)
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@grok which hotel did we book in Lisbon?", "format": "chat"})
+    v = wait_meeting(client, chat)
+    ctx = [m for m in v["messages"] if m["meta"]["kind"] == "context"][-1]
+    assert "Alfama hotel" in ctx["content"] and "attached" not in ctx["meta"]
+
+
+def test_readers_settings(client, monkeypatch):
+    async def detect(home, creds):
+        return {"vision": [], "transcribe": [], "embed": [{"id": "ollama:nomic-embed-text", "label": "x"}],
+                "tools": {"whisper": None, "whisper_model": None, "ffmpeg": None}}
+    monkeypatch.setattr(app_mod.enrich, "detect", detect)
+    client.post("/api/unlock", json={"password": "longenough"})
+    r = client.get("/api/readers").json()
+    assert r["config"] == {"vision": "auto", "transcribe": "auto", "embed": ""}
+    assert r["suggested"]["embed"] == "nomic-embed-text" and "whisper-model" in r["can_download"]
+    assert client.put("/api/readers", json={"embed": "ollama:nomic-embed-text"}).json()["embed"] == "ollama:nomic-embed-text"
+    assert client.post("/api/readers/download", json={"what": "evil"}).status_code == 400
+    assert client.post("/api/local/import", json={"path": "/no/such/model.gguf"}).status_code == 400
+    assert client.post("/api/local/import", json={"path": "/x/model.bin"}).json()["detail"].startswith("Point at a .gguf")

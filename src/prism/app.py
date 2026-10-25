@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -23,7 +24,8 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import local
+from . import enrich, local
+from .library import Library, attachable, passages_text
 from .providers import PLATFORMS, Provider, build_provider
 
 STATIC = Path(__file__).parent / "static"
@@ -47,6 +49,13 @@ def browsers() -> BrowserManager:
     channels = [None if channel == "bundled" else channel] if channel else None
     return BrowserManager(settings().prism_profiles_dir, headless=settings().prism_browser_headless,
                           channels=channels)
+
+
+@lru_cache
+def library() -> Library:
+    def creds() -> dict:
+        return {c["platform"]: c for c in store().enabled_credentials(vault())}
+    return Library(store(), data_dir(), creds=creds, readers_config=lambda: store().get_meta("readers"))
 
 
 @asynccontextmanager
@@ -273,7 +282,8 @@ class CredentialIn(BaseModel):
 # running inside the PRISM page. Each is a room member under a name the user picks.
 LOCAL_TRANSPORTS = ("local", "webgpu")
 LOCAL_NAME = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
-RESERVED = {"all", "any", "everyone", "moderator", "mod", "mother", "prism", "context", "user", "you"}
+RESERVED = {"all", "any", "everyone", "moderator", "mod", "mother", "prism", "docs", "context",
+            "user", "you"}
 
 
 def known_platform(platform: str) -> bool:
@@ -411,6 +421,20 @@ async def pull_model(body: PullIn) -> dict:
     return {"pulls": local.pulls()}
 
 
+class ImportIn(BaseModel):
+    path: str = Field(min_length=1, max_length=1000)
+
+
+@app.post("/api/local/import")
+async def import_model(body: ImportIn) -> dict:
+    """A .gguf already on this computer becomes an Ollama model (progress as for downloads)."""
+    try:
+        model = local.start_import(body.path)
+    except local.ProviderError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"model": model, "pulls": local.pulls()}
+
+
 @app.get("/api/client-jobs")
 def take_client_jobs(models: str = "") -> dict:
     """A PRISM page with in-browser models loaded takes the turns waiting for them."""
@@ -449,7 +473,8 @@ def chat_view(chat_id: int) -> dict:
         "chat": chat_or_404(chat_id),
         "messages": s.thread(chat_id),
         "daughters": [{**d, "messages": s.thread(chat_id, d["id"])} for d in s.daughters(chat_id)],
-        "context": s.context_for(chat_id),
+        "context": [{**c, "status": library().status(c["library"])} if c.get("library") else c
+                    for c in s.context_for(chat_id)],
         "meeting": meeting,
         "queued": [q.content for q in _queued.get(chat_id, [])],
         "meeting_defaults": meeting_defaults(),
@@ -602,7 +627,8 @@ async def send(chat_id: int, body: SendIn) -> dict:
             return chat_view(chat_id)
         if not running.accepts_messages:
             raise HTTPException(409, "The final answer is being written - send again in a moment")
-        running.add_user_message(text, attach_context(chat_id, text)
+        opens_files = any(isinstance(m.provider, BrowserProvider) for m in running.members.values())
+        running.add_user_message(text, await attach_context(chat_id, text, opens_files=opens_files)
                                  + ([attach_artifact(chat_id, body.artifact)] if body.artifact else []),
                                  [str(media_path(f)) for f in body.files])
         return chat_view(chat_id)
@@ -854,8 +880,10 @@ def attach_artifact(chat_id: int, art: "ArtifactIn") -> Entry:
     return entry
 
 
-def attach_context(chat_id: int, text: str) -> list[Entry]:
-    """#names in a message: each item joins the room (and is stored) just before it."""
+async def attach_context(chat_id: int, text: str, always: list[dict] = (),
+                         opens_files: bool = False) -> list[Entry]:
+    """#names in a message: each item joins the room (and is stored) just before it. A folder
+    or web pages (#name, or marked always) gives the passages that match the message."""
     s, entries = store(), []
     names = list(dict.fromkeys(context_name(n) for n in CONTEXT_REF.findall(text)))
     items = {n: s.find_context(chat_id, n) for n in names}
@@ -863,12 +891,69 @@ def attach_context(chat_id: int, text: str) -> list[Entry]:
         if not items[name]:
             known = ", ".join(f"#{c['name']}" for c in s.context_for(chat_id)) or "none yet"
             raise HTTPException(400, f"No #{name} - known: {known}. Write it with /save #{name} <text>")
+    for item in always:
+        items.setdefault(item["name"], item)
     for name, item in items.items():
-        entry = Entry("context", "context", f"#{name}: {item['title']}\n{item['content']}")
-        entry.id = s.add_message(chat_id, None, "user", entry.text,
-                                 {"kind": "context", "name": name, "speaker": "context"})
+        if item.get("library"):
+            entry, meta = await library_entry(chat_id, item, text, opens_files)
+        else:
+            entry = Entry("context", "context", f"#{name}: {item['title']}\n{item['content']}")
+            meta = {"kind": "context", "name": name, "speaker": "context"}
+        entry.id = s.add_message(chat_id, None, "user", entry.text, meta)
         entries.append(entry)
     return entries
+
+
+DOCS_BOT = "docs"
+
+
+def library_query(chat_id: int, text: str) -> str:
+    """What to search for: the message without its #names; a short one ("go on", "more")
+    borrows the words of the message before it."""
+    query = CONTEXT_REF.sub(" ", text).strip()
+    if len(re.findall(r"\w{3,}", query)) < 3:
+        topics = [m["content"] for m in store().thread(chat_id)
+                  if (m["meta"] or {}).get("kind") in ("topic", "user") and m["content"] != text]
+        query = f"{topics[-1] if topics else ''} {query}".strip()
+    return query
+
+
+async def library_entry(chat_id: int, item: dict, text: str, opens_files: bool) -> tuple[Entry, dict]:
+    lib, sid, name = library(), item["library"], item["name"]
+    lib.scan_if_stale(sid)
+    hits = await lib.retrieve([sid], library_query(chat_id, text))
+    status = lib.status(sid)
+    files: list[str] = []
+    if opens_files and status["options"].get("attach", True):
+        already = {p for m in store().thread(chat_id) for p in (m["meta"] or {}).get("attached_paths", [])}
+        files = attachable(hits, already)
+    where = (status["location"] if status["kind"] == "folder" else "the saved web pages")
+    head = f"#{name}: passages from {where} that match the message (ask for more with ASK @docs: <keywords>)"
+    if hits:
+        body = passages_text(hits)
+    elif status["busy"] or not status["scanned_at"]:
+        body = "(PRISM is still reading these files - nothing matching yet)"
+    else:
+        body = "(nothing in it matches this message)"
+    if files:
+        body += "\n\nAttached for you to open: " + ", ".join(Path(f).name for f in files)
+    entry = Entry("context", "context", f"{head}\n{body}", files=files)
+    meta = {"kind": "context", "name": name, "speaker": "context", "library": sid,
+            "sources": [{"path": h["path"], "page": h["page"]} for h in hits],
+            **({"attached": [Path(f).name for f in files], "attached_paths": files} if files else {})}
+    return entry, meta
+
+
+async def search_docs(question: str, chat_id: int) -> str:
+    """ASK @docs: every folder and web-page source this chat can use."""
+    items = [c for c in store().context_for(chat_id) if c.get("library")]
+    if not items:
+        return "No folders or web pages are in this chat's context."
+    hits = await library().retrieve([c["library"] for c in items], question, k=6)
+    names = ", ".join(f"#{c['name']}" for c in items)
+    if not hits:
+        return f"Nothing in {names} matches that."
+    return f"From the user's files ({names}):\n" + passages_text(hits, 6000)
 
 
 @app.post("/api/chats/{chat_id}/meeting/stop")
@@ -918,7 +1003,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
             raise HTTPException(400, f"Primary LLM {primary!r} has no enabled credentials")
 
     bound = {d["platform"]: d for d in s.daughters(chat_id)}
-    context_items = [c for c in s.context_for(chat_id) if c["always"]]  # the rest: by #name
+    always = [c for c in s.context_for(chat_id) if c["always"]]  # the rest: by #name
+    context_items = [c for c in always if not c.get("library")]   # folders: searched per message
 
     def context_changed_since_last_turn(name: str) -> bool:
         """Remote chats only see the context when it is sent; resend after additions."""
@@ -972,7 +1058,8 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         return s.add_message(chat_id, None, "user" if name == "user" else "assistant",
                              entry.text, meta)
 
-    room += attach_context(chat_id, text)
+    opens_files = any(cred["transport"] == "browser" for cred in seats.values())
+    room += await attach_context(chat_id, text, [c for c in always if c.get("library")], opens_files)
     if body.artifact:
         room.append(attach_artifact(chat_id, body.artifact))
     topic = Entry("user", "topic", text, files=[str(media_path(f)) for f in body.files])
@@ -985,11 +1072,14 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         @prism searches the user's other PRISM chats."""
         if platform == PRISM_BOT:
             return search_history(question, chat_id)
+        if platform == DOCS_BOT:
+            return await search_docs(question, chat_id)
         return await make_provider(creds[platform], fresh=True).complete(
             [{"role": "user", "content": ASK_PROMPT.format(question=question)}])
 
     # Memory lives in the signed-in web apps; API models remember nothing between calls.
-    askable = [PRISM_BOT] + [p for p, c in creds.items() if c["transport"] == "browser"]
+    askable = ([PRISM_BOT] + ([DOCS_BOT] if any(c.get("library") for c in s.context_for(chat_id)) else [])
+               + [p for p, c in creds.items() if c["transport"] == "browser"])
     session = Session(room, members, script, emit, context=context_block(context_items),
                       timeout=settings().request_timeout_s, deep=opts["deep"],
                       ask=ask, askable=askable, max_asks=opts["asks"])
@@ -1063,3 +1153,112 @@ def add_context(chat_id: int, c: ContextIn) -> dict:
 def delete_context(item_id: int) -> dict:
     store().delete_context(item_id)
     return {"ok": True}
+
+
+# --- library: folders and web pages as searchable context -------------------------------
+
+class LibraryIn(BaseModel):
+    name: str
+    location: str               # a folder, or URLs one per line
+    always: bool = False
+    global_: bool = Field(False, alias="global")
+    vision: bool = False        # read images and scanned pages with a vision model
+    transcribe: bool = False    # transcribe audio and video
+    attach: bool = True         # upload the best PDFs/images to bots that open files
+
+
+class LibraryOptionsIn(BaseModel):
+    vision: bool | None = None
+    transcribe: bool | None = None
+    attach: bool | None = None
+
+
+@app.post("/api/chats/{chat_id}/library")
+async def add_library(chat_id: int, body: LibraryIn) -> dict:
+    chat_or_404(chat_id)
+    name = context_name(body.name.lstrip("#"))
+    if not name or not body.location.strip():
+        raise HTTPException(400, "Give it a #name and a folder (or web addresses)")
+    try:
+        sid = library().add(None if body.global_ else chat_id, name, body.location, body.always,
+                            {"vision": body.vision, "transcribe": body.transcribe, "attach": body.attach})
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    library().scan(sid)
+    return chat_view(chat_id)
+
+
+@app.get("/api/library/{source_id}")
+def library_status(source_id: int) -> dict:
+    if not store().get_source(source_id):
+        raise HTTPException(404, "No such folder")
+    return library().status(source_id)
+
+
+@app.put("/api/library/{source_id}")
+async def library_options(source_id: int, body: LibraryOptionsIn) -> dict:
+    src = store().get_source(source_id)
+    if not src:
+        raise HTTPException(404, "No such folder")
+    options = {**src["options"], **body.model_dump(exclude_none=True)}
+    store().update_source(source_id, options=options)
+    library().scan(source_id)  # a reader switched on reads what it can now
+    return library().status(source_id)
+
+
+@app.post("/api/library/{source_id}/scan")
+async def library_scan(source_id: int, full: bool = False) -> dict:
+    if not store().get_source(source_id):
+        raise HTTPException(404, "No such folder")
+    return {"started": library().scan(source_id, full=full), **library().status(source_id)}
+
+
+class ReadersIn(BaseModel):
+    vision: str | None = None       # "auto" | "off" | a reader id
+    transcribe: str | None = None
+    embed: str | None = None        # "" = words only | "ollama:<model>" | "lmstudio:<model>"
+
+
+def _all_sources() -> list[int]:
+    return [r["id"] for r in store()._q("SELECT id FROM library_sources")]
+
+
+@app.get("/api/readers")
+async def readers_status() -> dict:
+    try:
+        creds = {c["platform"]: c for c in store().enabled_credentials(vault())}
+    except HTTPException:
+        creds = {}
+    found = await enrich.detect(data_dir(), creds)
+    return {**found, "config": enrich.load_config(store().get_meta("readers")),
+            "downloads": enrich.downloads(),
+            "can_download": {k: sys.platform == "win32" or not v.get("windows_only")
+                             for k, v in enrich.DOWNLOADS.items()},
+            "hints": {} if sys.platform == "win32" else enrich.MAC_HINTS,
+            "suggested": {"embed": enrich.SUGGESTED_EMBED, "vision": enrich.SUGGESTED_VISION}}
+
+
+@app.put("/api/readers")
+async def put_readers(body: ReadersIn) -> dict:
+    cfg = enrich.load_config(store().get_meta("readers"))
+    new = {**cfg, **body.model_dump(exclude_none=True)}
+    store().set_meta("readers", json.dumps(new))
+    if new["embed"] != cfg["embed"]:  # vectors from another model don't compare
+        store().clear_vecs()
+        for sid in _all_sources():
+            store().bump_source(sid)
+            if new["embed"]:
+                library().scan(sid)
+    return new
+
+
+class DownloadIn(BaseModel):
+    what: str
+
+
+@app.post("/api/readers/download")
+async def download_tool(body: DownloadIn) -> dict:
+    if body.what not in enrich.DOWNLOADS:
+        raise HTTPException(400, f"Unknown download {body.what!r}")
+    enrich.start_download(body.what, data_dir())
+    return {"downloads": enrich.downloads()}

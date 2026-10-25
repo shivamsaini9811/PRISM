@@ -1,6 +1,7 @@
 """Common interface every model provider implements."""
 
 from abc import ABC, abstractmethod
+import re
 from pathlib import Path
 from typing import TypedDict
 
@@ -26,7 +27,7 @@ class Provider(ABC):
                                   files: list[str] = ()) -> str:
         """The same, with files the user attached to the latest message. This default tells the
         model their names only; providers that can upload files override it."""
-        names = ", ".join(Path(f).name.split("-", 1)[-1] for f in files)
+        names = ", ".join(re.sub(r"^[0-9a-f]{12}-", "", Path(f).name) for f in files)
         note = f"\n\n[The user attached: {names} - you can't see the files through this connection.]"
         return await self.complete(messages[:-1] + [{**messages[-1],
                                                      "content": messages[-1]["content"] + note}], system)

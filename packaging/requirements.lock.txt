@@ -79,6 +79,10 @@ opentelemetry-api==1.45.1
     # via
     #   anthropic
     #   fastapi
+pillow==12.3.0 ; python_full_version < '3.11'
+    # via prism
+pillow==13.0.0 ; python_full_version >= '3.11'
+    # via prism
 playwright==1.64.0
     # via prism
 pyasn1==0.6.4
@@ -104,6 +108,8 @@ pyee==13.0.1 ; python_full_version < '3.12'
     # via playwright
 pyee==14.0.0 ; python_full_version >= '3.12'
     # via playwright
+pypdf==6.21.2
+    # via prism
 python-dotenv==1.2.4
     # via
     #   pydantic-settings
@@ -144,6 +150,7 @@ typing-extensions==4.16.0
     #   pydantic-core
     #   pydantic-settings
     #   pyee
+    #   pypdf
     #   starlette
     #   typing-inspection
     #   uvicorn

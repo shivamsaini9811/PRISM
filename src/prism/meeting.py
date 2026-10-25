@@ -69,11 +69,15 @@ ASK_HELP = (" You can ask the other assistants the user uses ({askable}): each k
             "build or write something, paste the full brief). When the user mentions their own "
             "things you don't have (a routine, a plan, past decisions, personal history), ASK "
             "before guessing. At most {max_asks} asks per turn.{prism}")
-ASK_PRISM_ONLY = (" You can search the user's past chats in this app: write one line "
-                  "`ASK @prism: <keywords>` and nothing after it; the matching messages come back "
-                  "to you and you then finish your turn. At most {max_asks} asks per turn.")
+ASK_TOOLS_ONLY = (" You can search the user's own material: write one line `ASK @name: <keywords>` "
+                  "and nothing after it; the results come back to you and you then finish your "
+                  "turn. At most {max_asks} asks per turn.{tools}")
 ASK_PRISM = (" `prism` is not an assistant: `ASK @prism: <keywords>` searches the user's past "
              "chats in this app and returns the matching messages.")
+ASK_DOCS = (" `docs` is not an assistant: `ASK @docs: <keywords>` searches the user's files and "
+            "web pages given to this chat (#folders) and returns the matching passages with file "
+            "and page - use it to check facts and find more than the passages you were given.")
+LOCAL_TOOLS = {"prism": ASK_PRISM, "docs": ASK_DOCS}  # searched by PRISM itself, not assistants
 ASK_LINE = re.compile(r"^[\s*_`>-]*ASK\s+@([A-Za-z][\w-]*)[*_`]*\s*:[\s*_`]*(.+?)[\s*_`]*$", re.I)
 MAX_ASKS = 3  # default advice budget per turn; the user sets 0-5
 DEEP = (" Take your time: reason step by step, check your own claims, and prefer depth over "
@@ -420,11 +424,12 @@ class Session:
     def _system(self, m: Member) -> str:
         others = ", ".join(n for n in self.members if n not in (m.name, MODERATOR)) or "none"
         askable = self._askable(m)
-        assistants = [a for a in askable if a != "prism"]
+        assistants = [a for a in askable if a not in LOCAL_TOOLS]
+        tools = "".join(LOCAL_TOOLS[a] for a in askable if a in LOCAL_TOOLS)
         help_ = ("" if not self.max_asks else
                  ASK_HELP.format(askable=", ".join(assistants), max_asks=self.max_asks,
-                                 prism=ASK_PRISM if "prism" in askable else "") if assistants else
-                 ASK_PRISM_ONLY.format(max_asks=self.max_asks) if askable else "")
+                                 prism=tools) if assistants else
+                 ASK_TOOLS_ONLY.format(max_asks=self.max_asks, tools=tools) if askable else "")
         return _with_context(MEMBER_SYSTEM.format(name=m.name, others=others,
                                                   deep=(DEEP if self.deep else "") + help_),
                              self.context)

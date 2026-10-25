@@ -99,8 +99,9 @@
   .ctx-item b button { border:0; background:none; padding:0; color:var(--muted); }
   .ctx-item p { margin:4px 0 0; white-space:pre-wrap; max-height:90px; overflow:auto; color:var(--muted); }
   .tag { font-size:10px; font-weight:400; border:1px solid var(--border); border-radius:4px; padding:0 4px; color:var(--muted); }
-  #ctxForm { padding:12px; border-top:1px solid var(--border); display:grid; gap:6px; }
-  #ctxForm textarea { min-height:70px; resize:vertical; }
+  #ctxForm, #libForm { padding:12px; border-top:1px solid var(--border); display:grid; gap:6px; }
+  #ctxForm textarea, #libForm textarea { min-height:70px; resize:vertical; }
+  #libForm { max-height:55vh; overflow:auto; } #libForm label { display:flex; gap:6px; align-items:flex-start; }
 
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
   .modal { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:18px; width:100%; max-width:440px; max-height:90vh; overflow:auto; }
@@ -148,6 +149,14 @@
   .lm { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:13px; }
   .lm span { flex:1; } .lm button { font-size:12px; padding:1px 9px; }
   progress { width:120px; height:8px; }
+  #readersBox h4 { margin:10px 0 4px; font-size:13px; } #readersBox h4:first-child { margin-top:0; }
+  #readersBox select { flex:1; font-size:12.5px; }
+  #ctxMode { display:flex; gap:6px; padding:8px 12px 0; border-top:1px solid var(--border); flex-shrink:0; }
+  #ctxMode button { font-size:12px; padding:2px 10px; white-space:nowrap; }
+  #ctxMode button.on { border-color:var(--accent); color:var(--accent); }
+  .ctx-item .lib-opts { display:flex; flex-wrap:wrap; gap:4px 12px; font-size:12px; margin-top:4px; }
+  .ctx-item .lib-opts label { display:flex; gap:4px; align-items:center; }
+  .ctx-item details { font-size:12px; margin-top:4px; } .ctx-item details li { word-break:break-all; }
   #webStatus { position:fixed; left:12px; bottom:12px; z-index:9; background:var(--card); border:1px solid var(--border);
     border-radius:8px; padding:6px 10px; font-size:12px; max-width:340px; }
   #artRevise { display:flex; gap:6px; padding:8px 10px; border-top:1px solid var(--border); }
@@ -223,13 +232,25 @@
     </form>
     <div id="help" class="muted hidden"><b>@claude</b> asks one · <b>@claude @gpt</b> asks several · <b>@all</b> or no @ asks everyone switched on · <b>@moderator</b> sums up ·
       <b>#name</b> attaches saved context · <b>/save #name</b> [text] saves the last answer (or the text) · <b>/save-global #name</b> · <b>/forget #name</b><br>
-      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
+      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats; <b>ASK @docs</b> searches the folders in context) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
   </main>
 
   <section id="ctx">
-    <div class="pad"><h3>Context</h3><div class="muted" style="font-size:12px">Write <b>#name</b> in a message to give it to the room. Items marked <i>always</i> go with every message. Global items work in every chat.</div></div>
+    <div class="pad"><h3>Context</h3><div class="muted" style="font-size:12px">Write <b>#name</b> in a message to give it to the room. Items marked <i>always</i> go with every message. Global items work in every chat. A <b>folder</b> or <b>web pages</b> are searched for each message: the bots get the passages that match it, and can search more with <b>ASK @docs</b>.</div></div>
     <div id="profileBar" class="ctx-item"></div>
     <div id="ctxList"></div>
+    <div id="ctxMode" class="hidden"><button type="button" data-mode="text" class="on">Add text</button><button type="button" data-mode="lib">Add a folder or web pages</button></div>
+    <form id="libForm" class="hidden">
+      <input id="libName" placeholder="#name (e.g. research)" required>
+      <textarea id="libLocation" rows="3" placeholder="Folder, e.g. D:\Research or C:\Users\me\Documents\Thesis&#10;- or web addresses, one per line" required></textarea>
+      <div class="muted" style="font-size:12px">Reads documents (PDF, Word, PowerPoint, Excel, text, Markdown, code, web pages, email .eml/.mbox, Notion/zip exports). Images, scans and recordings are found by name, and read too with a reader (Settings → Readers).</div>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="libGlobal"> Global (all chats)</label>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="libAlways"> Search it for every message (not only when #named)</label>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="libVision"> Read images and scanned pages (vision model)</label>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="libTranscribe"> Transcribe audio and video</label>
+      <label class="muted" style="font-size:12px"><input type="checkbox" id="libAttach" checked> Send the best-matching PDFs and images to the bots too</label>
+      <button class="primary">Add and read it</button>
+    </form>
     <form id="ctxForm" class="hidden">
       <input id="ctxTitle" placeholder="#name (e.g. spec)" required>
       <textarea id="ctxContent" placeholder="Notes, facts, code, requirements…" required></textarea>
@@ -279,6 +300,7 @@
       <div class="note">The primary moderates every meeting: after each round it writes the analysis, and at the end the final answer. It uses one extra conversation per meeting. An <b>API</b> connection makes it much faster.</div>
     </div>
     <div id="localBox" class="plat"></div>
+    <div id="readersBox" class="plat"></div>
     <div id="plats"></div>
   </div>
 </div>
@@ -437,14 +459,16 @@ function watch() {
   clearTimeout(state.poll);
   const v = state.view;
   const recalling = v?.messages.some(m => m.meta?.pending);
-  if (!v?.meeting && !recalling && !v?.profile?.updating) return;
+  const reading = v?.context.some(c => c.status?.busy);
+  if (!v?.meeting && !recalling && !v?.profile?.updating && !reading) return;
   state.poll = setTimeout(async () => {
     if (state.view?.chat.id !== v.chat.id) return;
     try {
       const fresh = await api(`/api/chats/${v.chat.id}`);
       if (state.view?.chat.id !== v.chat.id) return;
       const sig = x => JSON.stringify([x.messages.length, x.meeting, x.daughters.map(d => d.messages.length),
-                                       x.context.length, x.messages.filter(m => m.meta?.pending).length, x.profile]);
+                                       x.context.length, x.messages.filter(m => m.meta?.pending).length, x.profile,
+                                       x.context.map(c => c.status ? [c.status.busy, c.status.job?.files, c.status.chunks, c.content] : 0)]);
       const changed = sig(fresh) !== sig(v);
       state.view = fresh;
       if (changed) render();
@@ -458,7 +482,9 @@ function watch() {
 function render() {
   const v = state.view;
   state.arts = [];  // filled again as the messages render
-  $('ctxForm').classList.toggle('hidden', !v);
+  $('ctxMode').classList.toggle('hidden', !v);
+  $('ctxForm').classList.toggle('hidden', !v || state.ctxMode === 'lib');
+  $('libForm').classList.toggle('hidden', !v || state.ctxMode !== 'lib');
   if (!v) { $('tabs').innerHTML = ''; $('remote').classList.add('hidden'); $('composer').classList.add('hidden');
             $('meetbar').classList.add('hidden'); $('thread').innerHTML = '<div class="empty">Create or pick a chat.</div>'; $('ctxList').innerHTML = ''; return; }
 
@@ -490,9 +516,21 @@ function render() {
     <button data-profile="update" ${pr.updating ? 'disabled' : ''}>Update now</button></div>`;
   $('ctxList').innerHTML = v.context.map(c =>
     `<div class="ctx-item"><b><span>#${esc(c.name)} ${c.chat_id == null ? '<span class="tag">global</span>' : ''}
-       ${c.always ? '<span class="tag">always</span>' : ''}</span>
-       <button data-ctxdel="${c.id}" title="Remove">✕</button></b><p>${esc(c.content)}</p></div>`).join('')
+       ${c.always ? '<span class="tag">always</span>' : ''}${c.library ? `<span class="tag">${c.status?.kind === 'web' ? 'web' : 'folder'}</span>` : ''}</span>
+       <button data-ctxdel="${c.id}" title="Remove">✕</button></b><p>${esc(c.content)}</p>${c.library ? libHtml(c.status) : ''}</div>`).join('')
     || '<div class="muted" style="font-size:12px">Nothing stored yet.</div>';
+}
+function libHtml(st) {
+  if (!st) return '';
+  const j = st.job, o = st.options || {};
+  const busy = st.busy ? `<div class="muted" style="font-size:12px">${esc(j.stage)}${j.total ? ` ${j.files}/${j.total}` : ''}${j.current ? ` · ${esc(j.current)}` : ''}
+    ${j.total ? `<progress max="${j.total}" value="${j.files}"></progress>` : ''}</div>` : '';
+  const err = j?.error ? `<div class="err" style="font-size:12px">${esc(j.error)}</div>` : '';
+  const opt = (k, label) => `<label><input type="checkbox" data-libopt="${k}" data-lib="${st.id}" ${o[k] ?? (k === 'attach') ? 'checked' : ''}> ${label}</label>`;
+  const problems = st.problems?.length ? `<details><summary>${st.problems.length} file${st.problems.length > 1 ? 's' : ''} not fully read</summary><ul>${
+    st.problems.map(p => `<li>${esc(p.path)}: ${esc(p.note)}</li>`).join('')}</ul></details>` : '';
+  return `${busy}${err}<div class="lib-opts">${opt('vision', 'read images')}${opt('transcribe', 'transcribe audio/video')}${opt('attach', 'send files')}</div>
+    ${problems}<div class="plat-actions"><button data-libscan="${st.id}" ${st.busy ? 'disabled' : ''}>${st.kind === 'web' ? 'Fetch again' : 'Check for changes'}</button></div>`;
 }
 function md(text) {  // just enough markdown for the analysis: ## headings and **bold**
   let html = '', ask = false;
@@ -531,7 +569,8 @@ function meetingHtml(msgs, live) {
     if (kind === 'context') {
       flush();
       const [head, ...body] = m.content.split('\n');
-      html += `<div class="msg context"><details><summary>📎 ${esc(head)}</summary><pre>${esc(body.join('\n'))}</pre></details></div>`;
+      const sent = meta.attached?.length ? ` <span class="muted">· sent ${esc(meta.attached.join(', '))}</span>` : '';
+      html += `<div class="msg context"><details><summary>📎 ${esc(head)}${sent}</summary><pre>${esc(body.join('\n'))}</pre></details></div>`;
       continue;
     }
     if (kind === 'speaker') {
@@ -776,7 +815,34 @@ function pick(token) {
 $('input').oninput = renderSuggest;
 $('input').onclick = renderSuggest;
 $('suggest').onclick = e => { const t = e.target.dataset.pick; if (t) pick(t); };
+$('ctxMode').onclick = e => {
+  const m = e.target.dataset.mode; if (!m) return;
+  state.ctxMode = m;
+  for (const b of $('ctxMode').children) b.classList.toggle('on', b.dataset.mode === m);
+  render();
+};
+$('libForm').onsubmit = async e => {
+  e.preventDefault();
+  const name = $('libName').value.replace(/^#/, '').trim();
+  try {
+    state.view = await api(`/api/chats/${state.view.chat.id}/library`, {method: 'POST',
+      body: {name, location: $('libLocation').value, global: $('libGlobal').checked, always: $('libAlways').checked,
+             vision: $('libVision').checked, transcribe: $('libTranscribe').checked, attach: $('libAttach').checked}});
+  } catch (err) { return alert(err.message); }
+  $('libName').value = $('libLocation').value = '';
+  for (const id of ['libGlobal', 'libAlways', 'libVision', 'libTranscribe']) $(id).checked = false;
+  render(); watch(); notice(`Reading it now - use it with #${name}`);
+};
+$('ctxList').onchange = async e => {
+  const t = e.target; if (!t.dataset.libopt) return;
+  try { await api(`/api/library/${t.dataset.lib}`, {method: 'PUT', body: {[t.dataset.libopt]: t.checked}}); } catch (err) { alert(err.message); }
+  openChat(state.view.chat.id);
+};
 $('ctxList').onclick = async e => {
+  if (e.target.dataset.libscan) {
+    await api(`/api/library/${e.target.dataset.libscan}/scan?full=${e.shiftKey}`, {method: 'POST'});
+    return openChat(state.view.chat.id);
+  }
   const id = e.target.dataset.ctxdel; if (!id) return;
   await api(`/api/context/${id}`, {method: 'DELETE'}); openChat(state.view.chat.id);
 };
@@ -787,7 +853,7 @@ async function loadPlatforms() {
   const p = state.platforms;
   $('motherLabel').textContent = p.primary ? `Mother: ${p.primary}` : 'No primary set';
 }
-$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); };
+$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); loadReaders(); };
 $('closeSettings').onclick = () => { $('settings').classList.add('hidden'); clearTimeout(state.localPoll); if (state.view) render(); };
 
 /* ---------- local models: Ollama / LM Studio on this computer, or in this browser ---------- */
@@ -824,7 +890,9 @@ function renderLocal() {
         ${!p.done && p.total ? `<progress max="${p.total}" value="${p.completed}"></progress>` : ''}</div>`).join('');
     const get = rt.id !== 'ollama' ? '' : `<div class="lm"><input id="pullName" list="pullList" placeholder="model to download, e.g. ${esc(r.suggested[0])}" style="flex:1">
       <datalist id="pullList">${r.suggested.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
-      <button data-pull>Download</button></div>`;
+      <button data-pull>Download</button></div>
+      <div class="lm"><input id="importPath" placeholder="or a model file you have: D:\\Models\\qwen2.5-7b-instruct-q4_k_m.gguf" style="flex:1">
+      <button data-import title="Ollama copies the .gguf into its store; then add it to the room">Use this file</button></div>`;
     return `<h4>${esc(rt.label)} <span class="ok">· running</span></h4>${models}${pulls}${get}`;
   };
   const gpu = 'gpu' in navigator;
@@ -861,10 +929,62 @@ $('localBox').onclick = async e => {
   if (t.hasAttribute('data-localrefresh')) return loadLocal();
   if (t.dataset.addlocal) return addLocal(t.dataset.addlocal, 'local', t.dataset.rt);
   if (t.hasAttribute('data-addweb')) { const m = $('webModel').value; if (m) addLocal(m, 'webgpu', ''); return; }
+  if (t.hasAttribute('data-import')) {
+    const path = $('importPath').value.trim(); if (!path) return;
+    try { const r = await api('/api/local/import', {method: 'POST', body: {path}}); notice(`Importing as ${r.model}…`); loadLocal(); }
+    catch (err) { alert(err.message); }
+    return;
+  }
   if (t.hasAttribute('data-pull')) {
     const m = $('pullName').value.trim(); if (!m) return;
     try { await api('/api/local/pull', {method: 'POST', body: {model: m}}); loadLocal(); } catch (err) { alert(err.message); }
   }
+};
+
+/* Readers: models that read images/scans, transcribe recordings, and power meaning search. */
+async function loadReaders() {
+  clearTimeout(state.readersPoll);
+  if ($('settings').classList.contains('hidden')) return;
+  let r;
+  try { r = await api('/api/readers'); } catch (err) { $('readersBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  const sel = (job, found, none) => `<select data-reader="${job}">
+    ${job === 'embed' ? `<option value="">Words only (no model needed)</option>`
+      : `<option value="auto">Automatic${found.length ? ` (${esc(found[0].label)})` : ' - none found yet'}</option><option value="off">Off</option>`}
+    ${found.map(f => `<option value="${esc(f.id)}">${esc(f.label)}</option>`).join('')}</select>`;
+  const dl = (what, have, label) => {
+    const d = r.downloads[what];
+    if (have) return `<div class="lm"><span>${label}: <span class="ok">found</span> <span class="muted">${esc(have)}</span></span></div>`;
+    if (!r.can_download[what]) return `<div class="lm"><span>${label}: not found - install with <code>${esc(r.hints[what] || '')}</code></span></div>`;
+    const state_ = d ? (d.error ? `<span class="err">${esc(d.error)}</span>` : d.done ? '<span class="ok">done</span>'
+      : `<progress max="${d.total || 1}" value="${d.completed}"></progress>`) : '';
+    return `<div class="lm"><span>${label}: not found ${state_}</span>${d && !d.done ? '' : `<button data-download="${what}">Download</button>`}</div>`;
+  };
+  const t = r.tools;
+  $('readersBox').innerHTML = `<div class="plat-head"><b>Readers</b><button data-readersrefresh>Refresh</button></div>
+    <div class="muted" style="font-size:12px">For folders in context: what reads images, scans and recordings, and what finds passages by meaning. Ones on this computer are free and private; API ones use your API credit.</div>
+    <h4>Images and scanned pages</h4><div class="lm">${sel('vision', r.vision)}</div>
+    ${r.vision.length ? '' : `<div class="muted" style="font-size:12px">Download <b>${esc(r.suggested.vision)}</b> in Ollama above (it reads images), or save an API key for Claude, GPT, Gemini or Grok.</div>`}
+    <h4>Audio and video</h4><div class="lm">${sel('transcribe', r.transcribe)}</div>
+    ${dl('whisper', t.whisper, 'whisper.cpp (speech to text on this computer)')}
+    ${dl('whisper-model', t.whisper_model, 'its speech model')}
+    ${dl('ffmpeg', t.ffmpeg, 'ffmpeg (reads video and other audio formats)')}
+    <h4>Meaning search</h4><div class="lm">${sel('embed', r.embed)}</div>
+    <div class="muted" style="font-size:12px">Finds passages that mean the same thing in other words. ${r.embed.length ? '' : `Download <b>${esc(r.suggested.embed)}</b> in Ollama above (270 MB), then Refresh.`}</div>`;
+  for (const job of ['vision', 'transcribe', 'embed']) {
+    const s_ = $('readersBox').querySelector(`[data-reader="${job}"]`);
+    if (s_) s_.value = [...s_.options].some(o => o.value === r.config[job]) ? r.config[job] : (job === 'embed' ? '' : 'auto');
+  }
+  if (Object.values(r.downloads).some(d => !d.done)) state.readersPoll = setTimeout(loadReaders, 1000);
+}
+$('readersBox').onchange = async e => {
+  const job = e.target.dataset.reader; if (!job) return;
+  try { await api('/api/readers', {method: 'PUT', body: {[job]: e.target.value}}); notice(job === 'embed' && e.target.value ? 'Meaning search on - folders are being read again' : 'Saved'); }
+  catch (err) { alert(err.message); }
+};
+$('readersBox').onclick = async e => {
+  if (e.target.hasAttribute('data-readersrefresh')) return loadReaders();
+  const what = e.target.dataset.download; if (!what) return;
+  try { await api('/api/readers/download', {method: 'POST', body: {what}}); loadReaders(); } catch (err) { alert(err.message); }
 };
 
 /* In-browser models: the PRISM server hands their turns to this page, which runs them. */

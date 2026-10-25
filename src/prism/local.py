@@ -12,13 +12,16 @@ models have small context windows, so the history is trimmed to fit (newest kept
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 
@@ -142,6 +145,77 @@ def start_pull(model: str) -> None:
     task = asyncio.create_task(run())
     _pull_tasks.add(task)
     task.add_done_callback(_pull_tasks.discard)
+
+
+# --- a model file already on this computer (.gguf) -------------------------------------------
+
+def gguf_model_name(path: str) -> str:
+    """Ollama's name for an imported file: the file name, in the characters Ollama allows."""
+    stem = Path(path).stem.lower()
+    return re.sub(r"[^a-z0-9._-]+", "-", stem).strip("-._")[:60] or "imported"
+
+
+def start_import(path: str) -> str:
+    """Hand a downloaded .gguf (DeepSeek, Qwen, Llama…) to Ollama: its bytes go into Ollama's
+    store and it becomes a model there. Progress shows under the model's name in pulls()."""
+    file = Path(path.strip().strip('"'))
+    if file.suffix.lower() != ".gguf":
+        raise ProviderError("Point at a .gguf file - the format Ollama and LM Studio load "
+                            "(on Hugging Face, look for a GGUF version of the model)")
+    if not file.is_file():
+        raise ProviderError(f"No file at {path}")
+    model = gguf_model_name(str(file))
+    if model in _pulls and not _pulls[model].get("done"):
+        return model
+    size = file.stat().st_size
+    _pulls[model] = p = {"status": "checking the file", "completed": 0, "total": size,
+                         "error": None, "done": False}
+
+    async def run() -> None:
+        base = RUNTIMES["ollama"]["url"]
+        try:
+            def digest() -> str:
+                h = hashlib.sha256()
+                with open(file, "rb") as f:
+                    while block := f.read(1 << 20):
+                        h.update(block)
+                        p["completed"] = f.tell()
+                return "sha256:" + h.hexdigest()
+            dig = await asyncio.to_thread(digest)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30, read=None, write=None)) as http:
+                if (await http.head(f"{base}/api/blobs/{dig}")).status_code != 200:
+                    p.update(status="copying into Ollama", completed=0)
+
+                    async def body():
+                        with open(file, "rb") as f:
+                            while block := await asyncio.to_thread(f.read, 1 << 20):
+                                p["completed"] += len(block)
+                                yield block
+                    r = await http.post(f"{base}/api/blobs/{dig}", content=body())
+                    if r.status_code not in (200, 201):
+                        raise ProviderError(f"Ollama answered {r.status_code}: {r.text[:200]}")
+                p["status"] = "creating the model"
+                async with http.stream("POST", f"{base}/api/create", json={
+                        "model": model, "files": {file.name: dig}, "stream": True}) as r:
+                    if r.status_code != 200:
+                        raise ProviderError(f"Ollama answered {r.status_code}: {(await r.aread())[:200]!r}")
+                    async for line in r.aiter_lines():
+                        if line.strip():
+                            ev = json.loads(line)
+                            if ev.get("error"):
+                                raise ProviderError(ev["error"])
+                            p["status"] = ev.get("status", p["status"])
+        except httpx.ConnectError:
+            p["error"] = "Ollama isn't running - start it, then try again"
+        except Exception as e:
+            p["error"] = str(e) or type(e).__name__
+        finally:
+            p["done"] = True
+
+    task = asyncio.create_task(run())
+    _pull_tasks.add(task)
+    task.add_done_callback(_pull_tasks.discard)
+    return model
 
 
 # --- talking to a local model ----------------------------------------------------------------

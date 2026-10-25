@@ -57,6 +57,24 @@ marked *always* are sent with every message instead of only when named.
 A round takes as long as its slowest model plus the moderator: seconds over APIs, 1-2 minutes
 with web platforms.
 
+**Folders and web pages - your documents as context**
+
+In the Context panel, **Add a folder or web pages** gives a folder (or a list of URLs) a
+`#name`. PRISM reads it in the background - PDF, Word, PowerPoint, Excel, OpenDocument, EPUB,
+text, Markdown, code, CSV/JSON, HTML, notebooks, email (`.eml`, `.mbox`) and zip exports
+(Notion, Takeout) - and checks for changes every few minutes while it is used. Each message
+that names it (or every message, if marked *always*) gets the passages that best match, with
+file and page; the best-matching PDFs and images are also uploaded to web-app bots (once per
+chat). Bots search further with `ASK @docs: <keywords>`.
+
+Images, scanned PDFs, audio and video are found by name; with a **reader** (Settings →
+Readers) PRISM also reads them: a vision model copies out the text in images and scans and
+says what they show (Ollama, LM Studio, or an API key), and recordings are transcribed
+(whisper.cpp + ffmpeg - one-click download on Windows, `brew install whisper-cpp ffmpeg` on a
+Mac - or the OpenAI / Gemini API). **Meaning search** with an embedding model from Ollama or
+LM Studio (e.g. `nomic-embed-text`) finds passages worded differently from the question;
+without one, search is by words (BM25), which needs nothing installed.
+
 ## Connecting platforms
 
 Each platform connects one of two ways (Settings):
@@ -127,6 +145,10 @@ src/prism/
   __main__.py      launcher: starts the server, opens the UI
   app.py           FastAPI: vault, credentials, chats, context, browser connect/check
   meeting.py       the room: bookmarks, formats as scripts, sessions, moderator
+  library.py       folders / web pages: scanning, passages, search (#name, ASK @docs)
+  readers.py       files of every kind to text
+  enrich.py        reader models: images and scans, transcription, embeddings
+  local.py         Ollama / LM Studio / in-browser models, .gguf import
   db.py            SQLite store + migrations
   crypto.py        master-password vault
   providers/       API adapters (Anthropic, OpenAI-compatible, Gemini)

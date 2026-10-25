@@ -1,4 +1,5 @@
-"""SQLite store: vault meta, encrypted credentials, mother/daughter chats, messages, context."""
+"""SQLite store: vault meta, encrypted credentials, mother/daughter chats, messages, context,
+and the library (folders and web pages indexed for search)."""
 
 import json
 import re
@@ -56,6 +57,37 @@ CREATE TABLE IF NOT EXISTS context_items (
     content    TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+-- The library: a folder or a list of web pages, read into passages for search. A source is
+-- used through the context item that points at it (#name).
+CREATE TABLE IF NOT EXISTS library_sources (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT NOT NULL,             -- folder | web
+    location   TEXT NOT NULL,             -- the folder, or URLs one per line
+    options    TEXT NOT NULL DEFAULT '{}',
+    version    INTEGER NOT NULL DEFAULT 0, -- bumped whenever its passages change
+    scanned_at REAL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS library_files (
+    id        INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES library_sources(id) ON DELETE CASCADE,
+    path      TEXT NOT NULL,              -- relative to the folder, or the URL
+    local     TEXT,                       -- the file on this computer (web pages: a saved copy)
+    kind      TEXT NOT NULL,              -- text | pdf | image | audio | video | ...
+    mtime     REAL, size INTEGER,
+    note      TEXT,                       -- why it was not (fully) read
+    needs     TEXT,                       -- vision | transcribe: a reader could add more
+    enriched  TEXT,                       -- that reader's result: "done by X" or an error
+    UNIQUE (source_id, path)
+);
+CREATE TABLE IF NOT EXISTS library_chunks (
+    id      INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES library_files(id) ON DELETE CASCADE,
+    page    INTEGER,                      -- PDF page / slide / sheet, when there is one
+    text    TEXT NOT NULL,
+    vec     BLOB                          -- meaning-search embedding (float32), when made
+);
+CREATE INDEX IF NOT EXISTS library_chunks_file ON library_chunks (file_id);
 """
 
 
@@ -75,6 +107,10 @@ MIGRATIONS = [
     ALTER TABLE context_items ADD COLUMN name TEXT;
     ALTER TABLE context_items ADD COLUMN always INTEGER NOT NULL DEFAULT 0;
     UPDATE context_items SET always = 1;
+    """,
+    # v4: a context item can be a library source (folder / web pages), searched per message.
+    """
+    ALTER TABLE context_items ADD COLUMN library INTEGER REFERENCES library_sources(id) ON DELETE CASCADE;
     """,
 ]
 
@@ -277,19 +313,21 @@ class Store:
     # --- context store --------------------------------------------------------------
 
     def add_context(self, chat_id: int | None, title: str, content: str,
-                    name: str | None = None, always: bool = False) -> int:
+                    name: str | None = None, always: bool = False, library: int | None = None) -> int:
         """Write named context: a #name already in that scope (this chat, or global) is
         replaced, so writing the same name again updates it."""
         name = context_name(name or title)
         existing = self._q("SELECT id FROM context_items WHERE name = ? AND chat_id IS ?",
                            (name, chat_id))
         if existing:
-            self._q("UPDATE context_items SET title = ?, content = ?, always = ?, created_at = ?"
-                    " WHERE id = ?", (title, content, int(always), time.time(), existing[0]["id"]))
+            self._q("UPDATE context_items SET title = ?, content = ?, always = ?, library = ?,"
+                    " created_at = ? WHERE id = ?",
+                    (title, content, int(always), library, time.time(), existing[0]["id"]))
             return existing[0]["id"]
         return self._insert(
-            "INSERT INTO context_items (chat_id, title, content, name, always, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)", (chat_id, title, content, name, int(always), time.time()))
+            "INSERT INTO context_items (chat_id, title, content, name, always, library, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, title, content, name, int(always), library, time.time()))
 
     def context_for(self, chat_id: int) -> list[dict]:
         """Global items first, then this chat's items."""
@@ -304,4 +342,108 @@ class Store:
         return items[-1] if items else None
 
     def delete_context(self, item_id: int) -> None:
+        """A library item takes its index with it."""
+        rows = self._q("SELECT library FROM context_items WHERE id = ?", (item_id,))
         self._q("DELETE FROM context_items WHERE id = ?", (item_id,))
+        if rows and rows[0]["library"]:
+            self._q("DELETE FROM library_sources WHERE id = ?", (rows[0]["library"],))
+
+    def set_context_content(self, library: int, content: str) -> None:
+        self._q("UPDATE context_items SET content = ? WHERE library = ?", (content, library))
+
+    # --- library ------------------------------------------------------------------------
+
+    def add_source(self, kind: str, location: str, options: dict) -> int:
+        return self._insert("INSERT INTO library_sources (kind, location, options, created_at)"
+                            " VALUES (?, ?, ?, ?)", (kind, location, json.dumps(options), time.time()))
+
+    def get_source(self, source_id: int) -> dict | None:
+        rows = self._q("SELECT * FROM library_sources WHERE id = ?", (source_id,))
+        return {**dict(rows[0]), "options": json.loads(rows[0]["options"])} if rows else None
+
+    def update_source(self, source_id: int, **fields) -> None:
+        if "options" in fields:
+            fields["options"] = json.dumps(fields["options"])
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._q(f"UPDATE library_sources SET {sets} WHERE id = ?", (*fields.values(), source_id))
+
+    def bump_source(self, source_id: int) -> None:
+        self._q("UPDATE library_sources SET version = version + 1 WHERE id = ?", (source_id,))
+
+    def library_files(self, source_id: int) -> list[dict]:
+        return [dict(r) for r in self._q("SELECT * FROM library_files WHERE source_id = ? ORDER BY path",
+                                          (source_id,))]
+
+    def library_file(self, file_id: int) -> dict | None:
+        rows = self._q("SELECT * FROM library_files WHERE id = ?", (file_id,))
+        return dict(rows[0]) if rows else None
+
+    def put_library_file(self, source_id: int, path: str, chunks: list[tuple[int | None, str]],
+                         **fields) -> int:
+        """Write a file and its passages in one go, replacing what was there."""
+        with self._lock:
+            c = self._conn
+            row = c.execute("SELECT id FROM library_files WHERE source_id = ? AND path = ?",
+                            (source_id, path)).fetchone()
+            cols = ["local", "kind", "mtime", "size", "note", "needs", "enriched"]
+            vals = [fields.get(k) for k in cols]
+            if row:
+                file_id = row["id"]
+                c.execute(f"UPDATE library_files SET {', '.join(k + ' = ?' for k in cols)} WHERE id = ?",
+                          (*vals, file_id))
+                c.execute("DELETE FROM library_chunks WHERE file_id = ?", (file_id,))
+            else:
+                file_id = c.execute(
+                    f"INSERT INTO library_files (source_id, path, {', '.join(cols)})"
+                    f" VALUES (?, ?, {', '.join('?' * len(cols))})", (source_id, path, *vals)).lastrowid
+            c.executemany("INSERT INTO library_chunks (file_id, page, text) VALUES (?, ?, ?)",
+                          [(file_id, page, text) for page, text in chunks])
+            c.commit()
+            return file_id
+
+    def set_enriched(self, file_id: int, enriched: str, chunks: list[tuple[int | None, str]] = ()) -> None:
+        """A reader's result: its passages join the file's."""
+        with self._lock:
+            self._conn.execute("UPDATE library_files SET enriched = ? WHERE id = ?", (enriched, file_id))
+            self._conn.executemany("INSERT INTO library_chunks (file_id, page, text) VALUES (?, ?, ?)",
+                                   [(file_id, page, text) for page, text in chunks])
+            self._conn.commit()
+
+    def delete_library_files(self, file_ids: list[int]) -> None:
+        with self._lock:
+            self._conn.executemany("DELETE FROM library_files WHERE id = ?", [(i,) for i in file_ids])
+            self._conn.commit()
+
+    def library_chunks(self, source_id: int) -> list[sqlite3.Row]:
+        return self._q("SELECT c.id, c.file_id, c.page, c.text, c.vec, f.path, f.local, f.kind"
+                       " FROM library_chunks c JOIN library_files f ON f.id = c.file_id"
+                       " WHERE f.source_id = ? ORDER BY c.id", (source_id,))
+
+    def chunks_without_vec(self, source_id: int, limit: int = 64) -> list[sqlite3.Row]:
+        return self._q("SELECT c.id, c.text, f.path FROM library_chunks c"
+                       " JOIN library_files f ON f.id = c.file_id"
+                       " WHERE f.source_id = ? AND c.vec IS NULL ORDER BY c.id LIMIT ?", (source_id, limit))
+
+    def set_vecs(self, pairs: list[tuple[int, bytes]]) -> None:
+        with self._lock:
+            self._conn.executemany("UPDATE library_chunks SET vec = ? WHERE id = ?",
+                                   [(v, i) for i, v in pairs])
+            self._conn.commit()
+
+    def clear_vecs(self) -> None:
+        self._q("UPDATE library_chunks SET vec = NULL")
+
+    def library_problems(self, source_id: int, limit: int = 30) -> list[dict]:
+        """Files not (fully) read: why, for the Context panel."""
+        return [{"path": r["path"], "note": r["note"] or r["enriched"]} for r in self._q(
+            "SELECT path, note, enriched FROM library_files WHERE source_id = ? AND (note IS NOT NULL"
+            " OR enriched LIKE 'failed%') ORDER BY path LIMIT ?", (source_id, limit))]
+
+    def library_counts(self, source_id: int) -> dict:
+        r = self._q("SELECT COUNT(*) AS files, SUM(note IS NOT NULL) AS skipped,"
+                    " SUM(needs IS NOT NULL AND enriched IS NULL) AS waiting FROM library_files"
+                    " WHERE source_id = ?", (source_id,))[0]
+        c = self._q("SELECT COUNT(*) AS chunks, SUM(c.vec IS NOT NULL) AS vecs FROM library_chunks c"
+                    " JOIN library_files f ON f.id = c.file_id WHERE f.source_id = ?", (source_id,))[0]
+        return {"files": r["files"], "skipped": r["skipped"] or 0, "waiting": r["waiting"] or 0,
+                "chunks": c["chunks"], "vecs": c["vecs"] or 0}
