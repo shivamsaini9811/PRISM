@@ -26,7 +26,7 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import catalog, enrich, flows, local, readers
+from . import catalog, enrich, flows, kg as kg_mod, local, readers
 from .library import Library, attachable, passages_text
 from . import runner as runner_mod
 from .providers import PLATFORMS, Provider, build_provider, wait_reply
@@ -286,7 +286,7 @@ class CredentialIn(BaseModel):
 # running inside the PRISM page. Each is a room member under a name the user picks.
 LOCAL_TRANSPORTS = ("local", "webgpu")
 LOCAL_NAME = re.compile(r"^[a-z][a-z0-9-]{1,23}$")
-RESERVED = {"all", "any", "everyone", "moderator", "mod", "mother", "prism", "docs", "context",
+RESERVED = {"all", "any", "everyone", "moderator", "mod", "mother", "prism", "docs", "kg", "context",
             "user", "you"}
 
 
@@ -916,6 +916,8 @@ async def attach_context(chat_id: int, text: str, always: list[dict] = (),
     s, entries = store(), []
     names = list(dict.fromkeys(context_name(n) for n in CONTEXT_REF.findall(text)))
     items = {n: s.find_context(chat_id, n) for n in names}
+    if KG_NAME in items and not items[KG_NAME]:  # #kg: the knowledge graph, not a saved item
+        items[KG_NAME] = {"name": KG_NAME, "kg": True}
     for name in names:  # check all before storing any
         if not items[name]:
             known = ", ".join(f"#{c['name']}" for c in s.context_for(chat_id)) or "none yet"
@@ -925,6 +927,11 @@ async def attach_context(chat_id: int, text: str, always: list[dict] = (),
     for name, item in items.items():
         if item.get("library"):
             entry, meta = await library_entry(chat_id, item, text, opens_files)
+        elif item.get("kg"):
+            found = kg().mentioned(CONTEXT_REF.sub(" ", text)) or kg().mentioned(library_query(chat_id, text))
+            body = kg().describe(found) if found else "(the knowledge graph has nothing yet about what this message names)"
+            entry = Entry("context", "context", f"#kg: what the user's knowledge graph says about what this message names\n{body}")
+            meta = {"kind": "context", "name": KG_NAME, "speaker": "context", "entities": [e["id"] for e in found]}
         else:
             entry = Entry("context", "context", f"#{name}: {item['title']}\n{item['content']}")
             meta = {"kind": "context", "name": name, "speaker": "context"}
@@ -1107,11 +1114,14 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
             return search_history(question, chat_id)
         if platform == DOCS_BOT:
             return await search_docs(question, chat_id)
+        if platform == KG_NAME:
+            return kg().answer(question)
         return await make_provider(creds[platform], fresh=True).complete(
             [{"role": "user", "content": ASK_PROMPT.format(question=question)}])
 
     # Memory lives in the signed-in web apps; API models remember nothing between calls.
     askable = ([PRISM_BOT] + ([DOCS_BOT] if any(c.get("library") for c in s.context_for(chat_id)) else [])
+               + ([KG_NAME] if kg().counts()["entities"] else [])
                + [p for p, c in creds.items() if c["transport"] == "browser"])
     async def run(who: str, req: runner_mod.Request) -> runner_mod.Request:
         return await runner().request(req, chat_id, *run_cards(chat_id))
@@ -1147,6 +1157,10 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
                     maybe_update_profile()
                 except Exception:
                     log.exception("could not start the profile update")
+                try:
+                    maybe_update_kg(chat_id)
+                except Exception:
+                    log.exception("could not start the knowledge graph update")
                 await start_next_queued(chat_id)
 
     _session_tasks[chat_id] = asyncio.create_task(run())
@@ -1340,9 +1354,9 @@ def put_agent(name: str, body: AgentIn) -> dict:
                                  "not a platform's or a room member's name")
     if agent_platform({"model": body.model}) not in platforms:
         raise HTTPException(400, f"No room member {body.model} - set it up in Settings first")
-    bad = [t for t in body.tools if t not in ("ask", "docs", "prism", "run")]
+    bad = [t for t in body.tools if t not in ("ask", "docs", "prism", "kg", "run")]
     if bad:
-        raise HTTPException(400, f"Unknown tools {bad} - use ask, docs, prism, run")
+        raise HTTPException(400, f"Unknown tools {bad} - use ask, docs, prism, kg, run")
     spec = body.model_dump()
     spec["model"] = "@" + agent_platform(spec)
     spec["context"] = [context_name(c.lstrip("#")) for c in body.context if c.strip("# ")]
@@ -1502,12 +1516,14 @@ class AppRunEnv(flows.RunEnv):
 
     def askable(self, agent: dict) -> list[str]:
         tools = agent.get("tools") or []
-        out = [t for t in ("docs", "prism") if t in tools or "ask" in tools]
+        out = [t for t in ("docs", "prism", "kg") if t in tools or "ask" in tools]
         if "ask" in tools:
             out += [p for p, c in self._creds().items() if c["transport"] == "browser"]
         return out
 
     async def ask(self, target: str, question: str) -> str:
+        if target == KG_NAME:
+            return kg().answer(question)
         if target == PRISM_BOT:
             return search_history(question, self.chat_id)
         if target == DOCS_BOT:
@@ -1516,6 +1532,13 @@ class AppRunEnv(flows.RunEnv):
             [{"role": "user", "content": ASK_PROMPT.format(question=question)}])
 
     async def tool(self, name: str, query: str) -> str:
+        if name == "kg":
+            return kg().answer(query)
+        if name == "kg-write":
+            r = store().get_run(self.run_id)
+            counts = await extract_into_kg([(query, {"run": self.run_id, "chat": self.chat_id,
+                                                     "where": f"flow {r['flow'] if r else ''}"})])
+            return f"Added to the knowledge graph: {counts['entities']} things, {counts['links']} links."
         if name == "docs":
             return await search_docs(query, self.chat_id)
         if name == "prism":
@@ -1981,3 +2004,232 @@ def remove_entry(name: str) -> dict:
         catalog.remove(have.pop(name), uninstall_python=sandbox().uninstall)
         store().set_meta("installed", json.dumps(have))
     return catalog_view()
+
+
+# --- knowledge graph ---------------------------------------------------------------------------
+
+KG_NAME = "kg"
+KG_EVERY = 3            # new things said in a chat before an automatic update
+KG_FILES = 40           # files of a folder read per update
+_kg_job: dict = {"running": False}
+_kg_tasks: set[asyncio.Task] = set()
+
+
+@lru_cache
+def kg() -> kg_mod.Graph:
+    return kg_mod.Graph(store())
+
+
+def kg_settings() -> dict:
+    return {"mode": store().get_meta("kg_mode") or "manual", "model": store().get_meta("kg_model") or "auto"}
+
+
+def kg_provider() -> Provider:
+    """Decision 6: a local model when one is set up (free, private), else the primary."""
+    creds = {c["platform"]: c for c in store().enabled_credentials(vault())}
+    choice = kg_settings()["model"]
+    if choice != "auto":
+        cred = creds.get(choice)
+    else:
+        cred = next((c for c in creds.values() if c["transport"] == "local"), None) \
+            or creds.get(store().get_meta("primary_platform") or "")
+    if not cred:
+        raise HTTPException(400, "No model to read with - set up a local model or pick a primary LLM")
+    return make_provider(cred, fresh=True)
+
+
+async def extract_into_kg(items: list[tuple[str, dict]], progress: dict | None = None) -> dict:
+    """Each (material, evidence): a model lists the things and links in it; they are added."""
+    provider = kg_provider()
+    total = {"entities": 0, "links": 0, "failed": 0}
+    for text, evidence in items:
+        prompt = kg_mod.EXTRACT_PROMPT.format(types=", ".join(kg_mod.TYPES), where=evidence.get("where", ""),
+                                              text=text[-kg_mod.MAX_MATERIAL:])
+        msgs = [{"role": "user", "content": prompt}]
+        result = None
+        for _ in range(2):
+            reply = await wait_reply(provider.complete(list(msgs)), provider,
+                                     settings().request_timeout_s, settings().reply_max_s)
+            try:
+                result = kg_mod.parse_extraction(reply)
+                break
+            except kg_mod.ExtractError as e:
+                msgs += [{"role": "assistant", "content": reply},
+                         {"role": "user", "content": f"That wasn't usable ({e}). Reply with only the ```json block."}]
+        if result is None:
+            total["failed"] += 1
+        else:
+            got = kg().add(result, evidence)
+            total["entities"] += got["entities"]
+            total["links"] += got["links"]
+        if progress is not None:
+            progress["done"] = progress.get("done", 0) + 1
+    return total
+
+
+def chat_material(chat_id: int, after: int = 0) -> list[tuple[str, dict]]:
+    """A chat as material for the graph: what was said, in pieces of up to ~20k characters."""
+    chat = store().get_chat(chat_id) or {"title": ""}
+    pieces, buf, last = [], [], 0
+    for m in store().thread(chat_id):
+        meta = m["meta"] or {}
+        if m["id"] <= after or not m["content"] or meta.get("kind") not in ("topic", "user", "speaker", "final", "summary", "step"):
+            continue
+        who = "the user" if m["role"] == "user" else meta.get("speaker") or "a bot"
+        buf.append(f"[{who}] {m['content'][:6000]}")
+        last = m["id"]
+        if sum(len(x) for x in buf) > 20_000:
+            pieces.append(("\n\n".join(buf), last))
+            buf = []
+    if buf:
+        pieces.append(("\n\n".join(buf), last))
+    where = f'chat "{chat["title"][:60]}"'
+    return [(text, {"chat": chat_id, "message": mid, "where": where}) for text, mid in pieces]
+
+
+def folder_material(source_id: int) -> list[tuple[str, dict]]:
+    by_file: dict[str, list[str]] = {}
+    for r in store().library_chunks(source_id):
+        if len(by_file) >= KG_FILES and r["path"] not in by_file:
+            continue
+        by_file.setdefault(r["path"], []).append(r["text"])
+    return [("\n".join(parts)[:8000], {"source": source_id, "file": path, "where": f"file {path}"})
+            for path, parts in by_file.items() if sum(len(p) for p in parts) > 80]
+
+
+def start_kg_job(label: str, items: list[tuple[str, dict]], after=None) -> bool:
+    if _kg_job.get("running"):
+        return False
+    if not items:
+        return False
+    _kg_job.clear()
+    _kg_job.update(running=True, label=label, done=0, total=len(items), error=None, started=time.time())
+
+    async def go() -> None:
+        try:
+            got = await extract_into_kg(items, _kg_job)
+            _kg_job["result"] = got
+            if after:
+                after()
+        except Exception as e:
+            log.warning("knowledge graph update failed: %s", e)
+            _kg_job["error"] = getattr(e, "detail", None) or str(e) or type(e).__name__
+        finally:
+            _kg_job["running"] = False
+
+    task = asyncio.create_task(go())
+    _kg_tasks.add(task)
+    task.add_done_callback(_kg_tasks.discard)
+    return True
+
+
+def maybe_update_kg(chat_id: int) -> bool:
+    """Automatic mode: after a meeting with enough new in it, read it into the graph."""
+    if kg_settings()["mode"] != "auto":
+        return False
+    seen = int(store().get_meta(f"kg_seen:{chat_id}") or 0)
+    items = chat_material(chat_id, after=seen)
+    said = sum(1 for m in store().thread(chat_id) if m["id"] > seen and (m["meta"] or {}).get("kind") in ("topic", "user"))
+    if said < KG_EVERY:
+        return False
+    last = max((ev["message"] for _, ev in items), default=seen)
+    try:
+        kg_provider()
+    except HTTPException:
+        return False
+    return start_kg_job(f"chat {chat_id}", items, after=lambda: store().set_meta(f"kg_seen:{chat_id}", str(last)))
+
+
+@app.get("/api/kg")
+def kg_list(q: str = "") -> dict:
+    creds = [c for c in store().list_credentials() if c["enabled"]]
+    counts = kg().counts()
+    return {"total": counts["entities"], "links": counts["links"], "entities": kg().search(q), **kg_settings(), "job": dict(_kg_job),
+            "models": [c["platform"] for c in creds], "types": list(kg_mod.TYPES)}
+
+
+@app.get("/api/kg/{entity_id}")
+def kg_entity(entity_id: int) -> dict:
+    e = kg().get(entity_id)
+    if not e:
+        raise HTTPException(404, "Not in the knowledge graph")
+    chats = {c["id"]: c["title"] for c in store().list_chats()}
+    links = kg().links_of(entity_id)
+    for l in links:
+        for ev in l["evidence"]:
+            if ev.get("chat") in chats:
+                ev["chat_title"] = chats[ev["chat"]]
+    return {**e, "links": links}
+
+
+class KgEditIn(BaseModel):
+    name: str | None = None
+    type: str | None = None
+    summary: str | None = None
+    merge_into: int | None = None
+
+
+@app.put("/api/kg/{entity_id}")
+def kg_edit(entity_id: int, body: KgEditIn) -> dict:
+    if body.merge_into:
+        kg().merge(entity_id, body.merge_into)
+        return kg_entity(body.merge_into)
+    kg().edit(entity_id, body.name, body.type, body.summary)
+    e = kg().get(entity_id) or kg().find(body.name or "")
+    return kg_entity(e["id"]) if e else {"deleted": True}
+
+
+@app.delete("/api/kg/{entity_id}")
+def kg_delete(entity_id: int) -> dict:
+    kg().delete_entity(entity_id)
+    return {"ok": True}
+
+
+@app.delete("/api/kg/links/{link_id}")
+def kg_delete_link(link_id: int) -> dict:
+    kg().delete_link(link_id)
+    return {"ok": True}
+
+
+class KgExtractIn(BaseModel):
+    chat_id: int | None = None
+    source_id: int | None = None
+    text: str | None = None
+
+
+@app.post("/api/kg/extract")
+async def kg_extract(body: KgExtractIn) -> dict:
+    """Read a chat, a folder or a piece of text into the graph now (in the background)."""
+    vault()
+    kg_provider()  # fails early when there is no model to read with
+    if body.chat_id:
+        seen = int(store().get_meta(f"kg_seen:{body.chat_id}") or 0)
+        items = chat_material(body.chat_id)
+        last = max((ev["message"] for _, ev in items), default=seen)
+        started = start_kg_job(f"chat {body.chat_id}", items,
+                               after=lambda: store().set_meta(f"kg_seen:{body.chat_id}", str(last)))
+    elif body.source_id:
+        started = start_kg_job(f"folder {body.source_id}", folder_material(body.source_id))
+    elif body.text:
+        started = start_kg_job("text", [(body.text, {"where": "added by you"})])
+    else:
+        raise HTTPException(400, "What to read: chat_id, source_id or text")
+    if not started:
+        raise HTTPException(409, "Already reading something into the graph - or nothing to read")
+    return kg_list()
+
+
+class KgSettingsIn(BaseModel):
+    mode: str | None = None    # manual | auto
+    model: str | None = None   # auto | a room member
+
+
+@app.put("/api/kg-settings")
+def kg_put_settings(body: KgSettingsIn) -> dict:
+    if body.mode is not None:
+        if body.mode not in ("manual", "auto"):
+            raise HTTPException(400, "mode is manual or auto")
+        store().set_meta("kg_mode", body.mode)
+    if body.model is not None:
+        store().set_meta("kg_model", body.model)
+    return kg_list()

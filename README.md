@@ -94,6 +94,17 @@ Research has started…", reloads a page that stops updating (Gemini), and bring
 full report: from Claude's document panel, ChatGPT's report frame, Gemini's report panel.
 Checked against all four sites on 2026-10-25: 1 min (Grok) to 37 min (Gemini).
 
+**Knowledge graph** (Knowledge, in the sidebar): the things in your work - people,
+organisations, projects, decisions, documents, places, dates - and how they connect, read out
+of your chats ("Read this chat in now", or automatically after each chat), folders ("Add to
+knowledge graph" on a folder in Context) and flows (`tool: kg` with `text:` adds, with
+`query:` reads). A model lists the things and links as JSON - a local model when you have
+one, else the primary (or the one you pick) - and names that mean the same thing are merged.
+Every link keeps where it came from (the chat, with a quote; the file; the flow), shown on
+the Knowledge screen, where you can search, rename, merge, change, and delete. `#kg` in a
+message gives the room what is known about what the message names; bots look things up with
+`ASK @kg`.
+
 **Running Python**: a bot (or a flow agent with the *run Python* tool) can end its reply with
 `RUN @python` and a code block. The chat shows a card with the exact code and folder: **Run
 once**, **Always allow Python in this chat**, **Always allow Python**, or **Don't run**. The
@@ -233,6 +244,7 @@ src/prism/
   enrich.py        reader models: images and scans, transcription, embeddings
   local.py         Ollama / LM Studio / OpenAI-compatible servers / in-browser models, .gguf import
   runner.py        RUN @python: approval, the Python sandbox and pip, work folders
+  kg.py            the knowledge graph: extraction, merging names, evidence, #kg / ASK @kg
   catalog.py       the signed catalog: verify, install Python packages and models
   publish.py       prism-publish: keys, checksums, signing
   db.py            SQLite store + migrations

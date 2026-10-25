@@ -213,6 +213,7 @@
     <div id="chats"></div>
     <div class="side-foot">
       <button id="openFlows" title="Agents and flows: steps that run on their own">Flows</button>
+      <button id="openKg" title="The knowledge graph: people, projects, decisions and how they connect">Knowledge</button>
       <button id="openSettings">Settings</button>
       <button id="lockBtn">Lock</button>
       <button id="quitBtn" title="Stop PRISM and its browser">Quit</button>
@@ -263,7 +264,7 @@
     </form>
     <div id="help" class="muted hidden"><b>@claude</b> asks one · <b>@claude @gpt</b> asks several · <b>@all</b> or no @ asks everyone switched on · <b>@moderator</b> sums up ·
       <b>#name</b> attaches saved context · <b>/save #name</b> [text] saves the last answer (or the text) · <b>/save-global #name</b> · <b>/forget #name</b><br>
-      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats; <b>ASK @docs</b> searches the folders in context) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
+      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats; <b>ASK @docs</b> searches the folders in context; <b>#kg</b> / <b>ASK @kg</b>: the knowledge graph) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
   </main>
 
   <section id="ctx">
@@ -355,10 +356,28 @@
           <label><input type="checkbox" data-agtool="prism"> search past chats (ASK @prism)</label>
           <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label>
           <label title="It may ask to run Python on this computer - each run needs your approval"><input type="checkbox" data-agtool="run"> run Python</label>
+          <label><input type="checkbox" data-agtool="kg"> the knowledge graph (ASK @kg)</label>
           <label title="Web bots only: the site's Deep Research for each step (slow, uses your research allowance)"><input type="checkbox" id="agResearch"> deep research</label></div>
         <textarea id="agOutput" style="min-height:50px" placeholder="Fields PRISM reads from its reply, one per line, e.g.&#10;verdict: PASS|FIX&#10;notes: text"></textarea>
         <button class="primary">Save agent</button>
       </form>
+    </div>
+  </div>
+</div>
+
+<div class="overlay hidden" id="kgDlg">
+  <div class="modal wide flows">
+    <div class="plat-head"><h3>Knowledge</h3><span class="muted" id="kgCounts" style="margin-right:auto;margin-left:12px;font-size:12.5px"></span><button id="closeKg">Close</button></div>
+    <div class="muted" style="font-size:12.5px">The things in your work and how they connect, read from your chats, folders and flows - each link with where it came from. Write <b>#kg</b> in a message to give the room what is known about what you mention; bots look things up with <b>ASK @kg</b>.</div>
+    <div class="lm" style="flex-wrap:wrap;margin-top:6px">
+      <label class="muted" style="font-size:12.5px"><input type="checkbox" id="kgAuto"> read each chat in after it (automatic)</label>
+      <label class="muted" style="font-size:12.5px">read with <select id="kgModel"></select></label>
+      <button id="kgReadChat">Read this chat in now</button>
+      <span id="kgJob" class="muted" style="font-size:12.5px"></span>
+    </div>
+    <div class="flow-grid" style="margin-top:8px">
+      <div class="flow-list"><input id="kgSearch" placeholder="Search…" style="width:100%;margin-bottom:6px"><div id="kgList"></div></div>
+      <div id="kgDetail"><div class="muted">Pick something on the left.</div></div>
     </div>
   </div>
 </div>
@@ -629,7 +648,8 @@ function libHtml(st) {
   const problems = st.problems?.length ? `<details><summary>${st.problems.length} file${st.problems.length > 1 ? 's' : ''} not fully read</summary><ul>${
     st.problems.map(p => `<li>${esc(p.path)}: ${esc(p.note)}</li>`).join('')}</ul></details>` : '';
   return `${busy}${err}<div class="lib-opts">${opt('vision', 'read images')}${opt('transcribe', 'transcribe audio/video')}${opt('attach', 'send files')}</div>
-    ${problems}<div class="plat-actions"><button data-libscan="${st.id}" ${st.busy ? 'disabled' : ''}>${st.kind === 'web' ? 'Fetch again' : 'Check for changes'}</button></div>`;
+    ${problems}<div class="plat-actions"><button data-libscan="${st.id}" ${st.busy ? 'disabled' : ''}>${st.kind === 'web' ? 'Fetch again' : 'Check for changes'}</button>
+      <button data-libkg="${st.id}" title="A model reads its files (up to 40) for people, projects, decisions…">Add to knowledge graph</button></div>`;
 }
 function md(text) {  // just enough markdown for the analysis: ## headings and **bold**
   let html = '', ask = false;
@@ -1037,6 +1057,100 @@ $('runnerBox').onclick = async e => {
     return call('/api/runner/reset', {method: 'POST'}, 'Resetting…');
 };
 
+/* ---------- knowledge graph ---------- */
+const kgs = {current: null, data: null, timer: null, poll: null};
+async function openKg() {
+  await loadPlatforms();
+  $('kgDlg').classList.remove('hidden');
+  $('kgReadChat').disabled = !state.view;
+  await loadKg();
+}
+async function loadKg() {
+  clearTimeout(kgs.poll);
+  if ($('kgDlg').classList.contains('hidden')) return;
+  const d = kgs.data = await api('/api/kg?q=' + encodeURIComponent($('kgSearch').value.trim()));
+  $('kgCounts').textContent = `${d.total} things · ${d.links} links`;
+  $('kgAuto').checked = d.mode === 'auto';
+  $('kgModel').innerHTML = `<option value="auto">a local model if set up, else the primary</option>` + d.models.map(m => `<option value="${esc(m)}">@${esc(m)}</option>`).join('');
+  $('kgModel').value = d.models.includes(d.model) ? d.model : 'auto';
+  const j = d.job;
+  $('kgJob').innerHTML = j.running ? `reading ${esc(j.label)}: ${j.done}/${j.total}…` : j.error ? `<span class="err">${esc(j.error)}</span>`
+    : j.result ? `last read: ${j.result.entities} things, ${j.result.links} links${j.result.failed ? `, ${j.result.failed} pieces the model didn't answer usably` : ''}` : '';
+  $('kgList').innerHTML = d.entities.map(e => `<button type="button" data-kg="${e.id}" class="${e.id === kgs.current ? 'on' : ''}" title="${esc(e.summary)}">
+    ${esc(e.name)} <span class="muted" style="font-size:11px">${esc(e.type)} · ${e.links}</span></button>`).join('')
+    || '<div class="muted" style="font-size:12px">Nothing yet - read a chat or a folder in.</div>';
+  if (j.running) kgs.poll = setTimeout(loadKg, 1500);
+}
+function kgDrawing(e) {  // the thing in the middle, what it connects to around it
+  const others = [], seen = new Set();
+  for (const l of e.links) {
+    const out = l.src === e.id, id = out ? l.dst : l.src;
+    if (seen.has(id) || others.length >= 14) continue;
+    seen.add(id); others.push({id, name: out ? l.dst_name : l.src_name, rel: l.rel, out});
+  }
+  if (!others.length) return '';
+  const W = 640, H = 300, cx = W / 2, cy = H / 2, rx = 240, ry = 110;
+  const short = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;
+  let svg = `<svg viewBox="0 0 ${W} ${H}" width="${W}" role="img" aria-label="What ${esc(e.name)} connects to">`;
+  others.forEach((o, i) => {
+    const a = (i / others.length) * Math.PI * 2 - Math.PI / 2, x = cx + rx * Math.cos(a), y = cy + ry * Math.sin(a);
+    svg += `<line x1="${cx}" y1="${cy}" x2="${x}" y2="${y}" class="edge"/><text class="elabel" x="${(cx + x) / 2}" y="${(cy + y) / 2 - 3}" text-anchor="middle">${esc(short((o.out ? '' : '← ') + o.rel, 20))}</text>`
+      + `<g data-kg="${o.id}" style="cursor:pointer"><rect x="${x - 62}" y="${y - 14}" width="124" height="28" rx="8"/><text x="${x}" y="${y + 4}" text-anchor="middle" data-kg="${o.id}">${esc(short(o.name, 18))}</text></g>`;
+  });
+  return svg + `<g class="queued"><rect x="${cx - 80}" y="${cy - 17}" width="160" height="34" rx="9"/><text x="${cx}" y="${cy + 5}" text-anchor="middle" font-weight="600">${esc(short(e.name, 22))}</text></g></svg>`;
+}
+async function showKg(id) {
+  kgs.current = id;
+  let e;
+  try { e = await api(`/api/kg/${id}`); } catch (err) { $('kgDetail').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  const where = ev => ev.chat ? `<a href="#" data-kgchat="${ev.chat}">${esc(ev.chat_title || ev.where || 'a chat')}</a>`
+    : esc(ev.where || (ev.file ? 'file ' + ev.file : ev.run ? 'a flow' : ''));
+  const links = e.links.map(l => `<div class="lm" style="align-items:flex-start"><span>
+      <a href="#" data-kg="${l.src}">${esc(l.src_name)}</a> <b>${esc(l.rel)}</b> <a href="#" data-kg="${l.dst}">${esc(l.dst_name)}</a>
+      <br><span class="muted" style="font-size:12px">${l.evidence.map(ev => (ev.quote ? `"${esc(ev.quote)}" - ` : '') + where(ev)).join(' · ') || 'no source kept'}</span></span>
+      <button data-kgunlink="${l.id}" title="Remove this link">✕</button></div>`).join('') || '<div class="muted">No links.</div>';
+  const others = (kgs.data?.entities || []).filter(x => x.id !== e.id);
+  $('kgDetail').innerHTML = `<div style="display:grid;gap:6px">
+      <div class="lm"><input id="kgName" value="${esc(e.name)}" style="flex:1;font-weight:600"><select id="kgType">${kgs.data.types.map(t => `<option ${t === e.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+      <textarea id="kgSummary" style="min-height:44px" placeholder="What it is, in a line">${esc(e.summary)}</textarea>
+      ${e.aliases.length ? `<div class="muted" style="font-size:12.5px">Also called: ${esc(e.aliases.join(', '))}</div>` : ''}
+      <div class="plat-actions"><button class="primary" data-kgsave>Save</button>
+        <select id="kgMerge"><option value="">Same thing as…</option>${others.map(o => `<option value="${o.id}">${esc(o.name)}</option>`).join('')}</select>
+        <button data-kgmerge>Merge</button><button data-kgdelete>Delete</button></div>
+      <div class="graph">${kgDrawing(e)}</div>
+      <h4 style="margin:4px 0;font-size:13px">Links and where they came from</h4>${links}</div>`;
+  $('kgList').querySelectorAll('button').forEach(b => b.classList.toggle('on', +b.dataset.kg === id));
+}
+$('openKg').onclick = () => openKg().catch(err => alert(err.message));
+$('closeKg').onclick = () => $('kgDlg').classList.add('hidden');
+$('kgSearch').oninput = () => { clearTimeout(kgs.timer); kgs.timer = setTimeout(loadKg, 250); };
+$('kgAuto').onchange = async e => { await api('/api/kg-settings', {method: 'PUT', body: {mode: e.target.checked ? 'auto' : 'manual'}}); loadKg(); };
+$('kgModel').onchange = async e => { await api('/api/kg-settings', {method: 'PUT', body: {model: e.target.value}}); };
+$('kgReadChat').onclick = async () => {
+  if (!state.view) return;
+  try { await api('/api/kg/extract', {method: 'POST', body: {chat_id: state.view.chat.id}}); loadKg(); } catch (err) { alert(err.message); }
+};
+$('kgDlg').addEventListener('click', async e => {
+  const t = e.target, id = t.dataset.kg || t.closest('[data-kg]')?.dataset.kg;
+  if (t.dataset.kgchat) { e.preventDefault(); $('kgDlg').classList.add('hidden'); return openChat(+t.dataset.kgchat); }
+  if (id && !t.closest('#kgDetail .plat-actions')) { e.preventDefault(); return showKg(+id); }
+  const cur = kgs.current;
+  try {
+    if (t.hasAttribute('data-kgsave')) {
+      const r = await api(`/api/kg/${cur}`, {method: 'PUT', body: {name: $('kgName').value, type: $('kgType').value, summary: $('kgSummary').value}});
+      await loadKg(); return showKg(r.id ?? cur);
+    }
+    if (t.hasAttribute('data-kgmerge') && $('kgMerge').value) {
+      const into = +$('kgMerge').value;
+      await api(`/api/kg/${cur}`, {method: 'PUT', body: {merge_into: into}}); await loadKg(); return showKg(into);
+    }
+    if (t.hasAttribute('data-kgdelete') && confirm('Delete it and its links?')) {
+      await api(`/api/kg/${cur}`, {method: 'DELETE'}); kgs.current = null; $('kgDetail').innerHTML = ''; return loadKg();
+    }
+    if (t.dataset.kgunlink) { await api(`/api/kg/links/${t.dataset.kgunlink}`, {method: 'DELETE'}); await loadKg(); return showKg(cur); }
+  } catch (err) { alert(err.message); }
+});
+
 function renderMeetbar(show) {
   const v = state.view, live = v.meeting, def = v.meeting_defaults;
   $('meetbar').classList.toggle('hidden', !show);
@@ -1246,6 +1360,11 @@ $('ctxList').onchange = async e => {
   try { await api(`/api/library/${t.dataset.lib}`, {method: 'PUT', body: {[t.dataset.libopt]: t.checked}}); } catch (err) { alert(err.message); }
   openChat(state.view.chat.id);
 };
+$('ctxList').addEventListener('click', async e => {
+  const sid = e.target.dataset.libkg; if (!sid) return;
+  try { await api('/api/kg/extract', {method: 'POST', body: {source_id: +sid}}); notice('Reading it into the knowledge graph - see Knowledge'); }
+  catch (err) { alert(err.message); }
+});
 $('ctxList').onclick = async e => {
   if (e.target.dataset.libscan) {
     await api(`/api/library/${e.target.dataset.libscan}/scan?full=${e.shiftKey}`, {method: 'POST'});

@@ -294,3 +294,19 @@ inputs: [word]
     w = env.providers["w"]
     assert w.calls[0][0][-1]["content"].startswith("The count was 5") and "RUN @python" in w.calls[0][1]
     assert "[ran python" in w.calls[1][0][-1]["content"] and s.outputs["say"]["text"] == "It is 4."
+
+
+async def test_kg_steps_read_and_write():
+    f = parse("""
+name: k
+agents: {w: {model: "@gpt"}}
+nodes:
+  look: {tool: kg, query: "Priya"}
+  note: {agent: w, prompt: "Known: {{look.text}}"}
+  keep: {tool: kg, text: "{{note.text}}"}
+edges: [look -> note -> keep]
+""")
+    env = Env({"w": ["Priya leads design."]})
+    s = await Run.start(f, {}, env).run()
+    assert s.outputs["look"]["text"] == "kg found: Priya"
+    assert s.outputs["keep"]["text"] == "kg-write found: Priya leads design."

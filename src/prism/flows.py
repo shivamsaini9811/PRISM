@@ -42,7 +42,7 @@ from .meeting import _ask_request, _err
 from .providers import Provider, wait_reply
 
 NODE_TYPES = ("agent", "tool", "ask_you", "wait", "flow")
-TOOLS = ("docs", "prism", "fetch", "run")
+TOOLS = ("docs", "prism", "fetch", "run", "kg")
 NAME = re.compile(r"^[A-Za-z][\w-]{0,40}$")
 TEMPLATE = re.compile(r"\{\{\s*([\w/-]+)(?:\.([\w-]+))?\s*\}\}")
 DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|hr|d)?\s*$", re.I)
@@ -723,10 +723,11 @@ class Run:
                           text=done.output, round=s.node_runs.get(node, 0) + 1,
                           latency_s=round(time.perf_counter() - started, 1))
         elif n.type == "tool":
-            query = fill(str(n.spec.get("query") or n.spec.get("url") or n.spec.get("prompt") or ""),
+            query = fill(str(n.spec.get("query") or n.spec.get("url") or n.spec.get("prompt") or n.spec.get("text") or ""),
                          s.outputs, s.inputs, self.flow.aliases)
+            name = "kg-write" if n.spec["tool"] == "kg" and n.spec.get("text") else n.spec["tool"]
             started = time.perf_counter()
-            text = await wait_reply(self.env.tool(n.spec["tool"], query), None, self.env.timeout, self.env.max_s)
+            text = await wait_reply(self.env.tool(name, query), None, self.env.timeout, self.env.max_s)
             out = {"text": text}
             self.env.emit("step", node=node, type="tool", label=n.label, prompt=query, text=text,
                           round=s.node_runs.get(node, 0) + 1, latency_s=round(time.perf_counter() - started, 1))

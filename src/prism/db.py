@@ -134,6 +134,31 @@ MIGRATIONS = [
         updated_at REAL NOT NULL
     );
     """,
+    # v6: the knowledge graph - things, and links between them with where each came from.
+    """
+    CREATE TABLE kg_entities (
+        id         INTEGER PRIMARY KEY,
+        type       TEXT NOT NULL,
+        name       TEXT NOT NULL,
+        norm       TEXT NOT NULL,              -- lowercase, no punctuation: how names compare
+        aliases    TEXT NOT NULL DEFAULT '[]', -- JSON: other names for the same thing
+        summary    TEXT NOT NULL DEFAULT '',
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE INDEX kg_entities_norm ON kg_entities (norm);
+    CREATE TABLE kg_links (
+        id         INTEGER PRIMARY KEY,
+        src        INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+        rel        TEXT NOT NULL,
+        dst        INTEGER NOT NULL REFERENCES kg_entities(id) ON DELETE CASCADE,
+        evidence   TEXT NOT NULL DEFAULT '[]', -- JSON: [{where, chat, message | source, file | run, quote}]
+        confidence REAL NOT NULL DEFAULT 0.8,
+        created_at REAL NOT NULL
+    );
+    CREATE INDEX kg_links_src ON kg_links (src);
+    CREATE INDEX kg_links_dst ON kg_links (dst);
+    """,
 ]
 
 

@@ -14,7 +14,7 @@ def client(tmp_path, monkeypatch, shared_sandbox):
     monkeypatch.setenv("PRISM_HOME", str(tmp_path))
     monkeypatch.setenv("PRISM_DB_PATH", str(tmp_path / "t.db"))
     for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library, app_mod.runner,
-               app_mod.python_version):
+               app_mod.python_version, app_mod.kg):
         fn.cache_clear()
     monkeypatch.setattr(app_mod, "sandbox", lambda: shared_sandbox)  # made once per test run
     app_mod._vault["key"] = None

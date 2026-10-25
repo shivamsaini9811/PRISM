@@ -80,7 +80,9 @@ ASK_PRISM = (" `prism` is not an assistant: `ASK @prism: <keywords>` searches th
 ASK_DOCS = (" `docs` is not an assistant: `ASK @docs: <keywords>` searches the user's files and "
             "web pages given to this chat (#folders) and returns the matching passages with file "
             "and page - use it to check facts and find more than the passages you were given.")
-LOCAL_TOOLS = {"prism": ASK_PRISM, "docs": ASK_DOCS}  # searched by PRISM itself, not assistants
+ASK_KG = (" `kg` is not an assistant: `ASK @kg: <a name or question>` reads the user's knowledge "
+          "graph - people, projects, decisions and how they connect, with where each came from.")
+LOCAL_TOOLS = {"prism": ASK_PRISM, "docs": ASK_DOCS, "kg": ASK_KG}  # searched by PRISM itself, not assistants
 ASK_LINE = re.compile(r"^[\s*_`>-]*ASK\s+@([A-Za-z][\w-]*)[*_`]*\s*:[\s*_`]*(.+?)[\s*_`]*$", re.I)
 MAX_ASKS = 3  # default advice budget per turn; the user sets 0-5
 DEEP = (" Take your time: reason step by step, check your own claims, and prefer depth over "
