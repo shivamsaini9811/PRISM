@@ -57,6 +57,16 @@ marked *always* are sent with every message instead of only when named.
 A round takes as long as its slowest model plus the moderator: seconds over APIs, 1-2 minutes
 with web platforms.
 
+**Build with words - `@prism`**: ask PRISM itself, in plain words, and it builds it: "@prism
+make an agent that reviews my code harshly", "make a flow where claude drafts a brief, gpt
+reviews it until it passes, then it asks me", "run the flow brief on solar panels", "remember
+Priya leads design and the launch is 12 May", "what do we know about Priya?". The primary
+model turns the request into actions (several at once are fine), PRISM carries them out -
+agents saved, flows drafted, checked and saved, runs started, facts added to the knowledge
+graph - and a card shows what was done, with Run…, Open in Flows / Knowledge and Undo.
+Requests that can only mean this ("create … agent/flow/workflow", "run the flow …",
+"remember …") work without `@prism`.
+
 **Agents and flows - work that runs on its own**
 
 An **agent** (Flows → Agents) is a role on one of your models: instructions, the #context it
@@ -248,6 +258,7 @@ src/prism/
   local.py         Ollama / LM Studio / OpenAI-compatible servers / in-browser models, .gguf import
   runner.py        RUN @python: approval, the Python sandbox and pip, work folders
   kg.py            the knowledge graph: extraction, merging names, evidence, #kg / ASK @kg
+  builder.py       @prism: requests in plain words -> agents, flows, runs, knowledge
   catalog.py       the signed catalog: verify, install Python packages and models
   publish.py       prism-publish: keys, checksums, signing
   db.py            SQLite store + migrations

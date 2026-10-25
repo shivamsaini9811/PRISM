@@ -264,7 +264,8 @@
     </form>
     <div id="help" class="muted hidden"><b>@claude</b> asks one · <b>@claude @gpt</b> asks several · <b>@all</b> or no @ asks everyone switched on · <b>@moderator</b> sums up ·
       <b>#name</b> attaches saved context · <b>/save #name</b> [text] saves the last answer (or the text) · <b>/save-global #name</b> · <b>/forget #name</b><br>
-      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats; <b>ASK @docs</b> searches the folders in context; <b>#kg</b> / <b>ASK @kg</b>: the knowledge graph) · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
+      <b>Task plan:</b> one <b>@bot task</b> per line (or "<b>@gpt</b> write it, then <b>@claude</b> review it") runs step by step · <b>/recall @gpt #name</b> what to recall: saves that platform's memory of you as context · bots <b>ASK</b> the other platforms for your data or advice (<b>Asks</b> = budget per turn; <b>ASK @any</b> asks them all; <b>ASK @prism</b> searches your past PRISM chats; <b>ASK @docs</b> searches the folders in context; <b>#kg</b> / <b>ASK @kg</b>: the knowledge graph)<br>
+      <b>@prism</b> in plain words builds things for you: "<b>@prism</b> make an agent that reviews code harshly", "make a flow that researches a topic, drafts a brief and asks me before publishing", "run the flow brief on solar", "remember Priya leads design", "what do we know about Priya?" · <b>/profile</b> updates what PRISM knows about you (<b>/profile off</b> stops it)</div>
   </main>
 
   <section id="ctx">
@@ -714,7 +715,7 @@ function meetingHtml(msgs, live) {
     if (kind === 'topic') {
       flush(); group = null; order = meta.speakers || []; fmt = meta.format || 'chat'; rounds = meta.rounds || 1;
       const to = (meta.mentions || []).length ? meta.mentions.map(x => '@' + x).join(' ') : '@all';
-      const how = fmt === 'chat' || fmt === 'summary' ? '' : ` · ${FORMAT_LABEL[fmt]}, ${rounds} round${rounds > 1 ? 's' : ''}`;
+      const how = fmt === 'chat' || fmt === 'summary' || fmt === 'build' ? '' : ` · ${FORMAT_LABEL[fmt]}, ${rounds} round${rounds > 1 ? 's' : ''}`;
       html += `<div class="msg topic"><div class="who"><b>You</b> → ${esc(to)}${how}</div>${esc(m.content)}${filesHtml(meta.files)}</div>`;
       continue;
     }
@@ -742,6 +743,11 @@ function meetingHtml(msgs, live) {
       continue;
     }
     flush();
+    if (kind === 'build') {
+      flush();
+      html += buildCard(m);
+      continue;
+    }
     if (kind === 'run_request') {
       html += runCard(m);
       continue;
@@ -1151,6 +1157,43 @@ $('kgDlg').addEventListener('click', async e => {
   } catch (err) { alert(err.message); }
 });
 
+/* "@prism make an agent / a flow / remember…": what PRISM did, with the next steps. */
+function buildCard(m) {
+  const r = m.meta;
+  let body;
+  if (r.pending) body = '<em class="muted">Working out what you asked for…</em>';
+  else if (r.error) body = `<span class="err">${esc(r.error)}</span>`;
+  else body = (r.results || []).map((x, i) => {
+    const btn = [];
+    if (x.agent) btn.push(`<button data-bopen="agents">Open in Flows</button><button data-bundo-agent="${esc(x.agent)}">Undo</button>`);
+    if (x.flow && x.action === 'create_flow') btn.push(`<button class="primary" data-brun="${esc(x.flow)}">Run…</button><button data-bopen="flow" data-name="${esc(x.flow)}">Open in Flows</button><button data-bundo-flow="${esc(x.flow)}">Undo</button>`);
+    if (!x.ok && x.yaml) btn.push(`<button data-bdraft="${m.id}:${i}">Open the draft in Flows</button>`);
+    if (x.chat) btn.push(`<button class="primary" data-bchat="${x.chat}">Open the run</button>`);
+    if (x.kg) btn.push(`<button data-bopen="kg">Open Knowledge</button>`);
+    return `<div style="margin:6px 0"><div>${x.ok ? '✓' : '<span class="err">✗</span>'} ${richText(x.summary)}</div>`
+      + (x.detail ? `<div class="muted" style="font-size:12.5px">${esc(x.detail)}</div>` : '')
+      + (btn.length ? `<div class="plat-actions">${btn.join('')}</div>` : '') + '</div>';
+  }).join('');
+  return `<div class="msg"><div class="who"><span class="speaker-name">PRISM</span> · builds what you asked for</div>${body}</div>`;
+}
+$('thread').addEventListener('click', async e => {
+  const t = e.target, d = t.dataset;
+  try {
+    if (d.bopen === 'agents') { await openFlows(); document.querySelector('[data-ftab="agents"]').click(); }
+    else if (d.bopen === 'flow') { await openFlows(); document.querySelector('[data-ftab="flows"]').click(); pickFlow(d.name); }
+    else if (d.bopen === 'kg') await openKg();
+    else if (d.brun) { await openFlows(); document.querySelector('[data-ftab="flows"]').click(); pickFlow(d.brun); $('runFlow').click(); }
+    else if (d.bchat) openChat(+d.bchat);
+    else if (d.bdraft) {
+      const [mid, i] = d.bdraft.split(':'), m = state.view.messages.find(x => String(x.id) === mid);
+      await openFlows(); document.querySelector('[data-ftab="flows"]').click(); fl.current = null; renderFlowList();
+      $('flowSrc').value = m.meta.results[+i].yaml; checkFlow();
+    }
+    else if (d.bundoAgent && confirm(`Delete the agent @${d.bundoAgent}?`)) { await api(`/api/agents/${d.bundoAgent}`, {method: 'DELETE'}); notice('Deleted'); t.disabled = true; }
+    else if (d.bundoFlow && confirm(`Delete the flow ${d.bundoFlow}?`)) { await api(`/api/flows/${encodeURIComponent(d.bundoFlow)}`, {method: 'DELETE'}); notice('Deleted'); t.disabled = true; }
+  } catch (err) { alert(err.message); }
+});
+
 function renderMeetbar(show) {
   const v = state.view, live = v.meeting, def = v.meeting_defaults;
   $('meetbar').classList.toggle('hidden', !show);
@@ -1168,7 +1211,7 @@ function renderMeetbar(show) {
     $('send').disabled = live.phase === 'final';
     return;
   }
-  $('input').placeholder = 'Message the room… @name to ask someone, #name for context (Enter to send)';
+  $('input').placeholder = 'Message the room… @name to ask someone, #name for context, @prism to build an agent or flow (Enter to send)';
   $('send').textContent = 'Send'; $('send').disabled = false;
   if (!$('rounds').options.length)
     $('rounds').innerHTML = [1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}">${n}</option>`).join('');
@@ -1318,7 +1361,7 @@ function suggestions() {
   if (!v || !word) return [];
   const [, sigil, part] = word;
   const names = sigil === '@'
-    ? (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform).concat(['all', 'moderator'])
+    ? (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform).concat(['all', 'moderator', 'prism'])
     : v.context.map(c => c.name);
   return names.filter(n => n.startsWith(part.toLowerCase()) && n !== part.toLowerCase()).map(n => sigil + n);
 }

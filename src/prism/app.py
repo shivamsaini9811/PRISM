@@ -26,7 +26,7 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import catalog, enrich, flows, kg as kg_mod, local, readers
+from . import builder, catalog, enrich, flows, kg as kg_mod, local, readers
 from .library import Library, attachable, passages_text
 from . import runner as runner_mod
 from .providers import PLATFORMS, Provider, build_provider, wait_reply
@@ -639,6 +639,9 @@ async def send(chat_id: int, body: SendIn) -> dict:
     if cmd := COMMAND.match(text):
         notice = context_command(chat_id, *cmd.groups())
         return {**chat_view(chat_id), "notice": notice}
+    if BUILD_AT.match(text) or (not MENTION.search(text) and builder.is_request(text)):
+        start_build(chat_id, text)  # "@prism make an agent…", "create a flow that…", "remember…"
+        return chat_view(chat_id)
     r = store().run_for_chat(chat_id)
     if r and r["status"] in ("running", "waiting", "paused"):
         # A run's room: what the user says goes to the steps still to come.
@@ -1433,6 +1436,10 @@ class DraftIn(BaseModel):
 @app.post("/api/flows/draft")
 async def draft_flow(body: DraftIn) -> dict:
     """The primary model writes the YAML; PRISM checks it and asks once more to fix errors."""
+    return await draft_yaml(body.description)
+
+
+async def draft_yaml(description: str) -> dict:
     creds = {c["platform"]: c for c in store().enabled_credentials(vault())}
     primary = store().get_meta("primary_platform")
     if primary not in creds:
@@ -1441,7 +1448,7 @@ async def draft_flow(body: DraftIn) -> dict:
     example = "name: market-brief" + "\n".join(line[4:] for line in DRAFT_EXAMPLE.splitlines())
     agents = ", ".join(f"{a['name']} ({a['model']})" for a in store().list_agents()) or "none yet"
     msgs = [{"role": "user", "content": DRAFT_PROMPT.format(
-        description=body.description, example=example, agents=agents,
+        description=description, example=example, agents=agents,
         models=", ".join("@" + p for p in creds))}]
     source, errors = "", []
     for _ in range(2):
@@ -2235,3 +2242,121 @@ def kg_put_settings(body: KgSettingsIn) -> dict:
     if body.model is not None:
         store().set_meta("kg_model", body.model)
     return kg_list()
+
+
+# --- building with words: agents, flows and knowledge from a chat message ----------------------
+
+BUILD_AT = re.compile(r"^\s*@prism\b[\s,:]*", re.I)
+_build_tasks: set[asyncio.Task] = set()
+
+
+def safe_agent_name(name: str) -> str:
+    n = re.sub(r"[^a-z0-9-]+", "-", str(name).lower()).strip("-")[:24] or "agent"
+    n = n if n[0].isalpha() else "a-" + n
+    platforms = {c["platform"] for c in store().list_credentials()}
+    if n in RESERVED or n in PLATFORMS or n in platforms:
+        n = (n + "-agent")[:24]
+    return n if len(n) >= 2 else n + "-agent"
+
+
+async def do_action(a: dict, chat_id: int, message_id: int) -> dict:
+    """One action the model asked for: done, with what to show on the card."""
+    kind = a["action"]
+    try:
+        if kind == "create_agent":
+            name = safe_agent_name(a.get("name", "agent"))
+            model = "@" + str(a.get("model") or store().get_meta("primary_platform") or "").lstrip("@")
+            output = {str(k): str(v) for k, v in (a.get("output") or {}).items()} if isinstance(a.get("output"), dict) else {}
+            tools = [t for t in (a.get("tools") or []) if t in ("ask", "docs", "prism", "kg", "run")]
+            put_agent(name, AgentIn(model=model, instructions=str(a.get("instructions") or ""), tools=tools,
+                                    output=output, research=bool(a.get("research"))))
+            what = ", ".join(filter(None, [f"tools: {', '.join(tools)}" if tools else "",
+                                          f"answers with {', '.join(output)}" if output else "",
+                                          "deep research" if a.get("research") else ""]))
+            return {"action": kind, "ok": True, "agent": name,
+                    "summary": f"Made the agent @{name} on {model}" + (f" ({what})" if what else "")
+                               + f". Use it with @{name} in any chat, or in a flow.",
+                    "detail": str(a.get("instructions") or "")}
+        if kind == "create_flow":
+            draft = await draft_yaml(str(a.get("description") or ""))
+            if draft["errors"]:
+                return {"action": kind, "ok": False, "yaml": draft["source"],
+                        "summary": "Drafted a flow, but it has problems - open it in Flows to fix them: "
+                                   + "; ".join(draft["errors"][:3])}
+            name = save_flow(FlowIn(source=draft["source"]))["saved"]
+            inputs = list(parse_flow(draft["source"]).inputs)
+            return {"action": kind, "ok": True, "flow": name, "yaml": draft["source"], "inputs": inputs,
+                    "summary": f"Made the flow {name}" + (f" (inputs: {', '.join(inputs)})" if inputs else "")
+                               + ". Run it here, or open it in Flows to look at or change it."}
+        if kind == "run_flow":
+            name = str(a.get("flow") or "")
+            inputs = {str(k): str(v) for k, v in (a.get("inputs") or {}).items()}
+            view = await start_run(name, RunIn(inputs=inputs))
+            return {"action": kind, "ok": True, "flow": name, "chat": view["chat"]["id"],
+                    "summary": f"Started the flow {name} - it runs in its own chat."}
+        if kind == "remember":
+            text = str(a.get("text") or "")
+            counts = await extract_into_kg([(text, {"chat": chat_id, "message": message_id, "where": "told to PRISM"})])
+            return {"action": kind, "ok": True, "kg": True, "detail": text,
+                    "summary": f"Remembered it in the knowledge graph: {counts['entities']} things, {counts['links']} links."}
+        if kind == "recall":
+            return {"action": kind, "ok": True, "kg": True, "summary": kg().answer(str(a.get("question") or ""))}
+        return {"action": kind, "ok": True, "summary": str(a.get("answer") or "")}
+    except HTTPException as e:
+        return {"action": kind, "ok": False, "summary": f"Couldn't do it: {e.detail}"}
+    except Exception as e:
+        log.exception("builder action %s failed", kind)
+        return {"action": kind, "ok": False, "summary": f"Couldn't do it: {e}"}
+
+
+def start_build(chat_id: int, text: str) -> None:
+    s = store()
+    request = BUILD_AT.sub("", text).strip() or text
+    message_id = s.add_message(chat_id, None, "user", text, {"kind": "topic", "format": "build", "mentions": ["prism"]})
+    card = s.add_message(chat_id, None, "assistant", "", {"kind": "build", "speaker": "prism", "pending": True})
+    chat = s.get_chat(chat_id)
+    if chat and chat["title"] == "New chat":
+        s.update_chat(chat_id, title=text[:60])
+
+    async def go() -> None:
+        meta: dict = {"kind": "build", "speaker": "prism"}
+        try:
+            creds = {c["platform"]: c for c in s.enabled_credentials(vault())}
+            primary = s.get_meta("primary_platform")
+            if primary not in creds:
+                raise HTTPException(400, "Pick a primary LLM in Settings first - it reads requests like this")
+            provider = make_provider(creds[primary], fresh=True)
+            flows_ = []
+            for f in s.list_flows():
+                try:
+                    flows_.append(f"{f['name']}: {', '.join(parse_flow(f['source']).inputs) or 'no inputs'}")
+                except flows.FlowError:
+                    continue
+            prompt = builder.PROMPT.format(
+                members=", ".join(f"@{p}" for p in creds), text=request,
+                agents=", ".join(f"@{a['name']} ({a['model']}): {a.get('instructions', '')[:80]}" for a in s.list_agents()) or "none",
+                flows="; ".join(flows_) or "none")
+            msgs = [{"role": "user", "content": prompt}]
+            actions = None
+            for _ in range(2):
+                reply = await wait_reply(provider.complete(list(msgs)), provider,
+                                         settings().request_timeout_s, settings().reply_max_s)
+                try:
+                    actions = builder.parse_actions(reply)
+                    break
+                except builder.BuildError as e:
+                    msgs += [{"role": "assistant", "content": reply},
+                             {"role": "user", "content": f"That wasn't usable ({e}). Reply with only the ```json block."}]
+            if actions is None:
+                raise HTTPException(502, f"{primary} didn't answer in a form PRISM could use - try saying it differently")
+            meta["results"] = [await do_action(a, chat_id, message_id) for a in actions]
+        except HTTPException as e:
+            meta["error"] = e.detail
+        except Exception as e:
+            log.exception("building from words failed")
+            meta["error"] = str(e) or type(e).__name__
+        s.update_message(card, meta)
+
+    task = asyncio.create_task(go())
+    _build_tasks.add(task)
+    task.add_done_callback(_build_tasks.discard)
