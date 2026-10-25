@@ -26,6 +26,7 @@ class BrowserProvider(Provider):
         self.resend_system = resend_system
         self.notes: list[str] = []
         self.last_html: str | None = None
+        self.last_documents: list[dict] = []
         self._queued_at: float | None = None
         self.research = False  # switch the site's deep research mode on for each message
 
@@ -66,6 +67,7 @@ class BrowserProvider(Provider):
                 reply = await self.adapter.send(page, text, files=files, research=self.research)
                 self.notes = list(self.adapter.notes)  # the site's layout changed: what PRISM did
                 self.last_html = self.adapter.last_html  # the reply as the site showed it
+                self.last_documents = list(self.adapter.last_documents)  # reports, artifacts
                 if not self.fresh:
                     self.thread_url = page.url  # binds the daughter to the remote conversation
                 self.resend_system = False  # the remote chat has it now

@@ -144,6 +144,10 @@
   #artHead button.on { border-color:var(--accent); color:var(--accent); }
   #artBody { flex:1; min-height:0; position:relative; background:#fff; }
   #artBody iframe { border:0; width:100%; height:100%; display:block; background:#fff; }
+  #artBody .doc { height:100%; overflow:auto; padding:18px 24px; background:var(--card); color:var(--fg); font-size:14.5px; line-height:1.6; white-space:normal; }
+  #artBody .doc table { border-collapse:collapse; margin:8px 0; } #artBody .doc td, #artBody .doc th { border:1px solid var(--border); padding:4px 8px; vertical-align:top; }
+  #artBody .doc h1 { font-size:22px; } #artBody .doc h2 { font-size:18px; }
+  .docs { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; } .docs .chip { cursor:pointer; }
   #artBody pre { margin:0; height:100%; overflow:auto; padding:12px; font:12px/1.5 ui-monospace, Consolas, monospace; background:var(--bg); color:var(--fg); }
   #localBox h4 { margin:10px 0 4px; font-size:13px; } #localBox h4:first-child { margin-top:0; }
   .lm { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:13px; }
@@ -385,7 +389,7 @@ const filesHtml = names => (names || []).map(n => /\.(png|jpe?g|gif|webp)$/i.tes
 /* Fenced code in a message: shown as a code block; pages, SVG and React components get a live
    preview. Every previewable block in the chat is a version in the artifact pane. */
 const PREVIEW = {html: 'html', htm: 'html', svg: 'svg', xml: 'svg', jsx: 'react', tsx: 'react', react: 'react'};
-const EXT = {html: 'html', svg: 'svg', react: 'jsx'};
+const EXT = {html: 'html', svg: 'svg', react: 'jsx', doc: 'md'};
 function artTitle(code, kind, who) {
   const t = kind === 'react' ? code.match(/(?:function|const|class)\s+([A-Z]\w{1,40})/)
     : code.match(/<title>([^<]{1,80})<\/title>/i) || code.match(/<h1[^>]*>([^<{]{1,80})</i);
@@ -422,7 +426,12 @@ const SITE_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'UL', 'OL', 
   'CODE', 'PRE', 'BLOCKQUOTE', 'TABLE', 'THEAD', 'TBODY', 'TFOOT', 'TR', 'TH', 'TD', 'A', 'BR', 'HR', 'SPAN', 'DIV',
   'SUP', 'SUB', 'MARK', 'KBD', 'DL', 'DT', 'DD', 'DETAILS', 'SUMMARY', 'SECTION', 'ARTICLE', 'FIGURE', 'FIGCAPTION']);
 function siteHtml(m, who) {
-  const doc = new DOMParser().parseFromString(`<body>${m.meta.html}</body>`, 'text/html');
+  // pictures and files PRISM saved from the reply are lines of its text
+  const media = String(m.content || '').split('\n').filter(l => /^(!\[image\]|\[\u{1F4C4})/u.test(l.trim()));
+  return `<div class="site">${cleanHtml(m.meta.html, who)}</div>${media.length ? rich(esc(media.join('\n'))) : ''}`;
+}
+function cleanHtml(html, who) {
+  const doc = new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html');
   const clean = node => {
     for (const el of [...node.children]) {
       if (!SITE_TAGS.has(el.tagName)) { el.replaceWith(...(['SCRIPT', 'STYLE', 'TEMPLATE'].includes(el.tagName) ? [] : el.childNodes)); continue; }
@@ -443,11 +452,28 @@ function siteHtml(m, who) {
     holder.innerHTML = codeBlock(lang, code.textContent.replace(/\n$/, ''), who);
     pre.replaceWith(holder.firstElementChild);
   }
-  // pictures and files PRISM saved from the reply are lines of its text
-  const media = String(m.content || '').split('\n').filter(l => /^(!\[image\]|\[\u{1F4C4})/u.test(l.trim()));
-  return `<div class="site">${doc.body.innerHTML}</div>${media.length ? rich(esc(media.join('\n'))) : ''}`;
+  return doc.body.innerHTML;
 }
-const replyHtml = (m, who) => m.meta?.html ? siteHtml(m, who) : richText(m.content, who);
+/* Documents a reply made (claude.ai reports and artifacts, ChatGPT and Gemini research
+   reports): a chip on the card; they open in the side pane, as the site formatted them. */
+function docsHtml(docs, who) {
+  if (!docs?.length || !state.arts) return '';
+  return '<div class="docs">' + docs.map(d => {
+    const kind = PREVIEW[d.kind] || 'doc';
+    const n = state.arts.push({kind, code: d.text, html: kind === 'doc' ? d.html : null, who, title: d.title || 'Document'}) - 1;
+    return `<button class="chip" data-art="${n}" title="Open in the side pane">${kind === 'doc' ? '📄' : '🧩'} ${esc(d.title || 'Document')} · Open</button>`;
+  }).join('') + '</div>';
+}
+function replyHtml(m, who) {
+  const docs = m.meta?.documents;
+  if (m.meta?.html) return siteHtml(m, who) + docsHtml(docs, who);
+  let text = String(m.content ?? '');
+  if (docs?.length) {  // the reply's text carries the documents for the bots: show them once, in the pane
+    const at = text.indexOf(docs[0].text.slice(0, 60).trim());
+    if (at > 0) text = text.slice(0, at).replace(/\n+(##[^\n]*\n+)?$/, '');
+  }
+  return richText(text, who) + docsHtml(docs, who);
+}
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state = { chats: [], view: null, tab: 'mother', platforms: null, busy: false, poll: null };
 const BUDGETS = [['full', 'Full'], ['long', 'Long'], ['medium', 'Medium'], ['short', 'Short'], ['off', 'Off']];
@@ -1482,15 +1508,19 @@ function renderArt() {
   const key = `${artState.i}:${artState.tab}:${a.code.length}`;
   if (artState.shown === key) return;  // unchanged: don't reload the preview on every refresh
   artState.shown = key;
+  const bots = (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform);
+  const pick = bots.includes(a.who) ? a.who : bots[0];
+  $('artBot').innerHTML = bots.map(b => `<option ${b === pick ? 'selected' : ''}>${esc(b)}</option>`).join('');
   if (artState.tab === 'code') { $('artBody').innerHTML = `<pre>${esc(a.code)}</pre>`; return; }
+  if (a.kind === 'doc') {  // a document: shown formatted, in the page (sanitized like replies)
+    $('artBody').innerHTML = `<div class="doc">${a.html ? cleanHtml(a.html, a.who) : richText(a.code, a.who)}</div>`;
+    return;
+  }
   const frame = document.createElement('iframe');
   frame.setAttribute('sandbox', SANDBOX);
   frame.title = a.title;
   frame.srcdoc = artDoc(a);
   $('artBody').replaceChildren(frame);
-  const bots = (state.platforms?.credentials || []).filter(c => c.enabled).map(c => c.platform);
-  const pick = bots.includes(a.who) ? a.who : bots[0];
-  $('artBot').innerHTML = bots.map(b => `<option ${b === pick ? 'selected' : ''}>${esc(b)}</option>`).join('');
 }
 $('artClose').onclick = () => { $('art').classList.add('hidden'); document.body.classList.remove('art-open'); };
 $('artVersion').onchange = () => { artState.i = +$('artVersion').value; artState.follow = artState.i === state.arts.length - 1; renderArt(); };
@@ -1509,6 +1539,11 @@ $('artDownload').onclick = () => {
 $('artPop').onclick = () => {  // a new tab holding only the sandboxed frame
   const a = state.arts[artState.i], w = a && window.open('', '_blank');
   if (!w) return;
+  if (a.kind === 'doc') {
+    w.document.write(`<!doctype html><meta charset="utf-8"><title>${esc(a.title)}</title><style>body{font:16px/1.6 system-ui,sans-serif;max-width:860px;margin:32px auto;padding:0 16px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px;vertical-align:top}</style>${a.html ? cleanHtml(a.html, a.who) : richText(a.code, a.who)}`);
+    w.document.close();
+    return;
+  }
   w.document.write(`<!doctype html><title>${esc(a.title)}</title><style>html,body,iframe{margin:0;width:100%;height:100%;border:0;display:block}</style><iframe sandbox="${SANDBOX}"></iframe>`);
   w.document.close();
   w.document.querySelector('iframe').srcdoc = artDoc(a);

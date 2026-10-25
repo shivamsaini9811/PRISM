@@ -91,6 +91,17 @@ _DOC_TEXT_JS = """p => { const body = p.querySelector('#markdown-artifact, [clas
 
 RELOAD_STALLED_S = 120.0
 
+_DOC_HTML_JS = """p => { const body = p.querySelector('#markdown-artifact, [class*="markdown"]') || p;
+  return (REPLY_HTML)(body); }"""
+
+
+def _doc_as_text(doc: dict) -> str:
+    """A document as the bots read it: its title, then the text (code fenced)."""
+    body = doc["text"] if doc["kind"] == "doc" else f"```{doc['kind']}\n{doc['text']}\n```"
+    head = doc.get("title") or ""
+    return body if not head or body.lstrip().startswith(head) else f"## {head}\n\n{body}"
+
+
 PROCEED = "No preference - use your best judgement and go ahead with the research."
 
 
@@ -363,6 +374,7 @@ class SiteAdapter:
         self.fallback_after_s = fallback_after_s  # no reply on the known selector by then: watch the page
         self.notes: list[str] = []  # what changed in the last send, for the room to show
         self.last_html: str | None = None  # the last reply as the site formatted it
+        self.last_documents: list[dict] = []  # documents the reply made: {title, kind, text, html}
         self._composer_guessed = False
 
     async def open(self, page: Page, thread_url: str | None = None) -> None:
@@ -480,6 +492,7 @@ class SiteAdapter:
         """timeout_s: give up after this long with no activity on the page (default idle_s).
         research: switch the site's deep research mode on for this message first."""
         self._research, self._continued = research, False
+        self.last_documents = []
         reply = await self._send_once(page, text, timeout_s, files, research)
         if research and _asks_first(reply):
             # Deep research on some sites asks clarifying questions before it starts.
@@ -759,7 +772,7 @@ class SiteAdapter:
                 continue
         return "\n".join(parts)
 
-    async def _frame_documents(self, page: Page) -> list[str]:
+    async def _frame_documents(self, page: Page) -> list[dict]:
         """Reports drawn inside an embedded frame (and the frames within it)."""
         out = []
         frames = page.locator(self.cfg.document_frame)
@@ -768,23 +781,30 @@ class SiteAdapter:
                 top = await (await frames.nth(i).element_handle(timeout=3000)).content_frame()
                 if top is None:
                     continue
-                texts = []
+                best, text = None, ""
                 for f in [top] + top.child_frames + [g for c in top.child_frames for g in c.child_frames]:
                     try:
-                        texts.append(await f.evaluate("() => document.body ? document.body.innerText : ''"))
+                        t = await f.evaluate("() => document.body ? document.body.innerText : ''")
                     except Exception:
-                        pass
-                text = max(texts, key=len, default="")
+                        continue
+                    if len(t) > len(text):
+                        best, text = f, t
                 text = re.sub(r"(?:\n\d(?=\n)){5,}\n?", " ", text)  # animated counters: runs of digits
                 text = re.sub(r"[ \t]+\n", "\n", text).strip()
                 if len(text) > 40:
-                    out.append(text)
+                    try:
+                        html = await best.evaluate(f"() => ({_REPLY_HTML_JS})(document.body)")
+                    except Exception:
+                        html = None
+                    title = (await frames.nth(i).get_attribute("title")) or "Report"
+                    first = next((x for x in text.splitlines() if len(x.strip()) > 8 and not x.startswith("Research completed")), title)
+                    out.append({"title": first.strip()[:120], "kind": "doc", "text": text, "html": html})
                     self.notes.append("read the research report from its embedded frame")
             except Exception as e:
                 self.notes.append(f"couldn't read the embedded report ({str(e).splitlines()[0][:80]})")
         return out
 
-    async def _read_documents(self, page: Page, reply) -> list[str]:
+    async def _read_documents(self, page: Page, reply) -> list[dict]:
         """Open each document card in the reply and read the panel it opens; read reports
         drawn in embedded frames."""
         out = await self._frame_documents(page) if self.cfg.document_frame else []
@@ -803,10 +823,13 @@ class SiteAdapter:
                 body = (await panel.evaluate(_DOC_TEXT_JS)).strip()
                 if not body:
                     continue
-                if kind and kind not in ("markdown", "text", "document"):
-                    lang = {"react": "jsx", "application/vnd.ant.react": "jsx"}.get(kind, kind)
-                    body = f"```{lang}\n{body}\n```"
-                out.append(f"## {title}\n\n{body}" if title and not body.startswith(title) else body)
+                code = bool(kind) and kind not in ("markdown", "text", "document")
+                try:
+                    html = None if code else await panel.evaluate(_DOC_HTML_JS.replace("REPLY_HTML", _REPLY_HTML_JS))
+                except Exception:
+                    html = None
+                lang = {"react": "jsx", "application/vnd.ant.react": "jsx", "text/html": "html"}.get(kind, kind)
+                out.append({"title": title or "Untitled", "kind": lang if code else "doc", "text": body, "html": html})
                 self.notes.append(f"read the document \"{title or 'untitled'}\" from its panel")
         except Exception as e:
             self.notes.append(f"couldn't read a document the reply made ({str(e).splitlines()[0][:80]})")
@@ -913,7 +936,9 @@ class SiteAdapter:
                 except Exception:
                     self.last_html = None
                 docs = await self._read_documents(page, loc)
-                return clean_reply(text) + "".join(f"\n\n{d}" for d in docs)
+                self.last_documents = docs
+                # The bots get the documents as text; the page shows them in its document view.
+                return clean_reply(text) + "".join(f"\n\n{_doc_as_text(d)}" for d in docs)
             await asyncio.sleep(0.3 if quiet < 30 else 1.0)
 
     async def doctor(self, page: Page) -> dict:

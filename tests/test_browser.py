@@ -486,6 +486,8 @@ async def test_documents_in_panels_and_frames_are_read(manager):
     # The reply's own text (summary + card title), then the document from the panel - without its buttons.
     assert reply == "Summary of batteries.\nBig report\n\nBig report\n\nEvery country, in full."
     assert 'read the document "Big report" from its panel' in adapter.notes
+    doc = adapter.last_documents[0]  # also kept on its own, formatted, for the page's document view
+    assert (doc["title"], doc["kind"]) == ("Big report", "doc") and "Every country" in doc["html"] and "Copy" not in doc["html"]
 
     # ChatGPT deep research: the placeholder is not the answer; the report comes from its frame.
     cfg = CONFIG.with_overrides({"research_pending": "Deep Research has started", "research_done": "Research completed in",
@@ -496,4 +498,5 @@ async def test_documents_in_panels_and_frames_are_read(manager):
     reply = await adapter.send(page, "subsidies", research=True)
     assert "Poland raised its grants" in reply and "0\n1\n2" not in reply
     assert "read the research report from its embedded frame" in adapter.notes
+    assert "<h1>Report</h1>" in adapter.last_documents[0]["html"]
     await page.close()

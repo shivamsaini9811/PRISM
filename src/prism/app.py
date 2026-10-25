@@ -880,7 +880,7 @@ def latest_answer(chat_id: int) -> str:
     return (finals or said)[-1]["content"]
 
 
-FENCE = {"html": "html", "svg": "svg", "react": "jsx"}
+FENCE = {"html": "html", "svg": "svg", "react": "jsx", "doc": "markdown"}
 
 
 def attach_artifact(chat_id: int, art: "ArtifactIn") -> Entry:
@@ -1073,7 +1073,7 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
         if entry.text and name in members and meta["kind"] != "lookup":  # its own thread
             s.add_message(chat_id, daughter_ids[name], "user", st.prompt if st else prompt)
             s.add_message(chat_id, daughter_ids[name], "assistant", entry.text,
-                          {"html": meta["html"]} if meta.get("html") else None)
+                          {k: meta[k] for k in ("html", "documents") if meta.get(k)} or None)
             url = getattr(members[name].provider, "thread_url", None)
             if url:
                 s.set_remote_url(daughter_ids[name], url)
@@ -1529,10 +1529,13 @@ class AppRunEnv(flows.RunEnv):
                 meta["notes"] = list(notes)
             if html := getattr(provider, "last_html", None):
                 meta["html"] = html
+            if docs := getattr(provider, "last_documents", None):
+                meta["documents"] = docs
             # Each agent has its own tab, like a bot in a meeting.
             d = s.bind_daughter(self.chat_id, data["label"], provider.model)
             s.add_message(self.chat_id, d, "user", data["prompt"])
-            s.add_message(self.chat_id, d, "assistant", data["text"], {"html": meta["html"]} if meta.get("html") else None)
+            s.add_message(self.chat_id, d, "assistant", data["text"],
+                          {k: meta[k] for k in ("html", "documents") if meta.get(k)} or None)
             if url := getattr(provider, "thread_url", None):
                 s.set_remote_url(d, url)
         return s.add_message(self.chat_id, None, "assistant", data["text"], meta)

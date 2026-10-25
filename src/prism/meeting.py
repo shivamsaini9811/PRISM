@@ -372,6 +372,8 @@ class Session:
             meta["notes"] = list(notes)
         if st.text and (html := getattr(provider, "last_html", None)):
             meta["html"] = html  # shown the way the site formatted it
+        if st.text and (docs := getattr(provider, "last_documents", None)):
+            meta["documents"] = docs  # opened in the page's document view
         entry = Entry(st.speaker, kind, st.text or "")
         entry.id = self.emit("entry", entry=entry, meta=meta, statement=st)
         if st.text:
@@ -457,6 +459,8 @@ class Session:
             self._mark_seen(m, snapshot)
             if html := getattr(m.provider, "last_html", None):
                 meta["html"] = html
+            if docs := getattr(m.provider, "last_documents", None):
+                meta["documents"] = docs
             entry = Entry(MODERATOR, kind, text)
             entry.id = self.emit("entry", entry=entry, meta=meta, prompt=prompt)
             self.room.append(entry)
