@@ -1,6 +1,7 @@
 """Running Python for bots: the RUN syntax, the sandbox, pip, and approval."""
 
 import asyncio
+import os
 import subprocess
 import sys
 
@@ -88,3 +89,30 @@ async def test_approval_rules_new_packages_still_ask_and_cancel(shared_sandbox, 
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cards[3]["status"] == "cancelled" and not r.decide(cards[3]["id"], "once")
+
+
+def test_packaged_runtime_is_unpacked_into_the_data_folder_once(tmp_path, monkeypatch):
+    import io
+    import json
+    import tarfile
+    from prism import runner
+    app = tmp_path / "PRISM"
+    app.mkdir()
+    exe_name = "python.exe" if sys.platform == "win32" else "bin/python3"
+    with tarfile.open(app / "runtime.tar.gz", "w:gz") as t:
+        data = b"#!/bin/sh\necho fake\n"
+        info = tarfile.TarInfo(exe_name)
+        info.size, info.mode = len(data), 0o755
+        t.addfile(info, io.BytesIO(data))
+    (app / "runtime.json").write_text(json.dumps({"python": "3.12.15", "tag": "20261009"}))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app / "PRISM.exe"))
+    monkeypatch.setenv("PRISM_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("PRISM_PYTHON", raising=False)
+    assert runner.runtime_version() == "3.12.15"
+    assert not (tmp_path / "home" / "python").exists()          # the version needs no unpacking
+    exe = runner.runtime_python()
+    assert exe == str(tmp_path / "home" / "python" / "runtime-20261009" / exe_name)
+    assert (tmp_path / "home" / "python" / "runtime-20261009" / exe_name).is_file()
+    mtime = os.path.getmtime(exe)
+    assert runner.runtime_python() == exe and os.path.getmtime(exe) == mtime  # once

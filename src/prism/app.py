@@ -1820,7 +1820,7 @@ async def decide_command(request_id: str, body: DecideIn) -> dict:
 async def runner_settings() -> dict:
     sb = sandbox()
     return {"mode": runner_mode(), "rules": json.loads(store().get_meta("run_rules") or "{}"),
-            "python": python_version(), "runtime": runner_mod.runtime_python(),
+            "python": python_version(),
             "sandbox": str(sb.path), "ready": sb.ready(), "work": str(data_dir() / "work"),
             "timeout_s": settings().run_timeout_s, "packages": await asyncio.to_thread(sb.installed)}
 

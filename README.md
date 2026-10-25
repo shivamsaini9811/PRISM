@@ -120,7 +120,10 @@ work folder (`~/.prism/work/`), stops after 5 minutes (`RUN_TIMEOUT_S`), gets no
 saved keys, and what it prints - plus files it made, downloadable from the card - goes back
 to the bot. It is not an operating-system sandbox: approved code has your account's rights.
 Flows also have a `tool: run` step with `code:`. Builds include the runtime (~1 GB unpacked;
-`build.py --no-runtime` leaves it out).
+`build.py --no-runtime` leaves it out). It ships as one archive (`runtime.tar.gz`, next to
+PRISM.exe) that PRISM unpacks into `~/.prism/python/` on the first run - a few minutes once -
+because its ~30,000 small files would take far more room unpacked on a drive with large
+clusters (exFAT drives often use 32 MB per file).
 
 **Catalog - Python packages and models from your own server, signed by you**
 

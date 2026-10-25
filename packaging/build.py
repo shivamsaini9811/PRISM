@@ -10,6 +10,7 @@ the Mac build (.github/workflows/mac.yml does that on GitHub's Macs).
 """
 
 import argparse
+import json
 import os
 import plistlib
 import platform
@@ -95,10 +96,16 @@ def main() -> None:
         sys.path.insert(0, str(ROOT / "packaging"))
         import runtime
         src = runtime.prepare(args.build_dir)
-        dest = (args.dist_dir / "PRISM.app/Contents/Resources/runtime") if mac else (args.dist_dir / "PRISM/runtime")
-        print(f"+ copying PRISM's Python into {dest}", flush=True)
-        shutil.rmtree(dest, ignore_errors=True)
-        shutil.copytree(src, dest, symlinks=True)
+        # One archive, unpacked by PRISM into its data folder on first use: ~30,000 small
+        # files next to the app would take a terabyte on an exFAT drive (32 MB clusters).
+        dest = (args.dist_dir / "PRISM.app/Contents/Resources") if mac else (args.dist_dir / "PRISM")
+        archive = args.build_dir / f"runtime-{runtime.TAG}-{runtime.platform_key()}.tar.gz"
+        if not archive.exists():
+            print(f"+ packing PRISM's Python into {archive.name}", flush=True)
+            shutil.make_archive(str(archive).removesuffix(".tar.gz"), "gztar", src)
+        shutil.copy2(archive, dest / "runtime.tar.gz")
+        (dest / "runtime.json").write_text(json.dumps({"python": runtime.PY, "tag": runtime.TAG,
+                                                       "packages": len(runtime.PACKAGES)}))
     if mac:
         app = args.dist_dir / "PRISM.app"
         finish_mac_app(app, version)

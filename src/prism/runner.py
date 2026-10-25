@@ -122,19 +122,60 @@ def parse_request(text: str, who: str) -> Request | None:
 
 # --- the sandbox ------------------------------------------------------------------------------
 
+def _shipped(name: str) -> Path | None:
+    """A file shipped next to the app (Windows folder) or in PRISM.app's Resources."""
+    if not getattr(sys, "frozen", False):
+        return None
+    app = Path(sys.executable).parent
+    return next((p for p in (app / name, app.parent / "Resources" / name) if p.is_file()), None)
+
+
+def runtime_version() -> str:
+    """The version of PRISM's own Python, without unpacking it ("" if it isn't there)."""
+    if os.environ.get("PRISM_PYTHON"):
+        return "custom"
+    if not getattr(sys, "frozen", False):
+        return "%d.%d.%d" % sys.version_info[:3]
+    info = _shipped("runtime.json")
+    try:
+        return json.loads(info.read_text())["python"] if info else ""
+    except (OSError, ValueError, KeyError):
+        return ""
+
+
 def runtime_python() -> str | None:
-    """PRISM's own Python: PRISM_PYTHON, else the one shipped next to the app; when running
-    from source, the Python running PRISM."""
+    """PRISM's own Python: PRISM_PYTHON, else the one shipped with the app - one archive,
+    unpacked into PRISM's data folder the first time (a few minutes). It isn't kept unpacked
+    next to the app: on drives with large clusters (exFAT) its ~30,000 small files would take
+    a terabyte. When running from source: the Python running PRISM. Blocking: call in a thread."""
     if env := os.environ.get("PRISM_PYTHON"):
         return env
-    if getattr(sys, "frozen", False):
-        app = Path(sys.executable).parent
-        for root in (app / "runtime", app.parent / "Resources" / "runtime"):
-            for exe in (root / "python.exe", root / "bin" / "python3"):
-                if exe.is_file():
-                    return str(exe)
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    archive, info = _shipped("runtime.tar.gz"), _shipped("runtime.json")
+    if not archive or not info:
         return None
-    return sys.executable
+    from .config import data_dir
+    tag = json.loads(info.read_text()).get("tag", "")
+    target = data_dir() / "python" / f"runtime-{tag}"
+    exe = target / ("python.exe" if sys.platform == "win32" else "bin/python3")
+    if not exe.is_file():
+        import tarfile
+        part = target.with_name(target.name + ".part")
+        shutil.rmtree(part, ignore_errors=True)
+        part.mkdir(parents=True)
+        with tarfile.open(archive) as t:
+            root = part.resolve()
+            for m in t.getmembers():
+                if not (part / m.name).resolve().is_relative_to(root):
+                    raise RunError("PRISM's Python archive is damaged - reinstall PRISM")
+            t.extractall(part)
+        shutil.rmtree(target, ignore_errors=True)
+        part.rename(target)
+        for old in target.parent.glob("runtime-*"):  # an earlier PRISM's Python
+            if old != target and not old.name.endswith(".part"):
+                shutil.rmtree(old, ignore_errors=True)
+    return str(exe)
 
 
 class Sandbox:
@@ -223,12 +264,7 @@ class Sandbox:
         return lib if lib.is_dir() else next((self.path / "lib").glob("python3*/site-packages"), lib)
 
     def version(self) -> str:
-        base = self.runtime()
-        if not base:
-            return ""
-        p = subprocess.run([base, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
-                           capture_output=True, timeout=30, creationflags=NO_WINDOW)
-        return p.stdout.decode().strip()
+        return runtime_version()
 
 
 def execute(req: Request, work: Path, sandbox: Sandbox, timeout: float) -> Request:
