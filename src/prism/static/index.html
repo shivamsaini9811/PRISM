@@ -785,7 +785,9 @@ function meetingHtml(msgs, live) {
   if (live) {
     const what = live.phase === 'final' ? 'Writing the final answer…'
       : live.phase === 'analysing' ? `The moderator is analysing round ${live.round}…`
-      : live.approving?.length ? `${live.approving.join(', ')} wants to run Python - approve or refuse it above`
+      : live.approving?.length ? (msgs.some(m => m.meta?.kind === 'run_request' && m.meta.status === 'pending')
+          ? `${live.approving.join(', ')} wants to run Python - approve or refuse it above`
+          : `Running ${live.approving.join(', ')}'s Python…`)
       : live.waiting_on.length ? `Waiting on ${live.waiting_on.join(', ')}…` : 'Starting…';
     html += `<div class="msg"><em class="muted">${esc(what)}</em></div>`;
   }

@@ -117,3 +117,18 @@ def test_packaged_runtime_is_unpacked_into_the_data_folder_once(tmp_path, monkey
     assert (tmp_path / "home" / "python" / "runtime-20261009" / exe_name).is_file()
     mtime = os.path.getmtime(exe)
     assert runner.runtime_python() == exe and os.path.getmtime(exe) == mtime  # once
+
+
+async def test_stop_while_running_marks_the_card(shared_sandbox, tmp_path):
+    cards = []
+    rules = {"always": ["python"]}
+    r = Runner(tmp_path, rules=lambda: rules, save_rules=lambda x: None, sandbox=shared_sandbox, timeout=30)
+    emit = lambda req: cards.append(dict(req.card())) or len(cards)
+    update = lambda req, mid: cards.__setitem__(mid - 1, dict(req.card()))
+    task = asyncio.create_task(r.request(Request("claude", "import time\ntime.sleep(3)"), 1, emit, update))
+    await asyncio.sleep(1)
+    assert cards[0]["status"] == "running"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cards[0]["status"] == "cancelled"

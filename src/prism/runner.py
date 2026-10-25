@@ -374,7 +374,12 @@ class Runner:
             req.status = "installing" if req.install else "running"
             update(req, message_id)
         req.approved_by = rule
-        await asyncio.to_thread(execute, req, self.work_dir(f"chat-{chat_id}"), self.sandbox, self.timeout)
+        try:
+            await asyncio.to_thread(execute, req, self.work_dir(f"chat-{chat_id}"), self.sandbox, self.timeout)
+        except asyncio.CancelledError:  # Stop: the card must not stay on "running"
+            req.status = "cancelled"
+            update(req, message_id)
+            raise
         update(req, message_id)
         return req
 
