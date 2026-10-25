@@ -179,8 +179,8 @@ def parse(source: str, agents: Callable[[str], dict | None] = lambda n: None,
             node.label = str(spec["tool"])
             if node.label not in TOOLS:
                 errors.append(f"nodes.{nid}: tool is one of {', '.join(TOOLS)}")
-            elif node.label == "run" and not (spec.get("command") or (spec.get("code") and spec.get("lang"))):
-                errors.append(f"nodes.{nid}: tool run needs command: <a command line>, or code: and lang: (python, node, ...)")
+            elif node.label == "run" and (not spec.get("code") or str(spec.get("lang", "python")).lower() != "python"):
+                errors.append(f"nodes.{nid}: tool run takes code: (Python; a first line # pip: a b installs packages)")
         elif t == "ask_you":
             node.label = str(spec["ask_you"])[:60]
         elif t == "wait":
@@ -570,9 +570,9 @@ class RunEnv:
         """A program to run, after the user approves it: returns the finished request."""
         raise StepError("running programs is off (Settings → Running programs)")
 
-    def can_run(self, agent: dict) -> list[str]:
-        """Languages an agent may RUN in (empty: it may not)."""
-        return []
+    def can_run(self, agent: dict) -> str:
+        """The Python version an agent's RUN gets ("": it may not run code)."""
+        return ""
 
     def emit(self, kind: str, **data) -> int | None:
         return None
@@ -710,16 +710,16 @@ class Run:
             s.wake.pop(node, None)
             out = {"text": f"waited {n.spec['wait']}"}
         elif n.type == "tool" and n.spec["tool"] == "run":
-            from .runner import Request, result_for_bot
-            filled = lambda k: fill(str(n.spec.get(k) or ""), s.outputs, s.inputs, self.flow.aliases)
-            req = (Request(node, filled("command").split()[0].lower(), command=filled("command")) if n.spec.get("command")
-                   else Request(node, str(n.spec["lang"]).lower(), code=filled("code"), lang=str(n.spec["lang"]).lower()))
+            from .runner import Request, packages_in
+            code = fill(str(n.spec["code"]), s.outputs, s.inputs, self.flow.aliases)
+            good, bad = packages_in(code)
+            req = Request(node, code, packages=good, rejected=bad)
             started = time.perf_counter()
             done = await self.env.run(node, req)
             if done.status != "done":
                 raise StepError(f"the program didn't run ({done.status}): {done.output[:200]}")
             out = {"text": done.output, "exit_code": str(done.exit_code), "files": ", ".join(done.files)}
-            self.env.emit("step", node=node, type="tool", label=f"run {req.tool}", prompt=req.command or req.code,
+            self.env.emit("step", node=node, type="tool", label="run python", prompt=req.code,
                           text=done.output, round=s.node_runs.get(node, 0) + 1,
                           latency_s=round(time.perf_counter() - started, 1))
         elif n.type == "tool":
@@ -794,10 +794,10 @@ class Run:
         if askable:
             system += ASK_TOOL.format(names=", ".join(askable), max_asks=MAX_ASKS,
                                       hints="; ".join(ASK_HINTS.get(a, f"{a} is another assistant the user uses") for a in askable))
-        from .runner import RUN_HELP, parse_request, result_for_bot
+        from .runner import RUN_HELP, SHOWN_PACKAGES, parse_request, result_for_bot
         langs = self.env.can_run(agent)
         if langs:
-            system += RUN_HELP.format(langs=", ".join(langs), max_runs=MAX_RUNS)
+            system += RUN_HELP.format(version=langs, packages=SHOWN_PACKAGES, max_runs=MAX_RUNS)
         provider = self.env.provider(agent, memory)
         started = time.perf_counter()
         msgs = list(memory["history"]) + [{"role": "user", "content": full}]

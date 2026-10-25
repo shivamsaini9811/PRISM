@@ -10,11 +10,13 @@ from test_meeting import Fake
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, shared_sandbox):
     monkeypatch.setenv("PRISM_HOME", str(tmp_path))
     monkeypatch.setenv("PRISM_DB_PATH", str(tmp_path / "t.db"))
-    for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library, app_mod.runner):
+    for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library, app_mod.runner,
+               app_mod.python_version):
         fn.cache_clear()
+    monkeypatch.setattr(app_mod, "sandbox", lambda: shared_sandbox)  # made once per test run
     app_mod._vault["key"] = None
 
     calls = []
@@ -819,7 +821,6 @@ def test_bot_runs_a_program_after_approval(client, monkeypatch):
     import sys
     client.post("/api/unlock", json={"password": "longenough"})
     client.put("/api/credentials/gpt", json={"secret": "k"})
-    monkeypatch.setattr(app_mod, "installed_toolchains", lambda: {"python": sys.executable})
     seen = []
 
     class Coder:
@@ -839,7 +840,7 @@ def test_bot_runs_a_program_after_approval(client, monkeypatch):
         if card:
             break
         time.sleep(0.02)
-    assert "RUN @<language>" in seen[0][0] and "python" in seen[0][0]
+    assert "RUN @python" in seen[0][0] and "pandas" in seen[0][0]
     assert card["meta"]["status"] == "pending" and card["meta"]["code"] == "print(6 * 7)"
     assert v["meeting"]["approving"] == ["gpt"]
     r = client.post(f"/api/commands/{card['meta']['id']}", json={"allow": "chat", "chat_id": chat})
@@ -856,7 +857,7 @@ def test_bot_runs_a_program_after_approval(client, monkeypatch):
     seen.clear()
     client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt again", "format": "chat"})
     wait_meeting(client, chat)
-    assert "RUN @<language>" not in seen[0][0]
+    assert "RUN @python" not in seen[0][0]
     # A card left waiting when PRISM closed is marked expired.
     s = app_mod.store()
     mid = s.add_message(chat, None, "assistant", "", {"kind": "run_request", "status": "pending", "id": "x"})

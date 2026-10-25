@@ -2,9 +2,8 @@
 
     prism-publish keygen --out ~/prism-keys          # once: private key + public key line
     prism-publish new catalog.json --name "My tools"
-    prism-publish add catalog.json --name python --version 3.12.7 --kind toolchain \\
-        --file windows-x64=dist/python-win.zip --file macos-arm64=dist/python-mac.tar.gz \\
-        --command python=python.exe
+    prism-publish add catalog.json --name mytools --version 1.2.0 --kind python \\
+        --file any=dist/mytools-1.2.0-py3-none-any.whl
     prism-publish sign catalog.json --key ~/prism-keys/prism-publisher.key
     prism-publish verify catalog.json --pub "ed25519:..."
 
@@ -124,9 +123,8 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("catalog", type=Path)
     a.add_argument("--name", required=True)
     a.add_argument("--version", required=True)
-    a.add_argument("--kind", choices=["toolchain", "model"], default="toolchain")
+    a.add_argument("--kind", choices=["python", "model"], default="python")
     a.add_argument("--file", action="append", default=[], help="platform=path (windows-x64, macos-arm64, macos-x64, linux-x64, any)")
-    a.add_argument("--command", action="append", default=[], help="name=path inside the download, e.g. python=python.exe")
     a.add_argument("--description", default="")
     a.add_argument("--as", dest="as_name", help="models: the @name it joins the room as")
     a.add_argument("--url-base", default="", help="where the files will be, if not next to catalog.json")
@@ -148,7 +146,7 @@ def main(argv: list[str] | None = None) -> None:
         new(args.catalog, args.name)
         print(f"Started {args.catalog}")
     elif args.cmd == "add":
-        e = add(args.catalog, args.name, args.version, args.kind, args.file, args.command,
+        e = add(args.catalog, args.name, args.version, args.kind, args.file, [],
                 args.description, args.as_name, args.url_base)
         print(f"Added {e['name']} {e['version']} for {', '.join(e['files'])}. Sign it next.")
     elif args.cmd == "sign":

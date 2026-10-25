@@ -354,7 +354,7 @@
           <label><input type="checkbox" data-agtool="docs"> search your folders (ASK @docs)</label>
           <label><input type="checkbox" data-agtool="prism"> search past chats (ASK @prism)</label>
           <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label>
-          <label title="It may ask to run code or commands on this computer - each run needs your approval"><input type="checkbox" data-agtool="run"> run programs</label>
+          <label title="It may ask to run Python on this computer - each run needs your approval"><input type="checkbox" data-agtool="run"> run Python</label>
           <label title="Web bots only: the site's Deep Research for each step (slow, uses your research allowance)"><input type="checkbox" id="agResearch"> deep research</label></div>
         <textarea id="agOutput" style="min-height:50px" placeholder="Fields PRISM reads from its reply, one per line, e.g.&#10;verdict: PASS|FIX&#10;notes: text"></textarea>
         <button class="primary">Save agent</button>
@@ -759,7 +759,7 @@ function meetingHtml(msgs, live) {
   if (live) {
     const what = live.phase === 'final' ? 'Writing the final answer…'
       : live.phase === 'analysing' ? `The moderator is analysing round ${live.round}…`
-      : live.approving?.length ? `${live.approving.join(', ')} wants to run a program - approve or refuse it above`
+      : live.approving?.length ? `${live.approving.join(', ')} wants to run Python - approve or refuse it above`
       : live.waiting_on.length ? `Waiting on ${live.waiting_on.join(', ')}…` : 'Starting…';
     html += `<div class="msg"><em class="muted">${esc(what)}</em></div>`;
   }
@@ -964,17 +964,20 @@ $('agentForm').onsubmit = async e => {
 /* A bot asking to run a program: the exact code, where, and the user's choice. */
 function runCard(m) {
   const r = m.meta, open = r.status === 'pending';
-  const what = r.code != null ? `<pre>${esc(r.code)}</pre>` : `<pre>${esc(r.command)}</pre>`;
-  const state_ = {pending: 'wants to run this - your call', running: 'running…', done: `ran in ${r.seconds}s, exit code ${r.exit_code}`,
-    denied: 'you didn\'t allow it', failed: 'it failed', cancelled: 'cancelled (stopped)', expired: 'not run - PRISM restarted before you answered'}[r.status] || r.status;
+  const state_ = {pending: 'wants to run this - your call', installing: 'installing packages…', running: 'running…',
+    done: `ran in ${r.seconds}s, exit code ${r.exit_code}`, denied: 'you didn\'t allow it', failed: 'it failed',
+    cancelled: 'cancelled (stopped)', expired: 'not run - PRISM restarted before you answered'}[r.status] || r.status;
   const rule = r.approved_by && r.approved_by !== 'once' ? ` · allowed by your rule (${r.approved_by === 'always' ? 'always' : 'this ' + r.approved_by})` : '';
-  return `<div class="msg runreq ${esc(r.status)}"><div class="who"><span class="speaker-name">${esc(r.speaker)}</span> · run ${esc(r.tool)} · ${esc(state_)}${rule}</div>`
-    + what
-    + (open ? `<div class="warn">Runs in ${esc(r.work || 'its work folder')}, with your account's rights - it is not a sandbox. Time limit applies; PRISM's saved keys are not passed on.</div>
+  const pkgs = r.install?.length ? `<div class="warn"><b>Will install into PRISM's Python sandbox first:</b> ${esc(r.install.join(', '))} - from PyPI; installing runs the package's own setup code.</div>` : '';
+  const refused = r.rejected?.length ? `<div class="warn">Not installed (not package names): ${esc(r.rejected.join(', '))}</div>` : '';
+  return `<div class="msg runreq ${esc(r.status)}"><div class="who"><span class="speaker-name">${esc(r.speaker)}</span> · run python · ${esc(state_)}${rule}</div>`
+    + `<pre>${esc(r.code)}</pre>` + pkgs + refused
+    + (open ? `<div class="warn">Runs in ${esc(r.work || 'its work folder')} on PRISM's Python, with your account's rights - it is not a sandbox for your files. Time limit applies; PRISM's saved keys are not passed on.</div>
        <div class="plat-actions"><button class="primary" data-runreq="once" data-id="${esc(r.id)}">Run once</button>
-       <button data-runreq="chat" data-id="${esc(r.id)}">Always allow ${esc(r.tool)} in this chat</button>
-       <button data-runreq="always" data-id="${esc(r.id)}">Always allow ${esc(r.tool)}</button>
-       <button data-runreq="deny" data-id="${esc(r.id)}">Don't run</button></div>` : '')
+       <button data-runreq="chat" data-id="${esc(r.id)}">Always allow Python in this chat</button>
+       <button data-runreq="always" data-id="${esc(r.id)}">Always allow Python</button>
+       <button data-runreq="deny" data-id="${esc(r.id)}">Don't run</button></div>
+       ${r.install?.length ? '<div class="warn">Allowing Python doesn\'t allow new packages: those always ask.</div>' : ''}` : '')
     + (r.output ? `<details ${r.status === 'failed' ? 'open' : ''}><summary>Output${r.files?.length ? ` · made ${r.files.length} file${r.files.length > 1 ? 's' : ''}` : ''}</summary><pre>${esc(r.output)}</pre></details>` : '')
     + filesHtml(r.media) + '</div>';
 }
@@ -992,67 +995,46 @@ async function loadRunner() {
   let r;
   try { r = await api('/api/runner'); } catch (err) { $('runnerBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
   state.runner = r;
-  const rules = [...(r.rules.always || []).map(t => ['always', t, null]),
-    ...Object.entries(r.rules.chats || {}).flatMap(([c, ts]) => ts.map(t => ['chats', t, c])),
-    ...Object.entries(r.rules.flows || {}).flatMap(([f, ts]) => ts.map(t => ['flows', t, f]))];
+  const rules = [...(r.rules.always || []).map(() => ['always', null]),
+    ...Object.keys(r.rules.chats || {}).map(c => ['chats', c]), ...Object.keys(r.rules.flows || {}).map(f => ['flows', f])];
   const chatName = id => (state.chats.find(c => String(c.id) === String(id))?.title || `chat ${id}`);
-  $('runnerBox').innerHTML = `<div class="plat-head"><b>Running programs</b>
+  $('runnerBox').innerHTML = `<div class="plat-head"><b>Running Python</b>
       <label class="muted" style="font-size:12.5px"><input type="checkbox" id="runnerOn" ${r.mode === 'on' ? 'checked' : ''}> bots may ask to run code</label></div>
-    <div class="muted" style="font-size:12px">A bot can end its reply with <code>RUN @python</code> and a code block (or <code>RUN: a command</code>). You see the exact code first and choose. It runs in <code>${esc(r.work)}</code> with your account's rights - not a sandbox - for at most ${Math.round(r.timeout_s / 60)} min, without PRISM's saved keys.
-      Found here: ${r.languages.length ? esc(r.languages.join(', ')) : 'no languages yet'}${Object.keys(r.toolchains).length ? ` · from the catalog: ${esc(Object.keys(r.toolchains).join(', '))}` : ''}.</div>
+    <div class="muted" style="font-size:12px">A bot can end its reply with <code>RUN @python</code> and a code block. You see the code first and choose.
+      ${r.python ? `It runs on PRISM's own Python ${esc(r.python)} - with numpy, pandas, scipy, matplotlib, scikit-learn, requests, openpyxl, python-docx, pypdf, pillow and more -` : '<span class="err">PRISM\'s Python is missing from this install.</span>'}
+      in a sandbox at <code>${esc(r.sandbox)}</code> that takes what bots install (<code># pip: …</code>, always asked), so neither PRISM's Python nor this computer's changes.
+      Work folders: <code>${esc(r.work)}</code>; at most ${Math.round(r.timeout_s / 60)} min a run; PRISM's saved keys are not passed on. It has your account's rights - not a sandbox for your files.</div>
     <h4 style="margin:10px 0 4px;font-size:13px">Allowed without asking</h4>
-    ${rules.map(([kind, tool, where]) => `<div class="lm"><span><b>${esc(tool)}</b> · ${kind === 'always' ? 'everywhere' : kind === 'chats' ? 'in ' + esc(chatName(where)) : 'in the flow ' + esc(where)}</span>
-      <button data-revoke="${kind}|${esc(tool)}|${esc(where || '')}">Ask again</button></div>`).join('') || '<div class="muted" style="font-size:12.5px">Nothing - every run asks you first.</div>'}`;
+    ${rules.map(([kind, where]) => `<div class="lm"><span>Python ${kind === 'always' ? '<b>everywhere</b>' : kind === 'chats' ? 'in ' + esc(chatName(where)) : 'in the flow ' + esc(where)}</span>
+      <button data-revoke="${kind}|${esc(where || '')}">Ask again</button></div>`).join('') || '<div class="muted" style="font-size:12.5px">Nothing - every run asks you first.</div>'}
+    <h4 style="margin:10px 0 4px;font-size:13px">Installed in the sandbox <span class="muted">· besides PRISM's own packages</span></h4>
+    ${r.packages.map(p => `<div class="lm"><span>${esc(p.name)} <span class="muted">${esc(p.version)}</span></span><button data-uninstall-pkg="${esc(p.name)}">Remove</button></div>`).join('')
+      || `<div class="muted" style="font-size:12.5px">${r.ready ? 'Nothing yet.' : 'The sandbox is made on the first run.'}</div>`}
+    <div class="lm"><input id="pkgName" placeholder="install packages yourself, e.g. rapidfuzz geopandas" style="flex:1"><button data-install-pkg>Install</button>
+      <button data-reset-sandbox title="Remove everything installed into the sandbox">Reset sandbox</button></div>`;
 }
 $('runnerBox').onchange = async e => {
   if (e.target.id !== 'runnerOn') return;
   await api('/api/runner', {method: 'PUT', body: {mode: e.target.checked ? 'on' : 'off'}}); loadRunner();
 };
 $('runnerBox').onclick = async e => {
-  const v = e.target.dataset.revoke; if (!v) return;
-  const [kind, tool, where] = v.split('|'), rules = structuredClone(state.runner.rules);
-  if (kind === 'always') rules.always = rules.always.filter(t => t !== tool);
-  else rules[kind][where] = rules[kind][where].filter(t => t !== tool);
-  await api('/api/runner', {method: 'PUT', body: {rules}}); loadRunner();
-};
-
-/* Catalog: toolchains and models from your own server, installed only when signed by your key. */
-async function loadCatalog() {
-  clearTimeout(state.catalogPoll);
-  if ($('settings').classList.contains('hidden')) return;
-  let c;
-  try { c = await api('/api/catalog'); } catch (err) { $('catalogBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
-  const mb = n => n == null ? '' : n > 1e9 ? (n / 1e9).toFixed(1) + ' GB' : Math.max(1, Math.round(n / 1e6)) + ' MB';
-  const row = e => {
-    const p = c.installs[e.name], busy = p && !p.done;
-    const prog = busy ? `<progress max="${p.total || 1}" value="${p.completed}"></progress> <span class="muted">${esc(p.status)}</span>`
-      : p?.error ? `<span class="err">${esc(p.error)}</span>` : '';
-    const action = !e.available ? '<span class="muted">not for this computer</span>'
-      : busy ? '' : e.installed === e.version ? `<button data-uninstall="${esc(e.name)}">Remove</button>`
-      : `<button data-install="${esc(e.name)}">${e.installed ? 'Update' : 'Install'}</button>`;
-    return `<div class="lm"><span><b>${esc(e.name)}</b> ${esc(e.version)} <span class="muted">· ${e.kind === 'model' ? 'model' + (e.as ? ' @' + esc(e.as) : '') : 'tool'} · ${mb(e.size)}${e.installed ? ' · installed ' + esc(e.installed) : ''}</span>
-      ${e.description ? `<br><span class="muted" style="font-size:12px">${esc(e.description)}</span>` : ''} ${prog}</span>${action}</div>`;
+  const t = e.target, call = async (path, opts, busy) => {
+    t.disabled = true; if (busy) t.textContent = busy;
+    try { await api(path, opts); } catch (err) { alert(err.message); }
+    loadRunner();
   };
-  $('catalogBox').innerHTML = `<div class="plat-head"><b>Catalog</b>${c.url && c.keys.length ? '<button data-catrefresh>Check for updates</button>' : ''}</div>
-    <div class="muted" style="font-size:12px">Tools and models from your own server. PRISM installs only what is signed with your publisher key, checks every download's checksum, and refuses an older or expired catalog. Make the key and sign with <code>prism-publish</code>.</div>
-    <div class="lm"><input id="catUrl" value="${esc(c.url)}" placeholder="https://lib.example.com/catalog.json" style="flex:1"><button data-caturl>Save address</button></div>
-    <h4 style="margin:10px 0 4px;font-size:13px">Publisher keys</h4>
-    ${c.keys.map(k => `<div class="lm"><span><code>${esc(k.fingerprint)}</code>${k.bundled ? ' <span class="muted">(built in)</span>' : ''}</span>${k.bundled ? '' : `<button data-rmkey="${esc(k.key)}">Remove</button>`}</div>`).join('')
-      || '<div class="muted" style="font-size:12.5px">None yet - nothing can be installed until you add yours.</div>'}
-    <div class="lm"><input id="catKey" placeholder="ed25519:… (prism-publish keygen prints it)" style="flex:1"><button data-addkey>Add key</button></div>
-    ${c.error ? `<div class="err" style="font-size:12.5px">${esc(c.error)}</div>` : ''}
-    ${c.name ? `<h4 style="margin:10px 0 4px;font-size:13px">${esc(c.name)} <span class="muted">· version ${c.version} · checked ${esc(c.checked || '')} · valid until ${esc((c.expires || '').slice(0, 10))} · this computer: ${esc(c.platform)}</span></h4>${c.entries.map(row).join('') || '<div class="muted">Empty.</div>'}` : ''}`;
-  if (Object.values(c.installs).some(p => !p.done)) state.catalogPoll = setTimeout(loadCatalog, 1000);
-}
-$('catalogBox').onclick = async e => {
-  const t = e.target, call = async (path, opts) => { try { await api(path, opts); } catch (err) { alert(err.message); } loadCatalog(); };
-  if (t.hasAttribute('data-caturl')) return call('/api/catalog', {method: 'PUT', body: {url: $('catUrl').value.trim()}});
-  if (t.hasAttribute('data-addkey')) return call('/api/catalog', {method: 'PUT', body: {add_key: $('catKey').value.trim()}});
-  if (t.dataset.rmkey && confirm('Remove this key? Nothing signed with it will install any more.'))
-    return call('/api/catalog', {method: 'PUT', body: {remove_key: t.dataset.rmkey}});
-  if (t.hasAttribute('data-catrefresh')) return call('/api/catalog/refresh', {method: 'POST'});
-  if (t.dataset.install) return call('/api/catalog/install', {method: 'POST', body: {name: t.dataset.install}});
-  if (t.dataset.uninstall && confirm(`Remove ${t.dataset.uninstall}?`)) return call(`/api/catalog/${encodeURIComponent(t.dataset.uninstall)}`, {method: 'DELETE'});
+  if (t.dataset.revoke) {
+    const [kind, where] = t.dataset.revoke.split('|'), rules = structuredClone(state.runner.rules);
+    if (kind === 'always') rules.always = []; else delete rules[kind][where];
+    return call('/api/runner', {method: 'PUT', body: {rules}});
+  }
+  if (t.hasAttribute('data-install-pkg')) {
+    const names = $('pkgName').value.split(/[\s,]+/).filter(Boolean); if (!names.length) return;
+    return call('/api/runner/packages', {method: 'POST', body: {install: names}}, 'Installing…');
+  }
+  if (t.dataset.uninstallPkg) return call(`/api/runner/packages/${encodeURIComponent(t.dataset.uninstallPkg)}`, {method: 'DELETE'});
+  if (t.hasAttribute('data-reset-sandbox') && confirm('Remove everything installed into the sandbox? PRISM\'s own packages stay.'))
+    return call('/api/runner/reset', {method: 'POST'}, 'Resetting…');
 };
 
 function renderMeetbar(show) {

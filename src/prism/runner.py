@@ -1,24 +1,32 @@
-"""Running programs on the user's computer, for bots and flows - with the user's approval.
+"""Running Python for bots and flows, on the user's computer, with the user's approval.
 
-A bot ends its reply with one of:
+A bot ends its reply with:
 
-    RUN @python                 RUN: git log --oneline -5
+    RUN @python
     ```python
-    print(2 + 2)
+    # pip: rapidfuzz            (optional: packages it needs that aren't there yet)
+    import pandas as pd
+    print(pd.read_csv("data.csv").describe())
     ```
 
-PRISM shows an approval card with the exact code or command, the folder it runs in and the
-tool. The user runs it once, allows that tool for this chat (or always), or refuses. It runs
-in the chat's own work folder under PRISM's data folder, with a time limit, a cap on output
-and none of PRISM's saved keys in its environment; what it printed (and the files it made)
-goes back to the bot. Every run is logged with the chat's messages.
+PRISM shows an approval card with the exact code, the folder it runs in and any packages to
+install. The user runs it once, allows Python for this chat (or always), or refuses. New
+packages always ask - installing runs the package's own setup code - even where Python
+itself is allowed.
 
-This is not a sandbox: an approved program can do anything the user's account can. The card
-says so. Tools come from the catalog (installed toolchains, callable by name) or this
-computer's PATH.
+The code runs on PRISM's own Python (shipped with the app, with numpy, pandas, matplotlib
+and many more installed) inside a sandbox: a virtual environment under PRISM's data folder
+that sees those packages and takes what bots install, so neither PRISM's Python nor the
+computer's is changed (Settings → Running Python → Reset empties it). It runs in the chat's
+own work folder, with a time limit, capped output and none of PRISM's saved keys in its
+environment. What it printed and the files it made go back to the bot.
+
+This is not an operating-system sandbox: approved code can do what the user's account can.
+The card says so.
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -35,132 +43,221 @@ OUTPUT_MAX = 20_000
 FILES_MAX = 5                       # files a run made, handed back as attachments
 FILE_BYTES_MAX = 10 * 1024 * 1024
 DEFAULT_TIMEOUT_S = 300.0
+PIP_TIMEOUT_S = 900.0
 
-RUN_LINE = re.compile(r"^[\s*_`>-]*RUN\s*(?:@([\w.+-]+))?[*_`]*\s*(?::[\s*_`]*(.*?))?[\s*_`]*$", re.I)
+RUN_LINE = re.compile(r"^[\s*_`>-]*RUN\s*(?:@([\w.+-]+))?[*_`]*\s*:?[\s*_`]*$", re.I)
 FENCE = re.compile(r"```([\w.+-]*)[^\n]*\n(.*?)\n?```\s*$", re.S)
-# Code blocks: how to run each language (the tool is looked up by its first name found).
-LANGS = {
-    "python": (["python", "python3", "py"], ".py", []),
-    "py": (["python", "python3", "py"], ".py", []),
-    "node": (["node"], ".js", []), "javascript": (["node"], ".js", []), "js": (["node"], ".js", []),
-    "powershell": (["pwsh", "powershell"], ".ps1", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]),
-    "ps1": (["pwsh", "powershell"], ".ps1", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]),
-    "bash": (["bash"], ".sh", []), "sh": (["sh", "bash"], ".sh", []),
-    "cmd": (["cmd"], ".bat", ["/c"]), "bat": (["cmd"], ".bat", ["/c"]),
-}
-# Environment passed on: what programs need to start, nothing PRISM keeps (keys, tokens).
+PIP_LINE = re.compile(r"^\s*#\s*pip\s*:\s*(.+)$", re.I | re.M)
+# A requirement as pip takes it - a name, extras and a version - and nothing else: no
+# options, paths or URLs (they could point pip anywhere).
+PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?"
+                     r"((==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]+(,(==|>=|<=|~=|!=|>|<)[A-Za-z0-9.*+!_-]+)*)?$")
+# Environment passed on: what Python needs to start, nothing PRISM keeps (keys, tokens).
 KEEP_ENV = {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP",
             "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "LANG", "LC_ALL", "TERM",
-            "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "USER", "USERNAME", "SHELL", "TMPDIR"}
+            "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS", "USER", "USERNAME", "TMPDIR",
+            "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"}
 
-RUN_HELP = (" You can run programs on the user's computer - each run needs the user's approval: "
-            "end your reply with a line `RUN @<language>` followed by one fenced code block "
-            "(languages here: {langs}), or a line `RUN: <command>` for a command line; nothing "
-            "after it. It runs in a work folder of its own; what it prints comes back to you, "
-            "then finish your reply. Use it to compute, test code or process files rather than "
-            "guessing. At most {max_runs} runs per turn.")
-
-
-@dataclass
-class Request:
-    who: str                         # the bot or agent asking
-    tool: str                        # python, node, git, ...
-    code: str | None = None          # a code block, or
-    command: str | None = None       # a command line
-    lang: str = ""
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    status: str = "pending"          # pending | running | done | denied | failed | cancelled | expired
-    output: str = ""
-    exit_code: int | None = None
-    seconds: float = 0.0
-    files: list[str] = field(default_factory=list)
-    approved_by: str = ""            # once | chat | flow | always | rule
-
-    def card(self) -> dict:
-        return {k: v for k, v in self.__dict__.items()}
-
-
-def parse_request(text: str, who: str) -> Request | None:
-    """A RUN at the end of a reply: `RUN @lang` + one fenced block, or `RUN: command`."""
-    body = text.rstrip()
-    fence = FENCE.search(body)
-    lines = body.splitlines()
-    if fence:  # the block must be the last thing, right after a RUN line
-        before = body[:fence.start()].rstrip().splitlines()
-        if before and (m := RUN_LINE.match(before[-1])) and not m.group(2):
-            lang = (m.group(1) or fence.group(1) or "").lower()
-            code = fence.group(2)
-            if lang and code.strip():
-                return Request(who, lang, code=code, lang=lang)
-    if lines and (m := RUN_LINE.match(lines[-1])) and m.group(2):
-        command = m.group(2).strip().strip("`")
-        if command:
-            return Request(who, command.split()[0].strip('"').lower(), command=command)
-    return None
-
-
-def find_tool(name: str, toolchains: dict[str, str]) -> str | None:
-    """A catalog toolchain's command, else a program on PATH."""
-    return toolchains.get(name) or shutil.which(name)
-
-
-def argv_for(req: Request, work: Path, toolchains: dict[str, str]) -> list[str]:
-    if req.code is not None:
-        names, ext, pre = LANGS.get(req.lang, ([req.lang], "", []))
-        exe = next((p for n in names if (p := find_tool(n, toolchains))), None)
-        if not exe:
-            raise RunError(f"no {req.lang} on this computer - install it, or get it from the catalog (Settings)")
-        script = work / f"prism_run_{req.id}{ext}"
-        script.write_text(req.code, encoding="utf-8")
-        return [exe, *pre, str(script)]
-    first, *rest = _split(req.command)
-    exe = find_tool(first, toolchains) or (first if Path(first).is_absolute() and Path(first).exists() else None)
-    if not exe:
-        raise RunError(f"{first} isn't installed here (not in the catalog's tools, not on PATH)")
-    if sys.platform == "win32" and exe.lower().endswith((".bat", ".cmd")):
-        return ["cmd", "/c", exe, *rest]
-    return [exe, *rest]
-
-
-def _split(command: str) -> list[str]:
-    if sys.platform == "win32":
-        return [p.strip('"') for p in re.findall(r'"[^"]*"|\S+', command)]
-    import shlex
-    return shlex.split(command)
+RUN_HELP = (" You can run Python on the user's computer - each run needs the user's approval: end "
+            "your reply with a line `RUN @python` followed by one ```python block, and nothing "
+            "after it. Python {version} with {packages} and more is there; if you need another "
+            "package, make the block's first line `# pip: name1 name2`. The code runs in a work "
+            "folder of its own (save files there); what it prints comes back to you, then finish "
+            "your reply. Use it to compute, test code or process data rather than guessing. At "
+            "most {max_runs} runs per turn.")
+SHOWN_PACKAGES = "numpy, pandas, scipy, matplotlib, scikit-learn, requests, openpyxl, python-docx, pypdf, pillow"
 
 
 class RunError(Exception):
     pass
 
 
-def environment(toolchains: dict[str, str]) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k.upper() in KEEP_ENV}
-    dirs = list(dict.fromkeys(str(Path(p).parent) for p in toolchains.values()))
-    env["PATH"] = os.pathsep.join(dirs + [env.get("PATH", "")])
-    env["PYTHONIOENCODING"] = "utf-8"
-    return env
+@dataclass
+class Request:
+    who: str                         # the bot or agent asking
+    code: str
+    tool: str = "python"
+    packages: list[str] = field(default_factory=list)   # asked for with # pip:
+    install: list[str] = field(default_factory=list)    # of those, what isn't there yet
+    rejected: list[str] = field(default_factory=list)   # not package names: refused
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    status: str = "pending"          # pending | installing | running | done | denied | failed | cancelled | expired
+    output: str = ""
+    exit_code: int | None = None
+    seconds: float = 0.0
+    files: list[str] = field(default_factory=list)
+    approved_by: str = ""            # once | chat | flow | always
+
+    def card(self) -> dict:
+        return dict(self.__dict__)
 
 
-def execute(req: Request, work: Path, toolchains: dict[str, str], timeout: float) -> Request:
-    """Run it (blocking - call in a thread): output capped, files it made noted."""
+def packages_in(code: str) -> tuple[list[str], list[str]]:
+    """`# pip: a b==1.2` lines: (requirements, things that aren't requirements)."""
+    good, bad = [], []
+    for line in PIP_LINE.findall(code):
+        for token in line.replace(",", " ").split():
+            (good if PACKAGE.match(token) and not token.startswith("-") else bad).append(token)
+    return list(dict.fromkeys(good)), bad
+
+
+def parse_request(text: str, who: str) -> Request | None:
+    """`RUN @python` and one python block, at the very end of a reply."""
+    body = text.rstrip()
+    fence = FENCE.search(body)
+    if not fence:
+        return None
+    before = body[:fence.start()].rstrip().splitlines()
+    m = RUN_LINE.match(before[-1]) if before else None
+    lang = ((m.group(1) if m else "") or fence.group(1) or "").lower()
+    if not m or lang not in ("python", "py", "python3", ""):
+        return None
+    code = fence.group(2)
+    if not code.strip():
+        return None
+    good, bad = packages_in(code)
+    return Request(who, code, packages=good, rejected=bad)
+
+
+# --- the sandbox ------------------------------------------------------------------------------
+
+def runtime_python() -> str | None:
+    """PRISM's own Python: PRISM_PYTHON, else the one shipped next to the app; when running
+    from source, the Python running PRISM."""
+    if env := os.environ.get("PRISM_PYTHON"):
+        return env
+    if getattr(sys, "frozen", False):
+        app = Path(sys.executable).parent
+        for root in (app / "runtime", app.parent / "Resources" / "runtime"):
+            for exe in (root / "python.exe", root / "bin" / "python3"):
+                if exe.is_file():
+                    return str(exe)
+        return None
+    return sys.executable
+
+
+class Sandbox:
+    """A virtual environment on PRISM's Python that sees its packages and takes new ones."""
+
+    def __init__(self, path: Path, runtime: Callable[[], str | None] = runtime_python):
+        self.path, self.runtime = path, runtime
+
+    @property
+    def python(self) -> Path:
+        return self.path / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+
+    def ready(self) -> bool:
+        cfg = self.path / "pyvenv.cfg"
+        if not (cfg.is_file() and self.python.is_file()):
+            return False
+        home = next((line.split("=", 1)[1].strip() for line in cfg.read_text().splitlines()
+                     if line.startswith("home")), "")
+        return Path(home).is_dir()  # PRISM moved or updated: its Python is elsewhere now
+
+    def ensure(self) -> Path:
+        """Create it (or again, if PRISM's Python moved). Blocking: call in a thread."""
+        if self.ready():
+            return self.python
+        base = self.runtime()
+        if not base:
+            raise RunError("PRISM's Python is missing from this install - reinstall PRISM")
+        shutil.rmtree(self.path, ignore_errors=True)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        p = subprocess.run([base, "-m", "venv", "--system-site-packages", str(self.path)],
+                           capture_output=True, timeout=300, creationflags=NO_WINDOW)
+        if p.returncode != 0:
+            raise RunError("couldn't make the Python sandbox: " + p.stderr.decode(errors="replace")[-300:])
+        return self.python
+
+    def reset(self) -> None:
+        shutil.rmtree(self.path, ignore_errors=True)
+
+    def env(self) -> dict[str, str]:
+        env = {k: v for k, v in os.environ.items() if k.upper() in KEEP_ENV}
+        bindir = str(self.python.parent)
+        env.update({"PATH": os.pathsep.join([bindir, env.get("PATH", "")]), "VIRTUAL_ENV": str(self.path),
+                    "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+                    "MPLBACKEND": "Agg", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1"})
+        return env
+
+    def missing(self, packages: list[str]) -> list[str]:
+        """Which of these aren't installed (here or in PRISM's Python); a pinned version
+        always counts as missing, so pip checks it."""
+        if not packages:
+            return []
+        names = [re.split(r"[\[=<>!~]", p, maxsplit=1)[0] for p in packages]
+        code = ("import json, sys, importlib.metadata as m\nout = []\nfor n in json.loads(sys.argv[1]):\n"
+                "    try: m.distribution(n)\n    except m.PackageNotFoundError: out.append(n)\nprint(json.dumps(out))")
+        p = subprocess.run([str(self.ensure()), "-c", code, json.dumps(names)], capture_output=True,
+                           timeout=60, env=self.env(), creationflags=NO_WINDOW)
+        absent = set(json.loads(p.stdout or "[]")) if p.returncode == 0 else set(names)
+        return [r for r, n in zip(packages, names) if n in absent or any(op in r for op in "=<>!~")]
+
+    def install(self, requirements: list[str], extra: list[str] = (), timeout: float = PIP_TIMEOUT_S) -> str:
+        p = subprocess.run([str(self.ensure()), "-m", "pip", "install", "--no-input", *extra, *requirements],
+                           capture_output=True, timeout=timeout, env=self.env(), creationflags=NO_WINDOW)
+        out = (p.stdout + p.stderr).decode("utf-8", errors="replace")
+        if p.returncode != 0:
+            raise RunError("pip couldn't install " + " ".join(requirements) + ":\n" + out[-1500:])
+        return out
+
+    def uninstall(self, name: str) -> None:
+        subprocess.run([str(self.ensure()), "-m", "pip", "uninstall", "-y", name], capture_output=True,
+                       timeout=300, env=self.env(), creationflags=NO_WINDOW)
+
+    def installed(self) -> list[dict]:
+        """What bots (or the catalog) installed into the sandbox - not PRISM's own packages."""
+        if not self.ready():
+            return []
+        p = subprocess.run([str(self.python), "-m", "pip", "list", "--format", "json",
+                            "--path", str(self._site())], capture_output=True, timeout=60, env=self.env(),
+                           creationflags=NO_WINDOW)
+        try:
+            return [x for x in json.loads(p.stdout or "[]") if x["name"].lower() not in ("pip", "setuptools")]
+        except ValueError:
+            return []
+
+    def _site(self) -> Path:
+        lib = self.path / "Lib" / "site-packages"
+        return lib if lib.is_dir() else next((self.path / "lib").glob("python3*/site-packages"), lib)
+
+    def version(self) -> str:
+        base = self.runtime()
+        if not base:
+            return ""
+        p = subprocess.run([base, "-c", "import sys; print('%d.%d.%d' % sys.version_info[:3])"],
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW)
+        return p.stdout.decode().strip()
+
+
+def execute(req: Request, work: Path, sandbox: Sandbox, timeout: float) -> Request:
+    """Install what it asked for (it was approved), then run it - blocking: call in a thread."""
     work.mkdir(parents=True, exist_ok=True)
     before = {p: p.stat().st_mtime for p in work.rglob("*") if p.is_file()}
     start = time.monotonic()
+    notes = ""
     try:
-        argv = argv_for(req, work, toolchains)
-        p = subprocess.run(argv, cwd=work, env=environment(toolchains), capture_output=True,
+        python = sandbox.ensure()
+        if req.install:
+            req.status = "installing"
+            sandbox.install(req.install)
+            notes = f"[installed into the sandbox: {', '.join(req.install)}]\n"
+        script = work / f"prism_run_{req.id}.py"
+        script.write_text(req.code, encoding="utf-8")
+        req.status = "running"
+        p = subprocess.run([str(python), str(script)], cwd=work, env=sandbox.env(), capture_output=True,
                            timeout=timeout, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
         out = p.stdout.decode("utf-8", errors="replace")
         err = p.stderr.decode("utf-8", errors="replace")
         req.exit_code = p.returncode
-        req.output = out + (("\n[stderr]\n" + err) if err.strip() else "")
+        req.output = notes + out + (("\n[stderr]\n" + err) if err.strip() else "")
         req.status = "done"
     except subprocess.TimeoutExpired as e:
-        req.output = ((e.stdout or b"").decode("utf-8", "replace") + f"\n[stopped after {round(timeout)} s - the time limit]")
+        req.output = notes + (e.stdout or b"").decode("utf-8", "replace") + f"\n[stopped after {round(timeout)} s - the time limit]"
         req.status, req.exit_code = "failed", None
     except (RunError, OSError) as e:
-        req.output, req.status = str(e), "failed"
+        req.output, req.status = notes + str(e), "failed"
     req.seconds = round(time.monotonic() - start, 1)
     if len(req.output) > OUTPUT_MAX:
         req.output = req.output[:OUTPUT_MAX // 2] + f"\n[… {len(req.output) - OUTPUT_MAX} characters left out …]\n" + req.output[-OUTPUT_MAX // 2:]
@@ -175,42 +272,48 @@ def result_for_bot(req: Request) -> str:
         return "[The user did not allow this run. Don't try it again; finish your reply without it.]"
     if req.status in ("cancelled", "expired"):
         return f"[The run was {req.status}. Finish your reply without it.]"
-    head = (f"[ran {req.tool} in {req.seconds}s, exit code {req.exit_code}]" if req.status == "done"
-            else f"[{req.tool} failed]")
+    head = (f"[ran python in {req.seconds}s, exit code {req.exit_code}]" if req.status == "done"
+            else "[python failed]")
+    refused = (f"\n[not installed - not package names: {', '.join(req.rejected)}]" if req.rejected else "")
     files = f"\n[files it made: {', '.join(req.files)}]" if req.files else ""
-    return f"{head}\n{req.output.strip() or '(no output)'}{files}\n\nNow finish your reply (you may RUN again if you must)."
+    return (f"{head}{refused}\n{req.output.strip() or '(no output)'}{files}\n\n"
+            "Now finish your reply (you may RUN again if you must).")
 
 
 class Runner:
-    """Pending approvals, allow rules, and the runs themselves.
+    """Pending approvals, allow rules, and the runs.
 
-    rules: {"always": [tool], "chats": {chat_id: [tool]}, "flows": {flow: [tool]}} kept by the
-    app (meta `run_rules`); emit(req, chat_id) persists the card and returns its message id;
-    update(req, message_id) changes it."""
+    rules: {"always": ["python"], "chats": {chat_id: ["python"]}, "flows": {flow: ["python"]}},
+    kept by the app (meta `run_rules`). A rule lets code run without asking; packages it
+    wants that aren't installed yet still ask."""
 
     def __init__(self, work_root: Path, rules: Callable[[], dict], save_rules: Callable[[dict], None],
-                 toolchains: Callable[[], dict[str, str]] = dict, timeout: float = DEFAULT_TIMEOUT_S):
+                 sandbox: Sandbox, timeout: float = DEFAULT_TIMEOUT_S):
         self.work_root, self.rules, self.save_rules = work_root, rules, save_rules
-        self.toolchains, self.timeout = toolchains, timeout
+        self.sandbox, self.timeout = sandbox, timeout
         self.pending: dict[str, tuple[Request, asyncio.Future, int | None]] = {}
 
     def work_dir(self, scope: str) -> Path:
         return self.work_root / re.sub(r"[^\w-]", "_", scope)
 
-    def allowed(self, tool: str, chat_id: int | None, flow: str | None) -> str | None:
+    def allowed(self, chat_id: int | None, flow: str | None) -> str | None:
         r = self.rules() or {}
-        if tool in r.get("always", []):
+        if "python" in r.get("always", []):
             return "always"
-        if chat_id is not None and tool in r.get("chats", {}).get(str(chat_id), []):
+        if chat_id is not None and "python" in r.get("chats", {}).get(str(chat_id), []):
             return "chat"
-        if flow and tool in r.get("flows", {}).get(flow, []):
+        if flow and "python" in r.get("flows", {}).get(flow, []):
             return "flow"
         return None
 
     async def request(self, req: Request, chat_id: int, emit: Callable, update: Callable,
                       flow: str | None = None) -> Request:
-        """Ask the user (unless a rule already allows this tool), then run it."""
-        rule = self.allowed(req.tool, chat_id, flow)
+        """Ask the user (unless a rule allows it and nothing new is installed), then run it."""
+        try:
+            req.install = await asyncio.to_thread(self.sandbox.missing, req.packages)
+        except Exception:
+            req.install = list(req.packages)
+        rule = None if req.install else self.allowed(chat_id, flow)
         req.status = "running" if rule else "pending"
         message_id = emit(req)
         if not rule:
@@ -229,41 +332,28 @@ class Runner:
                 update(req, message_id)
                 return req
             rule = decision
-            req.status = "running"
+            req.status = "installing" if req.install else "running"
             update(req, message_id)
         req.approved_by = rule
-        await asyncio.to_thread(execute, req, self.work_dir(f"chat-{chat_id}"), self.toolchains(), self.timeout)
+        await asyncio.to_thread(execute, req, self.work_dir(f"chat-{chat_id}"), self.sandbox, self.timeout)
         update(req, message_id)
         return req
 
     def decide(self, request_id: str, allow: str | None, chat_id: int | None = None, flow: str | None = None) -> bool:
-        """allow: once | chat | flow | always, or None to refuse. Chat/flow/always add a rule."""
+        """allow: once | chat | flow | always, or None to refuse. Chat/flow/always add a rule
+        (for running Python; new packages keep asking)."""
         item = self.pending.get(request_id)
         if not item or item[1].done():
             return False
-        req, fut, _ = item
+        _req, fut, _ = item
         if allow in ("chat", "flow", "always"):
             r = dict(self.rules() or {})
             if allow == "always":
-                r["always"] = sorted(set(r.get("always", [])) | {req.tool})
+                r["always"] = ["python"]
             elif allow == "chat" and chat_id is not None:
-                chats = dict(r.get("chats", {}))
-                chats[str(chat_id)] = sorted(set(chats.get(str(chat_id), [])) | {req.tool})
-                r["chats"] = chats
+                r["chats"] = {**r.get("chats", {}), str(chat_id): ["python"]}
             elif allow == "flow" and flow:
-                fl = dict(r.get("flows", {}))
-                fl[flow] = sorted(set(fl.get(flow, [])) | {req.tool})
-                r["flows"] = fl
+                r["flows"] = {**r.get("flows", {}), flow: ["python"]}
             self.save_rules(r)
         fut.set_result(allow)
         return True
-
-    def languages(self) -> list[str]:
-        tc = self.toolchains()
-        seen = []
-        for lang, (names, _, _) in LANGS.items():
-            if lang in ("py", "js", "javascript", "ps1", "bat", "sh") or lang in seen:
-                continue
-            if any(find_tool(n, tc) for n in names):
-                seen.append(lang)
-        return seen

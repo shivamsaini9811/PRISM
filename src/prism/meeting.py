@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .providers import Message, Provider, wait_reply
-from .runner import RUN_HELP, Request, parse_request, result_for_bot
+from .runner import RUN_HELP, SHOWN_PACKAGES, Request, parse_request, result_for_bot
 
 MAX_RUNS = 5  # programs a bot may run per turn (each one approved by the user)
 
@@ -229,7 +229,7 @@ class Session:
         self.context, self.timeout, self.deep, self.max_s = context, timeout, deep, max_s
         # run(member, request) -> the finished request: the app asks the user, then runs it
         self.run_fn, self.runnable, self.approving = run, set(runnable), set()
-        self.languages: list[str] = []  # what a RUN can use here (set by the app)
+        self.python = ""  # the version RUN @python runs on here ("" = can't run; set by the app)
         self.ask, self.askable, self.max_asks = ask, list(askable), max_asks
         self.rounds = script.rounds
         self.round = 0
@@ -470,8 +470,8 @@ class Session:
                                  prism=tools) if assistants else
                  ASK_TOOLS_ONLY.format(max_asks=self.max_asks, tools=tools) if askable else "")
         role = f" Your role here, set by the user: {m.role}" if m.role else ""
-        if self.run_fn and m.name in self.runnable and self.languages:
-            help_ += RUN_HELP.format(langs=", ".join(self.languages), max_runs=MAX_RUNS)
+        if self.run_fn and m.name in self.runnable and self.python:
+            help_ += RUN_HELP.format(version=self.python, packages=SHOWN_PACKAGES, max_runs=MAX_RUNS)
         return _with_context(MEMBER_SYSTEM.format(name=m.name, others=others,
                                                   deep=role + (DEEP if self.deep else "") + help_),
                              self.context)

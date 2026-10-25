@@ -1,4 +1,4 @@
-"""The catalog: toolchains and models the publisher (the user's own server) offers, signed.
+"""The catalog: Python packages and models the publisher (the user's own server) offers, signed.
 
 The server holds two files next to each other: catalog.json and catalog.json.sig (the Ed25519
 signature of catalog.json's exact bytes, base64). PRISM installs nothing until it has the
@@ -11,14 +11,15 @@ folder. Make keys and sign with `prism-publish` (prism/publish.py).
 catalog.json:
     {"format": 1, "name": "My tools", "version": 7, "expires": "2027-01-31T00:00:00Z",
      "entries": [
-       {"name": "python", "version": "3.12.7", "kind": "toolchain", "description": "...",
-        "files": {"windows-x64": {"url": "python-3.12.7-win.zip", "sha256": "...", "size": 123}},
-        "commands": {"python": "python.exe"}},
+       {"name": "mytools", "version": "1.2.0", "kind": "python", "description": "...",
+        "files": {"any": {"url": "mytools-1.2.0-py3-none-any.whl", "sha256": "...", "size": 12345}}},
        {"name": "qwen-7b", "version": "q4", "kind": "model", "as": "qwen",
         "files": {"any": {"url": "https://.../qwen.gguf", "sha256": "...", "size": 4800000000}},
         "needs": {"ram_mb": 6000}}]}
-File URLs may be relative to the catalog's address. `commands` may also be per platform:
-{"windows-x64": {"python": "python.exe"}, "macos-arm64": {"python": "bin/python3"}}.
+File URLs may be relative to the catalog's address; a file per platform is allowed
+(windows-x64, macos-arm64, macos-x64, linux-x64, any). Python packages (wheels or source
+archives) install into PRISM's Python sandbox, where bots' code can import them; models go
+to Ollama and join the room.
 """
 
 import asyncio
@@ -138,13 +139,6 @@ def file_for(entry: dict) -> dict | None:
     return files.get(platform_key()) or files.get("any")
 
 
-def commands_for(entry: dict) -> dict[str, str]:
-    cmds = entry.get("commands") or {}
-    if cmds and all(isinstance(v, dict) for v in cmds.values()):
-        cmds = cmds.get(platform_key()) or cmds.get("any") or {}
-    return {str(k): str(v) for k, v in cmds.items()}
-
-
 # --- installing ------------------------------------------------------------------------------
 
 _installs: dict[str, dict] = {}
@@ -177,9 +171,10 @@ def _safe_extract(archive: Path, target: Path) -> None:
         raise CatalogError("not a zip or tar archive")
 
 
-def start_install(entry: dict, catalog_url: str, home: Path, on_done) -> None:
-    """Download, check the SHA-256, unpack (toolchains) or hand to Ollama (models);
-    on_done(record) records it. Progress in installs()."""
+def start_install(entry: dict, catalog_url: str, home: Path, on_done, install_python=None) -> None:
+    """Download, check the SHA-256, then install a Python package into the sandbox
+    (install_python(path)) or hand a model to Ollama; on_done(name, record) records it.
+    Progress in installs()."""
     name = entry["name"]
     if name in _installs and not _installs[name]["done"]:
         return
@@ -222,26 +217,19 @@ def start_install(entry: dict, catalog_url: str, home: Path, on_done) -> None:
                     raise CatalogError(err)
                 record = {"version": entry["version"], "kind": "model", "path": str(gguf),
                           "ollama": ollama_name, "as": entry.get("as") or name, "commands": {}}
-            else:
-                target = home / "toolchains" / name / str(entry["version"])
-                shutil.rmtree(target, ignore_errors=True)
-                target.mkdir(parents=True)
-                if Path(urljoin(catalog_url, f["url"])).suffix.lower() in (".zip", ".gz", ".tgz", ".xz", ".tar"):
-                    await asyncio.to_thread(_safe_extract, part, target)
-                    part.unlink()
-                else:  # a single program
-                    dest = target / Path(f["url"]).name
-                    part.replace(dest)
-                    dest.chmod(dest.stat().st_mode | stat.S_IXUSR)
-                commands = {}
-                for cmd, rel in commands_for(entry).items():
-                    path = (target / rel).resolve()
-                    if target.resolve() not in path.parents or not path.is_file():
-                        raise CatalogError(f"{cmd}: {rel} isn't in the download")
-                    if sys.platform != "win32":
-                        path.chmod(path.stat().st_mode | stat.S_IXUSR)
-                    commands[cmd] = str(path)
-                record = {"version": entry["version"], "kind": "toolchain", "path": str(target), "commands": commands}
+            else:  # a Python package: a wheel or source archive, into the sandbox
+                if entry.get("kind") != "python" or install_python is None:
+                    raise CatalogError(f"{name}: unknown kind {entry.get('kind')!r} (python or model)")
+                packages = home / "packages"
+                packages.mkdir(parents=True, exist_ok=True)
+                fname = Path(f["url"].split("?")[0]).name
+                if not fname.endswith((".whl", ".tar.gz", ".zip")):
+                    raise CatalogError(f"{name}: a Python package is a .whl, .tar.gz or .zip")
+                dest = packages / fname
+                part.replace(dest)
+                await asyncio.to_thread(install_python, str(dest))
+                record = {"version": entry["version"], "kind": "python", "path": str(dest),
+                          "package": entry["name"]}  # the entry is named after its pip package
             on_done(name, record)
             p["status"] = "installed"
         except Exception as e:
@@ -255,8 +243,8 @@ def start_install(entry: dict, catalog_url: str, home: Path, on_done) -> None:
     task.add_done_callback(_tasks.discard)
 
 
-def remove(record: dict) -> None:
-    if record.get("kind") == "toolchain" and record.get("path"):
-        shutil.rmtree(record["path"], ignore_errors=True)
-    elif record.get("path"):
+def remove(record: dict, uninstall_python=None) -> None:
+    if record.get("kind") == "python" and uninstall_python and record.get("package"):
+        uninstall_python(record["package"])
+    if record.get("path"):
         Path(record["path"]).unlink(missing_ok=True)

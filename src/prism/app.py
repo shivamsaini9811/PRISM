@@ -1121,7 +1121,7 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
                       timeout=settings().request_timeout_s, max_s=settings().reply_max_s, deep=opts["deep"],
                       ask=ask, askable=askable, max_asks=opts["asks"],
                       run=run if running_on else None, runnable=[n for n in members if n != MODERATOR])
-    session.languages = runner().languages() if running_on else []
+    session.python = python_version() if running_on else ""
     _sessions[chat_id] = session
     if chat["title"] == "New chat":
         s.update_chat(chat_id, title=text[:60], primary_platform=primary)
@@ -1491,8 +1491,8 @@ class AppRunEnv(flows.RunEnv):
             parts.insert(0, context_block(items))
         return "\n\n".join(parts)
 
-    def can_run(self, agent: dict) -> list[str]:
-        return runner().languages() if "run" in (agent.get("tools") or []) and runner_mode() == "on" else []
+    def can_run(self, agent: dict) -> str:
+        return python_version() if "run" in (agent.get("tools") or []) and runner_mode() == "on" else ""
 
     async def run(self, who: str, req) -> runner_mod.Request:
         if runner_mode() != "on":
@@ -1726,12 +1726,19 @@ def runner_mode() -> str:
     return store().get_meta("runner_mode") or "on"
 
 
-def installed_toolchains() -> dict[str, str]:
-    """Commands from catalog toolchains: name -> the program's path."""
-    out = {}
-    for item in json.loads(store().get_meta("installed") or "{}").values():
-        out.update(item.get("commands") or {})
-    return out
+@lru_cache
+def sandbox() -> runner_mod.Sandbox:
+    """PRISM's Python sandbox: what bots' code runs in and what they pip install into."""
+    return runner_mod.Sandbox(data_dir() / "python" / "env")
+
+
+@lru_cache
+def python_version() -> str:
+    """The version of PRISM's own Python ("" if it isn't there - then bots aren't offered RUN)."""
+    try:
+        return sandbox().version()
+    except Exception:
+        return ""
 
 
 @lru_cache
@@ -1740,7 +1747,7 @@ def runner() -> runner_mod.Runner:
         data_dir() / "work",
         rules=lambda: json.loads(store().get_meta("run_rules") or "{}"),
         save_rules=lambda r: store().set_meta("run_rules", json.dumps(r)),
-        toolchains=installed_toolchains, timeout=settings().run_timeout_s)
+        sandbox=sandbox(), timeout=settings().run_timeout_s)
 
 
 def run_cards(chat_id: int):
@@ -1787,10 +1794,12 @@ async def decide_command(request_id: str, body: DecideIn) -> dict:
 
 
 @app.get("/api/runner")
-def runner_settings() -> dict:
+async def runner_settings() -> dict:
+    sb = sandbox()
     return {"mode": runner_mode(), "rules": json.loads(store().get_meta("run_rules") or "{}"),
-            "languages": runner().languages(), "work": str(data_dir() / "work"),
-            "timeout_s": settings().run_timeout_s, "toolchains": installed_toolchains()}
+            "python": python_version(), "runtime": runner_mod.runtime_python(),
+            "sandbox": str(sb.path), "ready": sb.ready(), "work": str(data_dir() / "work"),
+            "timeout_s": settings().run_timeout_s, "packages": await asyncio.to_thread(sb.installed)}
 
 
 class RunnerIn(BaseModel):
@@ -1799,17 +1808,55 @@ class RunnerIn(BaseModel):
 
 
 @app.put("/api/runner")
-def put_runner(body: RunnerIn) -> dict:
+async def put_runner(body: RunnerIn) -> dict:
     if body.mode is not None:
         if body.mode not in ("on", "off"):
             raise HTTPException(400, "mode is on or off")
         store().set_meta("runner_mode", body.mode)
     if body.rules is not None:
         store().set_meta("run_rules", json.dumps(body.rules))
-    return runner_settings()
+    return await runner_settings()
 
 
-# --- catalog: toolchains and models from the user's own server, signed ------------------------
+class PackagesIn(BaseModel):
+    install: list[str] = []
+
+
+@app.post("/api/runner/packages")
+async def install_packages(body: PackagesIn) -> dict:
+    """You install packages into the sandbox yourself (Settings)."""
+    bad = [p for p in body.install if not runner_mod.PACKAGE.match(p)]
+    if bad or not body.install:
+        raise HTTPException(400, f"Not package names: {', '.join(bad) or '(none given)'}")
+    try:
+        await asyncio.to_thread(sandbox().install, body.install)
+    except runner_mod.RunError as e:
+        raise HTTPException(400, str(e)) from e
+    return await runner_settings()
+
+
+@app.delete("/api/runner/packages/{name}")
+async def uninstall_package(name: str) -> dict:
+    if not runner_mod.PACKAGE.match(name):
+        raise HTTPException(400, "Not a package name")
+    await asyncio.to_thread(sandbox().uninstall, name)
+    return await runner_settings()
+
+
+@app.post("/api/runner/reset")
+async def reset_sandbox() -> dict:
+    """Empty the sandbox: what bots installed goes; PRISM's own packages stay."""
+    if runner().pending:
+        raise HTTPException(409, "A run is waiting for your approval - answer it first")
+    await asyncio.to_thread(sandbox().reset)
+    have = installed()
+    for name in [n for n, r in have.items() if r.get("kind") == "python"]:
+        have.pop(name)
+    store().set_meta("installed", json.dumps(have))
+    return await runner_settings()
+
+
+# --- catalog: Python packages and models from the user's own server, signed ------------------
 
 def catalog_keys() -> list[str]:
     return catalog.bundled_keys() + json.loads(store().get_meta("catalog_keys") or "[]")
@@ -1909,7 +1956,7 @@ async def install_entry(body: InstallIn) -> dict:
     def done(name: str, record: dict) -> None:
         have = installed()
         if (old := have.get(name)) and old.get("path") != record.get("path"):
-            catalog.remove(old)
+            catalog.remove({**old, "package": None})  # the new version replaced it in the sandbox
         have[name] = record
         s.set_meta("installed", json.dumps(have))
         if record["kind"] == "model":  # it joins the room under its @name, like other local models
@@ -1920,7 +1967,8 @@ async def install_entry(body: InstallIn) -> dict:
                 except Exception:
                     log.warning("could not add %s to the room", name_)
     try:
-        catalog.start_install(entry, s.get_meta("catalog_url"), data_dir(), done)
+        catalog.start_install(entry, s.get_meta("catalog_url"), data_dir(), done,
+                              install_python=lambda path: sandbox().install([path]))
     except catalog.CatalogError as e:
         raise HTTPException(400, str(e)) from e
     return catalog_view()
@@ -1930,6 +1978,6 @@ async def install_entry(body: InstallIn) -> dict:
 def remove_entry(name: str) -> dict:
     have = installed()
     if name in have:
-        catalog.remove(have.pop(name))
+        catalog.remove(have.pop(name), uninstall_python=sandbox().uninstall)
         store().set_meta("installed", json.dumps(have))
     return catalog_view()

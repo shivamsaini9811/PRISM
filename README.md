@@ -94,23 +94,29 @@ Research has started…", reloads a page that stops updating (Gemini), and bring
 full report: from Claude's document panel, ChatGPT's report frame, Gemini's report panel.
 Checked against all four sites on 2026-10-25: 1 min (Grok) to 37 min (Gemini).
 
-**Running programs**: a bot (or a flow agent with the *run* tool) can end its reply with
-`RUN @python` and a code block, or `RUN: <command>`. The chat shows a card with the exact code,
-the folder and the tool: **Run once**, **Always allow <tool> in this chat**, **Always allow
-<tool>**, or **Don't run**. It runs in the chat's work folder (`~/.prism/work/`), stops after 5
-minutes (`RUN_TIMEOUT_S`), gets none of PRISM's saved keys, and what it prints - plus files it
-made, downloadable from the card - goes back to the bot. It is not a sandbox: an approved
-program has your account's rights. Settings → Running programs switches it off and lists the
-allow rules ("Ask again" removes one). Flows also have a `tool: run` step (`command:`, or
-`code:` + `lang:`).
+**Running Python**: a bot (or a flow agent with the *run Python* tool) can end its reply with
+`RUN @python` and a code block. The chat shows a card with the exact code and folder: **Run
+once**, **Always allow Python in this chat**, **Always allow Python**, or **Don't run**. The
+code runs on PRISM's own Python, shipped with the app (CPython 3.12 with numpy, pandas,
+scipy, matplotlib, seaborn, scikit-learn, statsmodels, sympy, networkx, duckdb, pyarrow,
+openpyxl, xlsxwriter, python-docx, python-pptx, pypdf, pillow, requests, httpx,
+beautifulsoup4, lxml, plotly and more - `runtime/PRISM-PACKAGES.txt` lists them), inside a
+sandbox (`~/.prism/python/env`, a virtual environment that sees those packages). A first line
+`# pip: name1 name2` installs packages into the sandbox - always asked, even where Python is
+allowed - so neither PRISM's Python nor the computer's changes; Settings → Running Python
+lists them, installs and removes, and **Reset sandbox** empties it. A run uses the chat's
+work folder (`~/.prism/work/`), stops after 5 minutes (`RUN_TIMEOUT_S`), gets none of PRISM's
+saved keys, and what it prints - plus files it made, downloadable from the card - goes back
+to the bot. It is not an operating-system sandbox: approved code has your account's rights.
+Flows also have a `tool: run` step with `code:`. Builds include the runtime (~1 GB unpacked;
+`build.py --no-runtime` leaves it out).
 
-**Catalog - tools and models from your own server, signed by you**
+**Catalog - Python packages and models from your own server, signed by you**
 
 ```bash
 prism-publish keygen --out ~/prism-keys          # once; keep the .key file off the server
 prism-publish new catalog.json --name "My tools"
-prism-publish add catalog.json --name python --version 3.12.7 \
-    --file windows-x64=python-win.zip --file macos-arm64=python-mac.tar.gz --command python=python.exe
+prism-publish add catalog.json --name mytools --version 1.2.0 --file any=mytools-1.2.0-py3-none-any.whl
 prism-publish add catalog.json --name qwen-7b --version q4 --kind model --file any=qwen.gguf --as qwen
 prism-publish sign catalog.json --key ~/prism-keys/prism-publisher.key   # bumps version, 90-day expiry
 ```
@@ -120,8 +126,9 @@ Settings → Catalog: the address and your public key (`ed25519:…`, printed by
 it in a build as `src/prism/publisher.pub`). PRISM installs nothing without a key, and only
 from a catalog whose signature matches, whose version isn't older than the last one it took,
 and that hasn't expired; every download must match its SHA-256 and archives can't write
-outside their folder. Toolchains go to `~/.prism/toolchains/` and their commands become
-available to RUN; models are handed to Ollama and join the room under their `as` name.
+outside their folder. Python packages (`--kind python`, the default: a wheel or source
+archive named after its pip package) install into the Python sandbox, where bots' code can
+import them; models are handed to Ollama and join the room under their `as` name.
 
 **Local models by address**: Settings → Local models → *A server by address* takes any
 OpenAI-compatible server (llama.cpp's `llama-server`, vLLM, LocalAI, Jan, a GPU box) with an
@@ -225,15 +232,15 @@ src/prism/
   readers.py       files of every kind to text
   enrich.py        reader models: images and scans, transcription, embeddings
   local.py         Ollama / LM Studio / OpenAI-compatible servers / in-browser models, .gguf import
-  runner.py        RUN: approval, work folders, running programs for bots and flows
-  catalog.py       the signed catalog: verify, install toolchains and models
+  runner.py        RUN @python: approval, the Python sandbox and pip, work folders
+  catalog.py       the signed catalog: verify, install Python packages and models
   publish.py       prism-publish: keys, checksums, signing
   db.py            SQLite store + migrations
   crypto.py        master-password vault
   providers/       API adapters (Anthropic, OpenAI-compatible, Gemini)
   browser/         Playwright transport: profiles, generic site driver, site selectors
   static/index.html
-packaging/         PyInstaller build
+packaging/         PyInstaller build; runtime.py = PRISM's own Python and its packages
 tests/
 ```
 

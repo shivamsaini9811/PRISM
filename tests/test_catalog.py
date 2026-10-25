@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from prism import app as app_mod, catalog, publish
 from prism.catalog import CatalogError, check, verify
+from conftest import make_wheel
 from test_app import client  # noqa: F401 - the app fixture
 
 
@@ -67,19 +68,12 @@ def test_archives_cannot_escape(tmp_path):
 def server(tmp_path_factory, keys):
     line, private = keys
     root = tmp_path_factory.mktemp("srv")
-    tool = io.BytesIO()
-    with zipfile.ZipFile(tool, "w") as z:
-        info = zipfile.ZipInfo("bin/hello.sh")
-        info.external_attr = 0o755 << 16
-        z.writestr(info, "#!/bin/sh\necho hello-from-catalog\n")
-        z.writestr("bin/hello.bat", "@echo hello-from-catalog\n")
-    (root / "hello.zip").write_bytes(tool.getvalue())
-    (root / "broken.zip").write_bytes(tool.getvalue())
+    make_wheel(root, "prismcat", "1.0", "GREETING = 'hello-from-catalog'\n")
+    make_wheel(root, "prismbroken", "1.0")
     cat = root / "catalog.json"
     publish.new(cat, "Test tools")
-    cmd = "bin/hello.bat" if sys.platform == "win32" else "bin/hello.sh"
-    publish.add(cat, "hello", "1.0", "toolchain", [f"any={root / 'hello.zip'}"], [f"hello={cmd}"], "Says hello")
-    publish.add(cat, "broken", "1.0", "toolchain", [f"any={root / 'broken.zip'}"], [f"hello={cmd}"])
+    publish.add(cat, "prismcat", "1.0", "python", [f"any={root / 'prismcat-1.0-py3-none-any.whl'}"], [], "Says hello")
+    publish.add(cat, "prismbroken", "1.0", "python", [f"any={root / 'prismbroken-1.0-py3-none-any.whl'}"], [])
     doc = json.loads(cat.read_text())
     doc["entries"][1]["files"]["any"]["sha256"] = "0" * 64  # its download won't match
     cat.write_text(json.dumps(doc, indent=2))
@@ -115,27 +109,25 @@ def test_catalog_install_through_the_app(client, server):
     client.put("/api/catalog", json={"url": url})
     r = client.post("/api/catalog/refresh")
     assert r.status_code == 400 and "no publisher key" in r.json()["detail"]
-    assert client.post("/api/catalog/install", json={"name": "hello"}).status_code == 400  # nothing unsigned
+    assert client.post("/api/catalog/install", json={"name": "prismcat"}).status_code == 400  # nothing unsigned
     assert client.put("/api/catalog", json={"add_key": "nonsense"}).status_code == 400
     v = client.put("/api/catalog", json={"add_key": line}).json()
     assert v["keys"][0]["fingerprint"] == catalog.fingerprint(line)
     v = client.post("/api/catalog/refresh").json()
-    assert v["name"] == "Test tools" and [e["name"] for e in v["entries"]] == ["hello", "broken"]
+    assert v["name"] == "Test tools" and [e["name"] for e in v["entries"]] == ["prismcat", "prismbroken"]
 
-    client.post("/api/catalog/install", json={"name": "hello"})
-    v = wait_install(client, "hello")
-    assert v["installs"]["hello"]["error"] is None, v["installs"]["hello"]
-    assert v["installed"]["hello"]["version"] == "1.0"
-    tools = app_mod.installed_toolchains()
-    assert set(tools) == {"hello"}
+    client.post("/api/catalog/install", json={"name": "prismcat"})
+    v = wait_install(client, "prismcat")
+    assert v["installs"]["prismcat"]["error"] is None, v["installs"]["prismcat"]
+    assert v["installed"]["prismcat"]["version"] == "1.0"
     from prism.runner import Request, execute
-    done = execute(Request("bot", "hello", command="hello"), root / "work", tools, 30)
-    assert done.output.strip() == "hello-from-catalog"
-    assert client.get("/api/runner").json()["toolchains"] == tools
+    done = execute(Request("bot", "import prismcat\nprint(prismcat.GREETING)"), root / "work", app_mod.sandbox(), 30)
+    assert done.output.strip() == "hello-from-catalog"  # bots' code can import it now
+    assert "prismcat" in [p["name"] for p in client.get("/api/runner").json()["packages"]]
 
-    client.post("/api/catalog/install", json={"name": "broken"})
-    v = wait_install(client, "broken")
-    assert "checksum" in v["installs"]["broken"]["error"] and "broken" not in v["installed"]
+    client.post("/api/catalog/install", json={"name": "prismbroken"})
+    v = wait_install(client, "prismbroken")
+    assert "checksum" in v["installs"]["prismbroken"]["error"] and "prismbroken" not in v["installed"]
 
     # The same server later serves an older catalog (say, restored from a backup): refused.
     cat = root / "catalog.json"
@@ -147,8 +139,8 @@ def test_catalog_install_through_the_app(client, server):
     r = client.post("/api/catalog/refresh")
     assert r.status_code == 400 and "older than" in r.json()["detail"]
 
-    v = client.delete("/api/catalog/hello").json()
-    assert "hello" not in v["installed"] and app_mod.installed_toolchains() == {}
+    v = client.delete("/api/catalog/prismcat").json()
+    assert "prismcat" not in v["installed"] and app_mod.sandbox().missing(["prismcat"]) == ["prismcat"]
 
 
 def test_prism_publish_command(tmp_path, capsys):
@@ -162,7 +154,7 @@ def test_prism_publish_command(tmp_path, capsys):
     cat = tmp_path / "catalog.json"
     publish.main(["new", str(cat), "--name", "Mine"])
     publish.main(["add", str(cat), "--name", "tool", "--version", "2", "--file", f"windows-x64={tool}",
-                  "--command", "tool=bin/tool.exe", "--url-base", "https://lib.example.com/files"])
+                  "--url-base", "https://lib.example.com/files"])
     publish.main(["sign", str(cat), "--key", str(tmp_path / "k" / "prism-publisher.key")])
     publish.main(["sign", str(cat), "--key", str(tmp_path / "k" / "prism-publisher.key")])
     publish.main(["verify", str(cat), "--pub", line])
@@ -170,4 +162,4 @@ def test_prism_publish_command(tmp_path, capsys):
     assert "Signed version 2" in out and "Valid: version 2, 1 entries" in out
     entry = json.loads(cat.read_text())["entries"][0]
     assert entry["files"]["windows-x64"]["url"] == "https://lib.example.com/files/tool.zip"
-    assert len(entry["files"]["windows-x64"]["sha256"]) == 64 and entry["commands"] == {"tool": "bin/tool.exe"}
+    assert len(entry["files"]["windows-x64"]["sha256"]) == 64 and entry["kind"] == "python"

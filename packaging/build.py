@@ -39,6 +39,8 @@ def main() -> None:
                     default=Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "prism-build")
     ap.add_argument("--dist-dir", type=Path, default=ROOT / "dist")
     ap.add_argument("--arch", default="", help="label for the zip name, e.g. arm64 or x86_64")
+    ap.add_argument("--no-runtime", action="store_true",
+                    help="leave out PRISM's own Python (bots can't RUN code; a much smaller build)")
     args = ap.parse_args()
 
     # Isolated build venv so the result never depends on what this machine has installed.
@@ -89,6 +91,14 @@ def main() -> None:
                    if line.startswith("__version__"))
     osname = {"Windows": "windows", "Darwin": "macos"}.get(platform.system(), "linux")
     stem = args.dist_dir / f"PRISM-{version}-{osname}{'-' + args.arch if args.arch else ''}"
+    if not args.no_runtime:  # PRISM's own Python with its packages (packaging/runtime.py)
+        sys.path.insert(0, str(ROOT / "packaging"))
+        import runtime
+        src = runtime.prepare(args.build_dir)
+        dest = (args.dist_dir / "PRISM.app/Contents/Resources/runtime") if mac else (args.dist_dir / "PRISM/runtime")
+        print(f"+ copying PRISM's Python into {dest}", flush=True)
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(src, dest, symlinks=True)
     if mac:
         app = args.dist_dir / "PRISM.app"
         finish_mac_app(app, version)
