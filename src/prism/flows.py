@@ -42,7 +42,7 @@ from .meeting import _ask_request, _err
 from .providers import Provider, wait_reply
 
 NODE_TYPES = ("agent", "tool", "ask_you", "wait", "flow")
-TOOLS = ("docs", "prism", "fetch")
+TOOLS = ("docs", "prism", "fetch", "run")
 NAME = re.compile(r"^[A-Za-z][\w-]{0,40}$")
 TEMPLATE = re.compile(r"\{\{\s*([\w/-]+)(?:\.([\w-]+))?\s*\}\}")
 DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(s|sec|m|min|h|hr|d)?\s*$", re.I)
@@ -51,6 +51,7 @@ MAX_NODE_RUNS = 25           # one node, in one run (a backstop under max_rounds
 MAX_SUBFLOW_DEPTH = 3
 HISTORY_KEEP = 24            # messages of an API/local agent's conversation kept in the state
 MAX_ASKS = 3
+MAX_RUNS = 5
 
 
 class FlowError(ValueError):
@@ -178,6 +179,8 @@ def parse(source: str, agents: Callable[[str], dict | None] = lambda n: None,
             node.label = str(spec["tool"])
             if node.label not in TOOLS:
                 errors.append(f"nodes.{nid}: tool is one of {', '.join(TOOLS)}")
+            elif node.label == "run" and not (spec.get("command") or (spec.get("code") and spec.get("lang"))):
+                errors.append(f"nodes.{nid}: tool run needs command: <a command line>, or code: and lang: (python, node, ...)")
         elif t == "ask_you":
             node.label = str(spec["ask_you"])[:60]
         elif t == "wait":
@@ -563,6 +566,14 @@ class RunEnv:
     async def tool(self, name: str, query: str) -> str:
         return ""
 
+    async def run(self, who: str, req) -> "object":
+        """A program to run, after the user approves it: returns the finished request."""
+        raise StepError("running programs is off (Settings → Running programs)")
+
+    def can_run(self, agent: dict) -> list[str]:
+        """Languages an agent may RUN in (empty: it may not)."""
+        return []
+
     def emit(self, kind: str, **data) -> int | None:
         return None
 
@@ -698,6 +709,19 @@ class Run:
                     pass
             s.wake.pop(node, None)
             out = {"text": f"waited {n.spec['wait']}"}
+        elif n.type == "tool" and n.spec["tool"] == "run":
+            from .runner import Request, result_for_bot
+            filled = lambda k: fill(str(n.spec.get(k) or ""), s.outputs, s.inputs, self.flow.aliases)
+            req = (Request(node, filled("command").split()[0].lower(), command=filled("command")) if n.spec.get("command")
+                   else Request(node, str(n.spec["lang"]).lower(), code=filled("code"), lang=str(n.spec["lang"]).lower()))
+            started = time.perf_counter()
+            done = await self.env.run(node, req)
+            if done.status != "done":
+                raise StepError(f"the program didn't run ({done.status}): {done.output[:200]}")
+            out = {"text": done.output, "exit_code": str(done.exit_code), "files": ", ".join(done.files)}
+            self.env.emit("step", node=node, type="tool", label=f"run {req.tool}", prompt=req.command or req.code,
+                          text=done.output, round=s.node_runs.get(node, 0) + 1,
+                          latency_s=round(time.perf_counter() - started, 1))
         elif n.type == "tool":
             query = fill(str(n.spec.get("query") or n.spec.get("url") or n.spec.get("prompt") or ""),
                          s.outputs, s.inputs, self.flow.aliases)
@@ -770,11 +794,22 @@ class Run:
         if askable:
             system += ASK_TOOL.format(names=", ".join(askable), max_asks=MAX_ASKS,
                                       hints="; ".join(ASK_HINTS.get(a, f"{a} is another assistant the user uses") for a in askable))
+        from .runner import RUN_HELP, parse_request, result_for_bot
+        langs = self.env.can_run(agent)
+        if langs:
+            system += RUN_HELP.format(langs=", ".join(langs), max_runs=MAX_RUNS)
         provider = self.env.provider(agent, memory)
         started = time.perf_counter()
         msgs = list(memory["history"]) + [{"role": "user", "content": full}]
         text = await wait_reply(provider.complete(list(msgs), system), provider, self.env.timeout, self.env.max_s)
         msgs.append({"role": "assistant", "content": text})
+        runs = 0
+        while langs and runs < MAX_RUNS and (req := parse_request(text, name)):
+            runs += 1
+            done = await self.env.run(name, req)
+            msgs.append({"role": "user", "content": result_for_bot(done)})
+            text = await wait_reply(provider.complete(list(msgs), system), provider, self.env.timeout, self.env.max_s)
+            msgs.append({"role": "assistant", "content": text})
         asks = 0
         while askable and (q := _ask_request(text)) and q.group(1).lower() in askable and asks < MAX_ASKS:
             asks += 1

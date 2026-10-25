@@ -21,3 +21,4 @@ class Settings(BaseSettings):
     # after this long with no sign of activity, or after reply_max_s in all.
     request_timeout_s: float = 1200.0
     reply_max_s: float = 4 * 3600.0
+    run_timeout_s: float = 300.0  # a program a bot runs (RUN) is stopped after this long

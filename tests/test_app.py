@@ -13,7 +13,7 @@ from test_meeting import Fake
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PRISM_HOME", str(tmp_path))
     monkeypatch.setenv("PRISM_DB_PATH", str(tmp_path / "t.db"))
-    for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library):
+    for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library, app_mod.runner):
         fn.cache_clear()
     app_mod._vault["key"] = None
 
@@ -813,3 +813,52 @@ def test_draft_flow_is_checked_and_fixed_once(client, monkeypatch):
     assert "write then check, twice" in prompts[0] and "{{input.name}}" in prompts[0] and "@claude" in prompts[0]
     assert "has no limit" in prompts[1]
     assert r["errors"] == [] and r["source"].startswith("name: d")
+
+
+def test_bot_runs_a_program_after_approval(client, monkeypatch):
+    import sys
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+    monkeypatch.setattr(app_mod, "installed_toolchains", lambda: {"python": sys.executable})
+    seen = []
+
+    class Coder:
+        name, model, thread_url = "gpt", "gpt-fake", None
+
+        async def complete(self, messages, system=None):
+            seen.append((system, messages[-1]["content"]))
+            if "[ran python" in messages[-1]["content"]:
+                return "The answer is " + messages[-1]["content"].split("\n")[1]
+            return "Let me compute it.\nRUN @python\n```python\nprint(6 * 7)\n```"
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: Coder())
+    chat = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt what is 6 x 7?", "format": "chat"})
+    for _ in range(200):
+        v = client.get(f"/api/chats/{chat}").json()
+        card = next((m for m in v["messages"] if m["meta"]["kind"] == "run_request"), None)
+        if card:
+            break
+        time.sleep(0.02)
+    assert "RUN @<language>" in seen[0][0] and "python" in seen[0][0]
+    assert card["meta"]["status"] == "pending" and card["meta"]["code"] == "print(6 * 7)"
+    assert v["meeting"]["approving"] == ["gpt"]
+    r = client.post(f"/api/commands/{card['meta']['id']}", json={"allow": "chat", "chat_id": chat})
+    assert r.status_code == 200
+    v = wait_meeting(client, chat)
+    card = next(m for m in v["messages"] if m["meta"]["kind"] == "run_request")
+    assert card["meta"]["status"] == "done" and card["meta"]["output"].strip() == "42"
+    assert v["messages"][-1]["content"] == "The answer is 42"
+    assert client.get("/api/runner").json()["rules"] == {"chats": {str(chat): ["python"]}}
+    assert client.post(f"/api/commands/{card['meta']['id']}", json={"allow": "once"}).status_code == 409
+
+    # Off: bots are not offered RUN at all.
+    client.put("/api/runner", json={"mode": "off"})
+    seen.clear()
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt again", "format": "chat"})
+    wait_meeting(client, chat)
+    assert "RUN @<language>" not in seen[0][0]
+    # A card left waiting when PRISM closed is marked expired.
+    s = app_mod.store()
+    mid = s.add_message(chat, None, "assistant", "", {"kind": "run_request", "status": "pending", "id": "x"})
+    app_mod.recover_runs()
+    assert next(m for m in s.thread(chat) if m["id"] == mid)["meta"]["status"] == "expired"

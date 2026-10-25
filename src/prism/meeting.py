@@ -32,6 +32,9 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .providers import Message, Provider, wait_reply
+from .runner import RUN_HELP, Request, parse_request, result_for_bot
+
+MAX_RUNS = 5  # programs a bot may run per turn (each one approved by the user)
 
 # How long each bot may talk per turn (words; 0 = no limit). A prompt instruction - web apps
 # can't enforce it.
@@ -209,19 +212,24 @@ class Statement:
 Emit = Callable[..., int | None]
 # ask(platform, question) -> what that platform's own memory of the user answers
 Ask = Callable[[str, str], Awaitable[str]]
+# run(member, request) -> the request, run (or refused) after the user's approval
+RunFn = Callable[[str, "Request"], Awaitable["Request"]]
 
 
 class Session:
     def __init__(self, room: list[Entry], members: dict[str, Member], script: Script, emit: Emit,
                  context: str = "", timeout: float = 300.0, deep: bool = False,
                  ask: Ask | None = None, askable: list[str] = (), max_asks: int = MAX_ASKS,
-                 max_s: float = 4 * 3600.0):
+                 max_s: float = 4 * 3600.0, run: "RunFn | None" = None, runnable: list[str] = ()):
         if script.moderated and MODERATOR not in members:
             raise ValueError("a moderated format needs the moderator")
         self.room, self.members, self.script, self.emit = room, members, script, emit
         # timeout: give up on a turn after this long with no sign the model is working;
         # max_s: in all. A model that keeps working (long research) is not cut off.
         self.context, self.timeout, self.deep, self.max_s = context, timeout, deep, max_s
+        # run(member, request) -> the finished request: the app asks the user, then runs it
+        self.run_fn, self.runnable, self.approving = run, set(runnable), set()
+        self.languages: list[str] = []  # what a RUN can use here (set by the app)
         self.ask, self.askable, self.max_asks = ask, list(askable), max_asks
         self.rounds = script.rounds
         self.round = 0
@@ -269,7 +277,8 @@ class Session:
     def status(self) -> dict:
         return {"running": self.phase != "done", "format": self.script.format,
                 "phase": self.phase, "round": self.round, "rounds": self.rounds,
-                "waiting_on": sorted(self.waiting_on), "stopping": self.stopped}
+                "waiting_on": sorted(self.waiting_on), "stopping": self.stopped,
+                "approving": sorted(self.approving)}
 
     # --- running -------------------------------------------------------------------------
 
@@ -321,19 +330,28 @@ class Session:
                          if files[t.speaker] else m.provider.complete(list(msgs), self._system(m)))
                 st.text = await wait_reply(first, m.provider, self.timeout, self.max_s)
                 msgs.append({"role": "assistant", "content": st.text})
-                asks = 0
-                while (q := _ask_request(st.text)) and (targets := self._targets(m, q.group(1))):
-                    if asks >= self.max_asks:  # budget spent: it answers with what it has
-                        answer = ("[No asks left this turn.] Finish your answer now with what you "
-                                  "have, and say what is still unknown.")
+                asks = runs = 0
+                while True:  # ASKs and RUNs at the end of the reply: answer them, let it go on
+                    if (q := _ask_request(st.text)) and (targets := self._targets(m, q.group(1))):
+                        if asks >= self.max_asks:  # budget spent: it answers with what it has
+                            answer = ("[No asks left this turn.] Finish your answer now with what "
+                                      "you have, and say what is still unknown.")
+                        else:
+                            asks += 1
+                            answer = await self._lookup(m.name, targets, q.group(2).strip())
+                    elif self.run_fn and m.name in self.runnable and (req := parse_request(st.text, m.name)):
+                        if runs >= MAX_RUNS:
+                            answer = "[No runs left this turn.] Finish your answer with what you have."
+                        else:
+                            runs += 1
+                            answer = await self._run(m.name, req)
                     else:
-                        asks += 1
-                        answer = await self._lookup(m.name, targets, q.group(2).strip())
+                        break
                     msgs.append({"role": "user", "content": answer})
                     st.text = await wait_reply(m.provider.complete(list(msgs), self._system(m)),
                                                m.provider, self.timeout, self.max_s)
                     msgs.append({"role": "assistant", "content": st.text})
-                    if answer.startswith("[No asks left"):
+                    if answer.startswith(("[No asks left", "[No runs left")):
                         break
                 m.history = msgs
                 # Only now: a bot whose turn failed gets the same messages again next time.
@@ -402,6 +420,21 @@ class Session:
         name = name.lower()
         return askable if name in ("any", "all") else [name] if name in askable else []
 
+    async def _run(self, who: str, req: Request) -> str:
+        """A RUN: waits for the user's approval (the card is in the room), then runs it."""
+        self.approving.add(who)
+        self._status()
+        try:
+            done = await self.run_fn(who, req)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return f"[the run could not start: {_err(e)}] Finish your reply without it."
+        finally:
+            self.approving.discard(who)
+            self._status()
+        return result_for_bot(done)
+
     async def _lookup(self, asker: str, targets: list[str], question: str) -> str:
         """One ASK, to one platform or several at once; each exchange joins the room."""
         async def one(target: str) -> str:
@@ -437,6 +470,8 @@ class Session:
                                  prism=tools) if assistants else
                  ASK_TOOLS_ONLY.format(max_asks=self.max_asks, tools=tools) if askable else "")
         role = f" Your role here, set by the user: {m.role}" if m.role else ""
+        if self.run_fn and m.name in self.runnable and self.languages:
+            help_ += RUN_HELP.format(langs=", ".join(self.languages), max_runs=MAX_RUNS)
         return _with_context(MEMBER_SYSTEM.format(name=m.name, others=others,
                                                   deep=role + (DEEP if self.deep else "") + help_),
                              self.context)

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Se
                       context_block, make_script)
 from . import enrich, flows, local, readers
 from .library import Library, attachable, passages_text
+from . import runner as runner_mod
 from .providers import PLATFORMS, Provider, build_provider, wait_reply
 
 STATIC = Path(__file__).parent / "static"
@@ -1102,9 +1104,15 @@ async def start_session(chat: dict, text: str, body: SendIn) -> None:
     # Memory lives in the signed-in web apps; API models remember nothing between calls.
     askable = ([PRISM_BOT] + ([DOCS_BOT] if any(c.get("library") for c in s.context_for(chat_id)) else [])
                + [p for p, c in creds.items() if c["transport"] == "browser"])
+    async def run(who: str, req: runner_mod.Request) -> runner_mod.Request:
+        return await runner().request(req, chat_id, *run_cards(chat_id))
+
+    running_on = runner_mode() == "on"
     session = Session(room, members, script, emit, context=context_block(context_items),
                       timeout=settings().request_timeout_s, max_s=settings().reply_max_s, deep=opts["deep"],
-                      ask=ask, askable=askable, max_asks=opts["asks"])
+                      ask=ask, askable=askable, max_asks=opts["asks"],
+                      run=run if running_on else None, runnable=[n for n in members if n != MODERATOR])
+    session.languages = runner().languages() if running_on else []
     _sessions[chat_id] = session
     if chat["title"] == "New chat":
         s.update_chat(chat_id, title=text[:60], primary_platform=primary)
@@ -1323,9 +1331,9 @@ def put_agent(name: str, body: AgentIn) -> dict:
                                  "not a platform's or a room member's name")
     if agent_platform({"model": body.model}) not in platforms:
         raise HTTPException(400, f"No room member {body.model} - set it up in Settings first")
-    bad = [t for t in body.tools if t not in ("ask", "docs", "prism")]
+    bad = [t for t in body.tools if t not in ("ask", "docs", "prism", "run")]
     if bad:
-        raise HTTPException(400, f"Unknown tools {bad} - use ask, docs, prism")
+        raise HTTPException(400, f"Unknown tools {bad} - use ask, docs, prism, run")
     spec = body.model_dump()
     spec["model"] = "@" + agent_platform(spec)
     spec["context"] = [context_name(c.lstrip("#")) for c in body.context if c.strip("# ")]
@@ -1474,6 +1482,15 @@ class AppRunEnv(flows.RunEnv):
             parts.insert(0, context_block(items))
         return "\n\n".join(parts)
 
+    def can_run(self, agent: dict) -> list[str]:
+        return runner().languages() if "run" in (agent.get("tools") or []) and runner_mode() == "on" else []
+
+    async def run(self, who: str, req) -> runner_mod.Request:
+        if runner_mode() != "on":
+            raise flows.StepError("running programs is off (Settings → Running programs)")
+        r = store().get_run(self.run_id)
+        return await runner().request(req, self.chat_id, *run_cards(self.chat_id), flow=r["flow"] if r else None)
+
     def askable(self, agent: dict) -> list[str]:
         tools = agent.get("tools") or []
         out = [t for t in ("docs", "prism") if t in tools or "ask" in tools]
@@ -1545,7 +1562,11 @@ class AppRunEnv(flows.RunEnv):
 
 
 def recover_runs() -> None:
-    """Runs that were going when PRISM closed wait to be continued."""
+    """Runs that were going when PRISM closed wait to be continued; programs waiting for
+    approval then can't be run any more (the bot's turn is gone)."""
+    for m in store().messages_of_kind("run_request"):
+        if m["meta"].get("status") in ("pending", "running"):
+            store().update_message(m["id"], {**m["meta"], "status": "expired"})
     for r in store().runs_with_status("running"):
         if r["id"] not in _run_tasks:
             store().save_run(r["id"], {**r["state"], "status": "paused",
@@ -1687,3 +1708,93 @@ async def answer_run(run_id: int, body: AnswerIn) -> dict:
             break
     launch(run_id, run)
     return chat_view(chat_id)
+
+
+# --- running programs (RUN): approval cards, rules, the work folder --------------------------
+
+def runner_mode() -> str:
+    """on: bots may ask to run programs (each run approved, or allowed by a rule); off: never."""
+    return store().get_meta("runner_mode") or "on"
+
+
+def installed_toolchains() -> dict[str, str]:
+    """Commands from catalog toolchains: name -> the program's path."""
+    out = {}
+    for item in json.loads(store().get_meta("installed") or "{}").values():
+        out.update(item.get("commands") or {})
+    return out
+
+
+@lru_cache
+def runner() -> runner_mod.Runner:
+    return runner_mod.Runner(
+        data_dir() / "work",
+        rules=lambda: json.loads(store().get_meta("run_rules") or "{}"),
+        save_rules=lambda r: store().set_meta("run_rules", json.dumps(r)),
+        toolchains=installed_toolchains, timeout=settings().run_timeout_s)
+
+
+def run_cards(chat_id: int):
+    """The approval card for a run request: written into the chat, then updated as it goes."""
+    s = store()
+
+    def emit(req: runner_mod.Request) -> int:
+        return s.add_message(chat_id, None, "assistant", "", {
+            "kind": "run_request", "speaker": req.who, "chat": chat_id,
+            "work": str(runner().work_dir(f"chat-{chat_id}")), **req.card()})
+
+    def update(req: runner_mod.Request, message_id: int) -> None:
+        meta = {"kind": "run_request", "speaker": req.who, "chat": chat_id,
+                "work": str(runner().work_dir(f"chat-{chat_id}")), **req.card()}
+        if req.status == "done" and req.files:  # small files it made can be opened from the card
+            media, work = [], runner().work_dir(f"chat-{chat_id}")
+            for rel in req.files[:runner_mod.FILES_MAX]:
+                src = work / rel
+                if src.is_file() and src.stat().st_size <= runner_mod.FILE_BYTES_MAX:
+                    media_dir().mkdir(parents=True, exist_ok=True)
+                    shown = re.sub(r"[^\w.\- ]+", "_", src.name)[:80]
+                    name = f"{uuid.uuid4().hex[:12]}-{shown}"
+                    shutil.copy2(src, media_dir() / name)
+                    media.append(name)
+            meta["media"] = media
+        s.update_message(message_id, meta)
+    return emit, update
+
+
+class DecideIn(BaseModel):
+    allow: str | None = None   # once | chat | flow | always; None refuses
+    chat_id: int | None = None
+    flow: str | None = None
+
+
+@app.post("/api/commands/{request_id}")
+async def decide_command(request_id: str, body: DecideIn) -> dict:
+    if body.allow not in (None, "once", "chat", "flow", "always"):
+        raise HTTPException(400, "allow is once, chat, flow or always")
+    if not runner().decide(request_id, body.allow, body.chat_id, body.flow):
+        raise HTTPException(409, "That request isn't waiting any more")
+    await asyncio.sleep(0.05)  # let the card change before the page reads it again
+    return chat_view(body.chat_id) if body.chat_id else {"ok": True}
+
+
+@app.get("/api/runner")
+def runner_settings() -> dict:
+    return {"mode": runner_mode(), "rules": json.loads(store().get_meta("run_rules") or "{}"),
+            "languages": runner().languages(), "work": str(data_dir() / "work"),
+            "timeout_s": settings().run_timeout_s, "toolchains": installed_toolchains()}
+
+
+class RunnerIn(BaseModel):
+    mode: str | None = None          # on | off
+    rules: dict | None = None        # the whole rule set (revoking = sending it without the rule)
+
+
+@app.put("/api/runner")
+def put_runner(body: RunnerIn) -> dict:
+    if body.mode is not None:
+        if body.mode not in ("on", "off"):
+            raise HTTPException(400, "mode is on or off")
+        store().set_meta("runner_mode", body.mode)
+    if body.rules is not None:
+        store().set_meta("run_rules", json.dumps(body.rules))
+    return runner_settings()

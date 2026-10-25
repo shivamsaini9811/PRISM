@@ -265,3 +265,32 @@ edges: [pause -> sub -> last]
     assert s.status == "done" and s.outputs["pause"]["text"] == "waited 0.05s"
     with pytest.raises(FlowError, match="nest at most"):
         parse("name: me\nnodes: {x: {flow: me}}", flows=lambda n: "name: me\nnodes: {x: {flow: me}}")
+
+
+async def test_run_step_and_agent_runs(tmp_path):
+    import sys
+    from prism.runner import execute
+    with pytest.raises(FlowError, match="tool run needs"):
+        parse("name: r\nnodes: {x: {tool: run}}")
+    f = parse("""
+name: r
+agents: {w: {model: "@gpt", tools: [run]}}
+nodes:
+  calc: {tool: run, lang: python, code: "print(len('{{input.word}}'))"}
+  say:  {agent: w, prompt: "The count was {{calc.text}}"}
+edges: [calc -> say]
+inputs: [word]
+""")
+
+    class RunEnv_(Env):
+        def can_run(self, agent):
+            return ["python"]
+
+        async def run(self, who, req):
+            return execute(req, tmp_path, {"python": sys.executable}, 30)
+    env = RunEnv_({"w": ["RUN @python\n```python\nprint(2 + 2)\n```", "It is 4."]})
+    s = await Run.start(f, {"word": "prism"}, env).run()
+    assert s.status == "done" and s.outputs["calc"]["text"].strip() == "5"
+    w = env.providers["w"]
+    assert w.calls[0][0][-1]["content"].startswith("The count was 5") and "RUN @<language>" in w.calls[0][1]
+    assert "[ran python" in w.calls[1][0][-1]["content"] and s.outputs["say"]["text"] == "It is 4."

@@ -55,6 +55,10 @@
   .seats { max-width:820px; margin:6px auto; display:flex; flex-direction:column; gap:8px; }  /* parallel answers, stacked */
   .seats .msg { margin:0; }
   .msg.lookup, .msg.recall { font-size:13px; border-style:dashed; }
+  .msg.runreq { font-size:13px; border-left:3px solid #d48a00; } .msg.runreq.done { border-left-color:var(--ok); }
+  .msg.runreq.denied, .msg.runreq.failed, .msg.runreq.expired, .msg.runreq.cancelled { border-left-color:var(--muted); }
+  .msg.runreq pre { white-space:pre-wrap; background:var(--bg); padding:8px; border-radius:6px; margin:6px 0; max-height:260px; overflow:auto; font:12px/1.45 ui-monospace, Consolas, monospace; }
+  .msg.runreq .warn { font-size:12px; color:var(--muted); }
   .media-img { display:block; max-width:100%; max-height:420px; margin:8px 0; border-radius:8px; border:1px solid var(--border); }
   .file-link, .chip { display:inline-flex; align-items:center; gap:4px; margin:6px 6px 0 0; padding:3px 9px; border:1px solid var(--border);
     border-radius:999px; font-size:12.5px; text-decoration:none; color:inherit; background:var(--bg); }
@@ -350,6 +354,7 @@
           <label><input type="checkbox" data-agtool="docs"> search your folders (ASK @docs)</label>
           <label><input type="checkbox" data-agtool="prism"> search past chats (ASK @prism)</label>
           <label><input type="checkbox" data-agtool="ask"> ask your other assistants</label>
+          <label title="It may ask to run code or commands on this computer - each run needs your approval"><input type="checkbox" data-agtool="run"> run programs</label>
           <label title="Web bots only: the site's Deep Research for each step (slow, uses your research allowance)"><input type="checkbox" id="agResearch"> deep research</label></div>
         <textarea id="agOutput" style="min-height:50px" placeholder="Fields PRISM reads from its reply, one per line, e.g.&#10;verdict: PASS|FIX&#10;notes: text"></textarea>
         <button class="primary">Save agent</button>
@@ -368,6 +373,7 @@
     </div>
     <div id="localBox" class="plat"></div>
     <div id="readersBox" class="plat"></div>
+    <div id="runnerBox" class="plat"></div>
     <div id="plats"></div>
   </div>
 </div>
@@ -558,7 +564,8 @@ function watch() {
       const sig = x => JSON.stringify([x.messages.length, x.meeting, x.daughters.map(d => d.messages.length),
                                        x.context.length, x.messages.filter(m => m.meta?.pending).length, x.profile,
                                        x.context.map(c => c.status ? [c.status.busy, c.status.job?.files, c.status.chunks, c.content] : 0),
-                                       x.run && [x.run.status, x.run.live, x.run.steps, x.run.queue.join()]]);
+                                       x.run && [x.run.status, x.run.live, x.run.steps, x.run.queue.join()],
+                                       x.messages.filter(m => m.meta?.kind === 'run_request').map(m => m.meta.status).join()]);
       const changed = sig(fresh) !== sig(v);
       state.view = fresh;
       if (changed) render();
@@ -714,6 +721,10 @@ function meetingHtml(msgs, live) {
       continue;
     }
     flush();
+    if (kind === 'run_request') {
+      html += runCard(m);
+      continue;
+    }
     if (kind === 'recall') {
       const what = meta.pending ? `<em class="muted">recalling… (a new chat on ${esc(meta.speaker)})</em>`
         : meta.error ? `<span class="err">${esc(meta.error)}</span>`
@@ -747,6 +758,7 @@ function meetingHtml(msgs, live) {
   if (live) {
     const what = live.phase === 'final' ? 'Writing the final answer…'
       : live.phase === 'analysing' ? `The moderator is analysing round ${live.round}…`
+      : live.approving?.length ? `${live.approving.join(', ')} wants to run a program - approve or refuse it above`
       : live.waiting_on.length ? `Waiting on ${live.waiting_on.join(', ')}…` : 'Starting…';
     html += `<div class="msg"><em class="muted">${esc(what)}</em></div>`;
   }
@@ -946,6 +958,61 @@ $('agentForm').onsubmit = async e => {
     renderAgents(); notice(`Saved @${name} - use it in flows, or @${name} in a chat`);
     $('agentForm').reset();
   } catch (err) { alert(err.message); }
+};
+
+/* A bot asking to run a program: the exact code, where, and the user's choice. */
+function runCard(m) {
+  const r = m.meta, open = r.status === 'pending';
+  const what = r.code != null ? `<pre>${esc(r.code)}</pre>` : `<pre>${esc(r.command)}</pre>`;
+  const state_ = {pending: 'wants to run this - your call', running: 'running…', done: `ran in ${r.seconds}s, exit code ${r.exit_code}`,
+    denied: 'you didn\'t allow it', failed: 'it failed', cancelled: 'cancelled (stopped)', expired: 'not run - PRISM restarted before you answered'}[r.status] || r.status;
+  const rule = r.approved_by && r.approved_by !== 'once' ? ` · allowed by your rule (${r.approved_by === 'always' ? 'always' : 'this ' + r.approved_by})` : '';
+  return `<div class="msg runreq ${esc(r.status)}"><div class="who"><span class="speaker-name">${esc(r.speaker)}</span> · run ${esc(r.tool)} · ${esc(state_)}${rule}</div>`
+    + what
+    + (open ? `<div class="warn">Runs in ${esc(r.work || 'its work folder')}, with your account's rights - it is not a sandbox. Time limit applies; PRISM's saved keys are not passed on.</div>
+       <div class="plat-actions"><button class="primary" data-runreq="once" data-id="${esc(r.id)}">Run once</button>
+       <button data-runreq="chat" data-id="${esc(r.id)}">Always allow ${esc(r.tool)} in this chat</button>
+       <button data-runreq="always" data-id="${esc(r.id)}">Always allow ${esc(r.tool)}</button>
+       <button data-runreq="deny" data-id="${esc(r.id)}">Don't run</button></div>` : '')
+    + (r.output ? `<details ${r.status === 'failed' ? 'open' : ''}><summary>Output${r.files?.length ? ` · made ${r.files.length} file${r.files.length > 1 ? 's' : ''}` : ''}</summary><pre>${esc(r.output)}</pre></details>` : '')
+    + filesHtml(r.media) + '</div>';
+}
+$('thread').addEventListener('click', async e => {
+  const act = e.target.dataset.runreq; if (!act) return;
+  e.target.disabled = true;
+  try {
+    const v = await api(`/api/commands/${e.target.dataset.id}`, {method: 'POST',
+      body: {allow: act === 'deny' ? null : act, chat_id: state.view.chat.id, flow: state.view.run?.flow || null}});
+    if (v.chat) { state.view = v; render(); watch(); }
+  } catch (err) { alert(err.message); openChat(state.view.chat.id); }
+});
+
+async function loadRunner() {
+  let r;
+  try { r = await api('/api/runner'); } catch (err) { $('runnerBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  state.runner = r;
+  const rules = [...(r.rules.always || []).map(t => ['always', t, null]),
+    ...Object.entries(r.rules.chats || {}).flatMap(([c, ts]) => ts.map(t => ['chats', t, c])),
+    ...Object.entries(r.rules.flows || {}).flatMap(([f, ts]) => ts.map(t => ['flows', t, f]))];
+  const chatName = id => (state.chats.find(c => String(c.id) === String(id))?.title || `chat ${id}`);
+  $('runnerBox').innerHTML = `<div class="plat-head"><b>Running programs</b>
+      <label class="muted" style="font-size:12.5px"><input type="checkbox" id="runnerOn" ${r.mode === 'on' ? 'checked' : ''}> bots may ask to run code</label></div>
+    <div class="muted" style="font-size:12px">A bot can end its reply with <code>RUN @python</code> and a code block (or <code>RUN: a command</code>). You see the exact code first and choose. It runs in <code>${esc(r.work)}</code> with your account's rights - not a sandbox - for at most ${Math.round(r.timeout_s / 60)} min, without PRISM's saved keys.
+      Found here: ${r.languages.length ? esc(r.languages.join(', ')) : 'no languages yet'}${Object.keys(r.toolchains).length ? ` · from the catalog: ${esc(Object.keys(r.toolchains).join(', '))}` : ''}.</div>
+    <h4 style="margin:10px 0 4px;font-size:13px">Allowed without asking</h4>
+    ${rules.map(([kind, tool, where]) => `<div class="lm"><span><b>${esc(tool)}</b> · ${kind === 'always' ? 'everywhere' : kind === 'chats' ? 'in ' + esc(chatName(where)) : 'in the flow ' + esc(where)}</span>
+      <button data-revoke="${kind}|${esc(tool)}|${esc(where || '')}">Ask again</button></div>`).join('') || '<div class="muted" style="font-size:12.5px">Nothing - every run asks you first.</div>'}`;
+}
+$('runnerBox').onchange = async e => {
+  if (e.target.id !== 'runnerOn') return;
+  await api('/api/runner', {method: 'PUT', body: {mode: e.target.checked ? 'on' : 'off'}}); loadRunner();
+};
+$('runnerBox').onclick = async e => {
+  const v = e.target.dataset.revoke; if (!v) return;
+  const [kind, tool, where] = v.split('|'), rules = structuredClone(state.runner.rules);
+  if (kind === 'always') rules.always = rules.always.filter(t => t !== tool);
+  else rules[kind][where] = rules[kind][where].filter(t => t !== tool);
+  await api('/api/runner', {method: 'PUT', body: {rules}}); loadRunner();
 };
 
 function renderMeetbar(show) {
@@ -1172,7 +1239,7 @@ async function loadPlatforms() {
   const p = state.platforms;
   $('motherLabel').textContent = p.primary ? `Mother: ${p.primary}` : 'No primary set';
 }
-$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); loadReaders(); };
+$('openSettings').onclick = async () => { await loadPlatforms(); renderSettings(); $('settings').classList.remove('hidden'); loadLocal(); loadReaders(); loadRunner(); };
 $('closeSettings').onclick = () => { $('settings').classList.add('hidden'); clearTimeout(state.localPoll); if (state.view) render(); };
 
 /* ---------- local models: Ollama / LM Studio on this computer, or in this browser ---------- */

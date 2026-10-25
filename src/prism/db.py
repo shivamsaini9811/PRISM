@@ -291,6 +291,12 @@ class Store:
             " VALUES (?, ?, ?, ?, ?, ?)",
             (chat_id, daughter_id, role, content, json.dumps(meta) if meta else None, time.time()))
 
+    def messages_of_kind(self, kind: str) -> list[dict]:
+        """Room messages of one kind, any chat (e.g. run requests left waiting)."""
+        rows = self._q("SELECT id, chat_id, meta_json FROM messages WHERE meta_json LIKE ?",
+                       (f'%"kind": "{kind}"%',))
+        return [{"id": r["id"], "chat_id": r["chat_id"], "meta": json.loads(r["meta_json"])} for r in rows]
+
     def update_message(self, message_id: int, meta: dict) -> None:
         self._q("UPDATE messages SET meta_json = ? WHERE id = ?", (json.dumps(meta), message_id))
 
