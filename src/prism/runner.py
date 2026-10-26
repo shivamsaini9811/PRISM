@@ -66,7 +66,9 @@ RUN_HELP = (" You can run Python on the user's computer - each run needs the use
             "package, make the block's first line `# pip: name1 name2`. The code runs in a work "
             "folder of its own (save files there); what it prints comes back to you, then finish "
             "your reply. Use it to compute, test code or process data rather than guessing. At "
-            "most {max_runs} runs per turn.")
+            "most {max_runs} runs per turn. print() what you want to see.\n\n"
+            "Example - asked \"what is 2**100?\", your whole reply is:\n"
+            "I'll compute it.\nRUN @python\n```python\nprint(2**100)\n```")
 SHOWN_PACKAGES = "numpy, pandas, scipy, matplotlib, scikit-learn, requests, openpyxl, python-docx, pypdf, pillow"
 
 
