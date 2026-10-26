@@ -525,6 +525,7 @@ _queued: dict[int, list["SendIn"]] = {}  # @mentioned messages waiting for the r
 DEFAULTS = {"rounds": 3, "speakers": {}, "deep": False, "format": "roundtable", "asks": 3,
             "research": False}
 MENTION = re.compile(r"(?<![\w.])@([A-Za-z][\w-]*)")
+TOOL_WORDS = {"python", "docs", "kg", "prism", "any"}
 CONTEXT_REF = re.compile(r"(?<![\w&#])#([A-Za-z][\w-]*)")   # "C#" and "#1" are not references
 COMMAND = re.compile(r"^/(save|save-global|forget)\s+#([A-Za-z][\w-]*)\s*(.*)$", re.S)
 RECALL = re.compile(r"^/recall\s+@([A-Za-z][\w-]*)\s+#([A-Za-z][\w-]*)\s*(.*)$", re.S)
@@ -572,6 +573,8 @@ def parse_mentions(text: str, members: list[str]) -> list[str]:
     found: list[str] = []
     for raw in MENTION.findall(text):
         name = ALIASES.get(raw.lower(), raw.lower())
+        if name in TOOL_WORDS and name not in members:
+            continue  # "RUN @python", "ASK @docs": PRISM's tools, not someone to ask
         if name not in members + ["all", MODERATOR]:
             raise HTTPException(400, f"Unknown @{raw} - in this room: "
                                      + ", ".join(f"@{n}" for n in members + ["all", MODERATOR]))

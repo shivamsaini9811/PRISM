@@ -179,6 +179,11 @@ def test_mentions_pick_who_answers(client):
     r = client.post(f"/api/chats/{chat}/messages", json={"content": "@bard hi"})
     assert r.status_code == 400 and "@claude" in r.json()["detail"]
     assert client.post(f"/api/chats/{chat}/messages", json={"content": "mail me at a@b.com"}).status_code == 200
+    wait_meeting(client, chat)
+    r = client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt write it and use RUN @python"})
+    assert r.status_code == 200  # a tool word, not an unknown bot
+    v = wait_meeting(client, chat)
+    assert [m["meta"]["speaker"] for m in v["messages"] if m["meta"]["kind"] == "speaker"][-1] == "gpt"
 
 
 def test_named_context_write_use_forget(client):
