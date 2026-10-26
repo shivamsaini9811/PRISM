@@ -224,6 +224,7 @@ class OllamaProvider(Provider):
     """Ollama's own chat API: unlike its OpenAI-style one, it lets PRISM set the context
     window, so a long room isn't silently cut from the front (where the instructions are).
     The reply streams in, so a slow model counts as working while it writes."""
+    on_this_computer = True  # small models: RUN @python is read forgivingly
 
     def __init__(self, name: str, model: str, base_url: str | None = None):
         self.name, self.model = name, model
@@ -256,6 +257,7 @@ class OllamaProvider(Provider):
 class LMStudioProvider(Provider):
     """LM Studio - and any server that speaks the OpenAI chat API (llama.cpp's server, vLLM,
     LocalAI, Jan, a model on your own server), with an optional key."""
+    on_this_computer = True  # small models: RUN @python is read forgivingly
 
     def __init__(self, name: str, model: str, base_url: str | None = None, api_key: str | None = None):
         self.name, self.model, self.api_key = name, model, api_key
@@ -357,6 +359,8 @@ client_jobs = ClientJobs()
 
 
 class BrowserModelProvider(Provider):
+    on_this_computer = True  # small models: RUN @python is read forgivingly
+
     def __init__(self, name: str, model: str, timeout: float = 900):
         self.name, self.model, self.timeout = name, model, timeout
 

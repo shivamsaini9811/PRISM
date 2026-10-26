@@ -294,6 +294,7 @@ class Engine:
 
 class BuiltinProvider(Provider):
     """A model run by PRISM's own engine; talks to it as an OpenAI-compatible server."""
+    on_this_computer = True  # small models: RUN @python is read forgivingly
 
     def __init__(self, name: str, model_id: str, engine: Engine):
         self.name, self.model, self.engine = name, model_id, engine

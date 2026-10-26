@@ -47,6 +47,9 @@ PIP_TIMEOUT_S = 900.0
 
 RUN_LINE = re.compile(r"^[\s*_`>-]*RUN\s*(?:@([\w.+-]+))?[*_`]*\s*:?[\s*_`]*$", re.I)
 FENCE = re.compile(r"```([\w.+-]*)[^\n]*\n(.*?)\n?```\s*$", re.S)
+BLOCKS = re.compile(r"```([\w.+-]*)[^\n]*\n(.*?)\n?```", re.S)
+RUN_ANYWHERE = re.compile(r"^[\s#*_`>-]*RUN\s*@python3?\b.*$", re.I | re.M)
+ASKED_TO_RUN = re.compile(r"\b(?:run|execute|RUN\s*@python)\b", re.I)
 LABEL = re.compile(r"^\s*(python3?|py|code|copy|copy code)?\s*$", re.I)
 PIP_LINE = re.compile(r"^\s*#\s*pip\s*:\s*(.+)$", re.I | re.M)
 # A requirement as pip takes it - a name, extras and a version - and nothing else: no
@@ -105,8 +108,32 @@ def packages_in(code: str) -> tuple[list[str], list[str]]:
     return list(dict.fromkeys(good)), bad
 
 
-def parse_request(text: str, who: str) -> Request | None:
-    """`RUN @python` and one python block, at the very end of a reply."""
+def parse_request(text: str, who: str, forgiving: bool = False, asked: bool = False) -> Request | None:
+    """`RUN @python` and one python block, at the very end of a reply.
+
+    forgiving (small models on this computer, which garble the format): the last python block
+    is a request when RUN @python is anywhere in the reply (after the block, inside it) - or,
+    if the user asked to run something (asked), when the reply ends with that block."""
+    if req := _strict(text, who):
+        return req
+    if not forgiving:
+        return None
+    blocks = [b for b in BLOCKS.finditer(text) if b.group(1).lower() in ("python", "py", "python3", "")]
+    if not blocks:
+        return None
+    last = blocks[-1]
+    after = text[last.end():].strip()
+    said_run = bool(RUN_ANYWHERE.search(text))
+    if not (said_run and (not after or RUN_ANYWHERE.fullmatch(after))) and not (asked and not after):
+        return None
+    code = RUN_ANYWHERE.sub("", last.group(2)).strip("\n")
+    if not code.strip():
+        return None
+    good, bad = packages_in(code)
+    return Request(who, code, packages=good, rejected=bad)
+
+
+def _strict(text: str, who: str) -> Request | None:
     body = text.rstrip()
     fence = FENCE.search(body)
     if not fence:

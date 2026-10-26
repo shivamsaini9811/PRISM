@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from .providers import Message, Provider, wait_reply
-from .runner import RUN_HELP, SHOWN_PACKAGES, Request, parse_request, result_for_bot
+from .runner import ASKED_TO_RUN, RUN_HELP, SHOWN_PACKAGES, Request, parse_request, result_for_bot
 
 MAX_RUNS = 5  # programs a bot may run per turn (each one approved by the user)
 
@@ -341,7 +341,9 @@ class Session:
                         else:
                             asks += 1
                             answer = await self._lookup(m.name, targets, q.group(2).strip())
-                    elif self.run_fn and m.name in self.runnable and (req := parse_request(st.text, m.name)):
+                    elif self.run_fn and m.name in self.runnable and (req := parse_request(
+                            st.text, m.name, forgiving=getattr(m.provider, "on_this_computer", False),
+                            asked=runs == 0 and bool(ASKED_TO_RUN.search(st.prompt)))):
                         if runs >= MAX_RUNS:
                             answer = "[No runs left this turn.] Finish your answer with what you have."
                         else:

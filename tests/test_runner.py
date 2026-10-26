@@ -132,3 +132,19 @@ async def test_stop_while_running_marks_the_card(shared_sandbox, tmp_path):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert cards[0]["status"] == "cancelled"
+
+
+def test_forgiving_reading_for_small_local_models():
+    from prism.runner import parse_request
+    after = 'Here:\n```python\nprint("Hello, world!")\n```\n\nRUN @python'      # RUN after the block
+    inside = 'Now run it:\n```python\n# RUN @python\nprint(1)\n```'             # RUN inside the block
+    bare = '```python\nprint("Hello, world!")\n```'                               # no RUN at all
+    shown = 'Like this:\n```python\nprint(1)\n```\nThen call it from your app.'  # code shown, not run
+    for text in (after, inside, bare, shown):
+        assert parse_request(text, "q") is None                # the big models' strict format only
+    assert parse_request(after, "q", forgiving=True).code == 'print("Hello, world!")'
+    assert parse_request(inside, "q", forgiving=True).code == "print(1)"
+    assert parse_request(bare, "q", forgiving=True) is None    # the user didn't ask to run
+    assert parse_request(bare, "q", forgiving=True, asked=True).code == 'print("Hello, world!")'
+    assert parse_request(shown, "q", forgiving=True, asked=True) is None  # text after it: an example
+    assert parse_request("RUN @python\n```python\nprint(2)\n```", "q", forgiving=True).code == "print(2)"

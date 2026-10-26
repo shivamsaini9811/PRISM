@@ -894,3 +894,28 @@ def test_engine_models_listed_added_switched_and_removed(client, tmp_path):
     assert client.post("/api/engine/models/nope/download").status_code == 404
     assert not client.delete(f"/api/engine/models/{m.id}").json()["models"][0]["installed"]
     assert not (tmp_path / "models" / m.file).exists()
+
+
+def test_a_small_local_model_that_garbles_run_still_gets_a_card(client, monkeypatch):
+    client.post("/api/unlock", json={"password": "longenough"})
+    client.put("/api/credentials/gpt", json={"secret": "k"})
+
+    class Small:  # what Qwen 2.5 1.5B wrote when asked "run a hello world program in python"
+        name, model, thread_url, on_this_computer = "gpt", "qwen2.5-1.5b", None, True
+
+        async def complete(self, messages, system=None):
+            if "[ran python" in messages[-1]["content"]:
+                return "Done."
+            return '```python\nprint("Hello, world!")\n```'
+    monkeypatch.setattr(app_mod, "make_provider", lambda cred, **kw: Small())
+    chat = client.post("/api/chats").json()["id"]
+    client.post(f"/api/chats/{chat}/messages", json={"content": "@gpt run a hello world program in python", "format": "chat"})
+    for _ in range(200):
+        v = client.get(f"/api/chats/{chat}").json()
+        card = next((m for m in v["messages"] if m["meta"]["kind"] == "run_request"), None)
+        if card:
+            break
+        time.sleep(0.02)
+    assert card and card["meta"]["code"] == 'print("Hello, world!")' and card["meta"]["status"] == "pending"
+    assert client.post(f"/api/commands/{card['meta']['id']}", json={"allow": None}).status_code == 200  # deny
+    wait_meeting(client, chat)
