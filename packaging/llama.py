@@ -65,7 +65,24 @@ def fetch(name: str, digest: str, cache: Path) -> Path:
 
 def wanted(name: str) -> bool:
     stem = name.rsplit("/", 1)[-1]
+    if stem in ("llama", "llama.exe"):  # the all-tools program; only the server is used
+        return False
     return not stem.startswith(SKIP) or stem.startswith(("llama-server", "llama-common"))
+
+
+VC_RUNTIME = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+
+
+def vc_runtime(out: Path) -> None:
+    """llama-server needs Microsoft's Visual C++ runtime, which not every PC has: its files go
+    next to it (app-local, as Microsoft allows), taken from the Windows that builds PRISM."""
+    for system in (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32", Path("/mnt/c/Windows/System32")):
+        if all((system / n).is_file() for n in VC_RUNTIME):
+            for n in VC_RUNTIME:
+                shutil.copyfile(system / n, out / n)
+            return
+    raise SystemExit("the Visual C++ runtime (msvcp140.dll, vcruntime140*.dll) isn't on this computer - "
+                     "install it from https://aka.ms/vs/17/release/vc_redist.x64.exe and build again")
 
 
 def install(platform: str, dest: Path, cache: Path) -> list[Path]:
@@ -92,8 +109,14 @@ def install(platform: str, dest: Path, cache: Path) -> list[Path]:
             if p.is_symlink():
                 os.symlink(os.readlink(p), target)
             else:
-                shutil.copy2(p, target)
+                shutil.copyfile(p, target)
+                try:
+                    shutil.copymode(p, target)  # keeps executables runnable (macOS, Linux)
+                except OSError:
+                    pass
         shutil.rmtree(stage, ignore_errors=True)
+        if platform == "windows":
+            vc_runtime(out)
         servers.append(out / exe.name)
         print(f"+ {build}: {out / exe.name}", flush=True)
     return servers

@@ -130,3 +130,22 @@ async def test_download_checked_refused_when_wrong_and_when_disk_is_full(hub, tm
         eng.start_download(huge.id, tmp_path, url=hub)
     eng.remove(good.id, tmp_path)
     assert eng.installed(tmp_path) == set()
+
+
+async def test_engine_dying_mid_answer_is_reported(fake_server):
+    e = eng.Engine(fake_server)
+    a = eng.MODELS[0]
+    await e.ensure(a.id)
+    e.done()
+    p = eng.BuiltinProvider("small", a.id, e)
+    original = e.ensure
+
+    async def ensure_then_die(model_id):
+        got = await original(model_id)
+        e.proc.kill()
+        e.proc.wait()
+        return got
+    e.ensure = ensure_then_die
+    with pytest.raises(ProviderError, match="engine stopped while answering"):
+        await p.complete([{"role": "user", "content": "hi"}])
+    assert e.busy == 0

@@ -221,7 +221,7 @@ class Engine:
             self.port, self.key = free_port(), secrets.token_urlsafe(24)
             log = self.home / "models" / "engine.log"
             args = [str(exe), "-m", str(models_dir(self.home) / m.file), "--host", "127.0.0.1",
-                    "--port", str(self.port), "-c", str(CONTEXT), "--api-key", self.key,
+                    "--port", str(self.port), "-c", str(CONTEXT), "--parallel", "1", "--api-key", self.key,
                     "-ngl", "0" if exe.parent.name == "cpu" else "99", "--reasoning-format", "deepseek"]
             with open(log, "w") as out:
                 self.proc = subprocess.Popen(args, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -309,5 +309,12 @@ class BuiltinProvider(Provider):
             self._client = LMStudioProvider(self.name, self.model, base, key)
             self._client.label = f"PRISM's engine ({BY_ID[self.model].label})"
             return await self._client.complete(messages, system)
+        except (httpx.HTTPError, ProviderError) as e:
+            if self.engine.running():
+                raise
+            log = models_dir(self.engine.home) / "engine.log"
+            tail = log.read_text(errors="replace").strip().splitlines()[-3:] if log.exists() else []
+            raise ProviderError(f"the model engine stopped while answering ({' | '.join(tail)[-300:] or e}) - "
+                                "a smaller model, or Runs on: the processor, may help") from e
         finally:
             self.engine.done()

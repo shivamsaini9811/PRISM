@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-m"); ap.add_argument("--host"); ap.add_argument("--port", type=int); ap.add_argument("-c")
-ap.add_argument("--api-key"); ap.add_argument("-ngl"); ap.add_argument("--reasoning-format")
+ap.add_argument("--api-key"); ap.add_argument("-ngl"); ap.add_argument("--reasoning-format"); ap.add_argument("--parallel")
 a = ap.parse_args()
 if "crash" in a.m:
     print("error: failed to load model", flush=True); sys.exit(1)
