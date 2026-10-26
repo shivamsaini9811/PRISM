@@ -3,7 +3,7 @@
 `PRISM-<version>-macos-arm64.zip` (Apple Silicon) and `PRISM-<version>-macos-x86_64.zip` (Intel)
 hold everything: PRISM's Python for macOS with all its packages, and PRISM. In Terminal:
 
-    cd ~/Downloads && unzip -q PRISM-0.8.5-macos-arm64.zip && xattr -dr com.apple.quarantine PRISM && ./PRISM/start.command
+    cd ~/Downloads && unzip -q PRISM-0.8.6-macos-arm64.zip && xattr -dr com.apple.quarantine PRISM && ./PRISM/start.command
 
 Afterwards double-click `PRISM/start.command` to start it. Needs macOS 14 or later. Made on any
 computer with `python packaging/mac_portable.py` (uv installs the macOS wheels).
