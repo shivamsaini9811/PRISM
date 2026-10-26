@@ -1436,10 +1436,12 @@ async function loadLocal() {
   clearTimeout(state.localPoll);
   if ($('settings').classList.contains('hidden')) return;
   let r;
-  try { r = await api('/api/local'); } catch (err) { $('localBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
+  try { [r, state.engine] = await Promise.all([api('/api/local'), api('/api/engine')]); }
+  catch (err) { $('localBox').innerHTML = `<span class="err">${esc(err.message)}</span>`; return; }
   state.local = r;
   renderLocal();
-  if (Object.values(r.pulls).some(x => !x.done)) state.localPoll = setTimeout(loadLocal, 1000);  // a download is running
+  const busy = Object.values(r.pulls).some(x => !x.done) || state.engine.models.some(m => m.download && !m.download.done);
+  if (busy) state.localPoll = setTimeout(loadLocal, 1000);  // a download is running
 }
 function renderLocal() {
   const r = state.local; if (!r) return;
@@ -1471,6 +1473,7 @@ function renderLocal() {
   $('localBox').innerHTML = `<div class="plat-head"><b>Local models</b><button data-localrefresh>Refresh</button></div>
     <div class="muted" style="font-size:12px">Run models on this computer: private, free, offline. Each joins the room under its own @name.
       ${free ? `Free memory now: ${(free / 1024).toFixed(1)} GB - a model needs about its size in memory.` : ''}</div>
+    ${renderEngine()}
     ${r.runtimes.map(runtime).join('')}
     <h4>In this browser <span class="muted">· ${gpu ? 'WebGPU available' : 'needs WebGPU (Edge or Chrome)'}</span></h4>
     <div class="muted" style="font-size:12.5px">No install: the model runs inside this PRISM tab (small models, 1-8B). The first use downloads it (1-5 GB) and keeps it in the browser. Keep the tab open while it answers.</div>
@@ -1479,6 +1482,34 @@ function renderLocal() {
     <div class="lm"><input id="srvUrl" placeholder="http://192.168.1.20:8080" style="flex:2"><input id="srvKey" placeholder="key (if it needs one)" style="flex:1"><button data-srvlist>List models</button></div>
     <div id="srvModels"></div>`;
   if (gpu) fillWebModels();
+}
+/* PRISM's own engine (llama.cpp, shipped with PRISM): download a model, add it, ask it. */
+function renderEngine() {
+  const e = state.engine; if (!e) return '';
+  const gb = n => (n / 1e9).toFixed(1) + ' GB';
+  const eng = e.engine;
+  if (!eng.binary) return `<h4>PRISM's engine <span class="muted">· not in this install</span></h4>
+    <div class="muted" style="font-size:12.5px">This copy of PRISM came without its model engine (running from source?). Use Ollama below, or the PRISM download.</div>`;
+  const freeRam = e.free_ram_mb ? e.free_ram_mb / 1024 : 0;
+  const rows = e.models.map(m => {
+    const d = m.download, going = d && !d.done;
+    const tight = freeRam && m.ram_gb > freeRam;
+    const right = m.installed
+      ? (m.in_room ? `<span class="ok">@${esc(m.in_room)}</span>` : `<button data-engadd="${m.id}">Add to room</button>`)
+        + ` <button data-engdel="${m.id}" title="Delete the model file (${gb(m.size)})">Remove</button>`
+      : going ? `<progress max="${d.total}" value="${d.completed}"></progress> <span class="muted">${Math.floor(100 * d.completed / d.total)}%</span>`
+      : `<button data-engget="${m.id}"${m.size + 1e9 > e.disk_free ? ' disabled title="Not enough free disk"' : ''}>Download ${gb(m.size)}</button>`;
+    return `<div class="lm"><span><b>${esc(m.label)}</b> <span class="muted">· ${esc(m.good_for)} · needs ~${m.ram_gb} GB memory · ${esc(m.license)}</span>
+      ${tight ? '<span class="err" title="More than the memory free now: close programs, or pick a smaller one">· more than free memory</span>' : ''}
+      ${d && d.error ? `<br><span class="err">${esc(d.error)}</span>` : ''}</span><span>${right}</span></div>`;
+  }).join('');
+  const builds = eng.builds.length > 1 ? `<label class="muted" style="font-size:12.5px">Runs on
+    <select id="engBuild">${eng.builds.map(b => `<option value="${b}"${b === eng.build ? ' selected' : ''}>${
+      {cpu: 'the processor (CPU)', vulkan: 'the graphics chip (Vulkan)', metal: 'Apple graphics (Metal)'}[b]}</option>`).join('')}</select></label>` : '';
+  return `<h4>PRISM's engine <span class="muted">· built in, nothing to install${eng.running ? ` · running ${esc(e.models.find(m => m.id === eng.model)?.label || '')}` : ''}</span></h4>
+    <div class="muted" style="font-size:12.5px">Download a model once (checked against its published checksum; ${gb(e.disk_free)} free on disk), add it to the room, then ask it with its @name.
+      It starts when asked and stops after 10 minutes unused. One runs at a time.</div>
+    ${rows}${builds}`;
 }
 async function fillWebModels() {
   try {
@@ -1499,9 +1530,26 @@ async function addLocal(model, transport, runtime, secret = '') {
     renderSettings(); renderLocal(); notice(`@${name} joined - ask it with @${name}`);
   } catch (err) { alert(err.message); }
 }
+$('localBox').onchange = async e => {
+  if (e.target.id !== 'engBuild') return;
+  try { state.engine = await api('/api/engine', {method: 'PUT', body: {build: e.target.value}}); renderLocal(); }
+  catch (err) { alert(err.message); }
+};
 $('localBox').onclick = async e => {
   const t = e.target;
   if (t.hasAttribute('data-localrefresh')) return loadLocal();
+  if (t.dataset.engget) {
+    try { state.engine = await api(`/api/engine/models/${t.dataset.engget}/download`, {method: 'POST'}); loadLocal(); }
+    catch (err) { alert(err.message); }
+    return;
+  }
+  if (t.dataset.engadd) { await addLocal(t.dataset.engadd, 'local', 'builtin'); return loadLocal(); }
+  if (t.dataset.engdel) {
+    const m = state.engine.models.find(x => x.id === t.dataset.engdel);
+    if (!confirm(`Delete ${m.label} from this computer? (${(m.size / 1e9).toFixed(1)} GB; you can download it again)`)) return;
+    try { state.engine = await api(`/api/engine/models/${m.id}`, {method: 'DELETE'}); renderLocal(); } catch (err) { alert(err.message); }
+    return;
+  }
   if (t.dataset.addlocal) return addLocal(t.dataset.addlocal, 'local', t.dataset.rt);
   if (t.hasAttribute('data-addweb')) { const m = $('webModel').value; if (m) addLocal(m, 'webgpu', ''); return; }
   if (t.hasAttribute('data-srvlist')) {

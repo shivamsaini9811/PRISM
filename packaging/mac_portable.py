@@ -28,11 +28,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "packaging"))
+import llama  # noqa: E402
 import runtime  # noqa: E402
 
 ARCHES = {"arm64": ("macos-arm64", "aarch64-apple-darwin"), "x86_64": ("macos-x64", "x86_64-apple-darwin"),
           # the same package for Linux: lets the layout be tried on a machine that isn't a Mac
           "linux-test": ("linux-x64", "x86_64-unknown-linux-gnu")}
+ENGINE = {"arm64": "macos-arm64", "x86_64": "macos-x86_64", "linux-test": "linux"}  # packaging/llama.py
 MACOS = "14.0"
 
 START = """#!/bin/bash
@@ -103,6 +105,7 @@ def build(arch: str, out: Path, cache: Path) -> Path:
                    env={**os.environ, "MACOSX_DEPLOYMENT_TARGET": MACOS})
     shutil.copytree(ROOT / "src" / "prism", site / "prism",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    llama.install(ENGINE[arch], app, cache / "llama")   # -> PRISM/llama/<build>/llama-server
     (app / "start.command").write_text(START)
     (app / "start.command").chmod(0o755)
     (app / "README-MAC.txt").write_text(README.format(

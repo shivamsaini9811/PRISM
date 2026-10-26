@@ -26,7 +26,7 @@ from .crypto import WrongPassword
 from .db import Store, context_name
 from .meeting import (BUDGETS, FORMATS, MAX_ROUNDS, MODERATOR, Entry, Member, Session,
                       context_block, make_script)
-from . import builder, catalog, enrich, flows, kg as kg_mod, local, readers
+from . import builder, catalog, engine as engine_mod, enrich, flows, kg as kg_mod, local, readers
 from .library import Library, attachable, passages_text
 from . import runner as runner_mod
 from .providers import PLATFORMS, Provider, build_provider, wait_reply
@@ -65,6 +65,7 @@ def library() -> Library:
 async def lifespan(_: FastAPI):
     recover_runs()
     yield
+    engine().kill()  # no model server left running after PRISM
     for task in list(_session_tasks.values()) + list(_run_tasks.values()):
         task.cancel()
     await asyncio.gather(*_session_tasks.values(), *_run_tasks.values(), return_exceptions=True)
@@ -168,7 +169,7 @@ def make_provider(cred: dict, thread_url: str | None = None, fresh: bool = False
                   resend_system: bool = False, advisor: bool = True) -> Provider:
     """API providers are stateless; browser providers bind to a remote conversation."""
     if cred["transport"] in LOCAL_TRANSPORTS:
-        return local.local_provider(cred, settings().reply_max_s)
+        return local.local_provider(cred, settings().reply_max_s, engine=engine())
     if cred["transport"] == "browser":
         if cred["platform"] not in SITES:
             raise ValueError(f"{cred['platform']} has no web app support")
@@ -301,8 +302,8 @@ def platforms() -> dict:
     catalog = {p: {**spec, "web": p in SITES} for p, spec in PLATFORMS.items()}
     for c in store().list_credentials():
         if c["transport"] in LOCAL_TRANSPORTS:
-            where = "in this browser" if c["transport"] == "webgpu" else \
-                local.RUNTIMES.get(c["base_url"] or "ollama", {}).get("label", c["base_url"])
+            where = "in this browser" if c["transport"] == "webgpu" else "PRISM's engine" \
+                if c["base_url"] == "builtin" else local.RUNTIMES.get(c["base_url"] or "ollama", {}).get("label", c["base_url"])
             catalog[c["platform"]] = {"label": f"{c['platform']} (local · {c['model']} · {where})",
                                       "kind": "local", "default_model": c["model"], "needs_secret": False,
                                       "web": False, "local": c["transport"]}
@@ -2360,3 +2361,61 @@ def start_build(chat_id: int, text: str) -> None:
     task = asyncio.create_task(go())
     _build_tasks.add(task)
     task.add_done_callback(_build_tasks.discard)
+
+
+# --- PRISM's own model engine (llama.cpp) and its models -----------------------------------------
+
+@lru_cache
+def engine() -> engine_mod.Engine:
+    return engine_mod.Engine(data_dir(), build=store().get_meta("engine_build")
+                           or ("metal" if sys.platform == "darwin" else "cpu"))
+
+
+@app.get("/api/engine")
+def engine_view() -> dict:
+    have = engine_mod.installed(data_dir())
+    progress = engine_mod.downloads()
+    added = {c["model"]: c["platform"] for c in store().list_credentials()
+             if c["transport"] == "local" and (c.get("base_url") or "") == "builtin"}
+    models_dir = engine_mod.models_dir(data_dir())
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return {"models": [{"id": m.id, "label": m.label, "size": m.size, "ram_gb": m.ram_gb, "license": m.license,
+                        "good_for": m.good_for, "installed": m.id in have, "in_room": added.get(m.id),
+                        "download": progress.get(m.id)} for m in engine_mod.MODELS],
+            "engine": engine().status(), "disk_free": shutil.disk_usage(models_dir).free,
+            "free_ram_mb": local.free_ram_mb()}
+
+
+@app.post("/api/engine/models/{model_id}/download")
+async def engine_download(model_id: str) -> dict:
+    if model_id not in engine_mod.BY_ID:
+        raise HTTPException(404, "No such model")
+    try:
+        engine_mod.start_download(model_id, data_dir())
+    except local.ProviderError as e:
+        raise HTTPException(400, str(e)) from e
+    return engine_view()
+
+
+@app.delete("/api/engine/models/{model_id}")
+async def engine_remove(model_id: str) -> dict:
+    if model_id not in engine_mod.BY_ID:
+        raise HTTPException(404, "No such model")
+    if engine().model == model_id:
+        await engine().stop()
+    engine_mod.remove(model_id, data_dir())
+    return engine_view()
+
+
+class EngineIn(BaseModel):
+    build: str
+
+
+@app.put("/api/engine")
+async def engine_settings(body: EngineIn) -> dict:
+    if body.build not in ("cpu", "vulkan", "metal"):
+        raise HTTPException(400, "build is cpu, vulkan or metal")
+    store().set_meta("engine_build", body.build)
+    await engine().stop()
+    engine().build = body.build
+    return engine_view()

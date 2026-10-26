@@ -14,7 +14,7 @@ def client(tmp_path, monkeypatch, shared_sandbox):
     monkeypatch.setenv("PRISM_HOME", str(tmp_path))
     monkeypatch.setenv("PRISM_DB_PATH", str(tmp_path / "t.db"))
     for fn in (app_mod.settings, app_mod.store, app_mod.browsers, app_mod.library, app_mod.runner,
-               app_mod.python_version, app_mod.kg):
+               app_mod.python_version, app_mod.kg, app_mod.engine):
         fn.cache_clear()
     monkeypatch.setattr(app_mod, "sandbox", lambda: shared_sandbox)  # made once per test run
     app_mod._vault["key"] = None
@@ -869,3 +869,23 @@ def test_the_page_is_never_shown_from_an_old_cache(client):
     r = client.get("/")
     assert r.status_code == 200 and r.headers["cache-control"] == "no-cache"
     assert 'id="openKg"' in r.text and 'id="openFlows"' in r.text
+
+
+def test_engine_models_listed_added_switched_and_removed(client, tmp_path):
+    from prism import engine as eng
+    client.post("/api/unlock", json={"password": "longenough"})
+    v = client.get("/api/engine").json()
+    assert [m["id"] for m in v["models"]] == [m.id for m in eng.MODELS]
+    assert not any(m["installed"] for m in v["models"]) and v["engine"]["build"] == "cpu" and v["disk_free"] > 0
+    m = eng.MODELS[0]
+    (tmp_path / "models" / m.file).write_text("gguf")       # as if downloaded and checked
+    (tmp_path / "models" / (m.file + ".ok")).write_text(m.sha256)
+    client.put("/api/credentials/tiny", json={"transport": "local", "model": m.id, "base_url": "builtin"})
+    row = client.get("/api/engine").json()["models"][0]
+    assert row["installed"] and row["in_room"] == "tiny"
+    assert "PRISM's engine" in client.get("/api/platforms").json()["catalog"]["tiny"]["label"]
+    assert client.put("/api/engine", json={"build": "vulkan"}).json()["engine"]["build"] == "vulkan"
+    assert client.put("/api/engine", json={"build": "cuda"}).status_code == 400
+    assert client.post("/api/engine/models/nope/download").status_code == 404
+    assert not client.delete(f"/api/engine/models/{m.id}").json()["models"][0]["installed"]
+    assert not (tmp_path / "models" / m.file).exists()

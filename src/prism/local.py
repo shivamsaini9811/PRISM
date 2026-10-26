@@ -387,10 +387,15 @@ async def server_models(url: str, api_key: str | None = None) -> list[dict]:
     return [{"name": m["id"], "size_mb": None} for m in data if "embed" not in m["id"]]
 
 
-def local_provider(cred: dict, timeout: float = 900) -> Provider:
+def local_provider(cred: dict, timeout: float = 900, engine=None) -> Provider:
     runtime = (cred.get("base_url") or "").strip()
     if cred["transport"] == "webgpu":
         return BrowserModelProvider(cred["platform"], cred["model"], timeout)
+    if runtime == "builtin":  # PRISM's own engine (llama.cpp)
+        from .engine import BuiltinProvider
+        if engine is None:
+            raise ProviderError("PRISM's model engine isn't available here")
+        return BuiltinProvider(cred["platform"], cred["model"], engine)
     if runtime.startswith("lmstudio") or ":1234" in runtime:
         return LMStudioProvider(cred["platform"], cred["model"],
                                 None if runtime.startswith("lmstudio") else runtime, cred.get("secret"))

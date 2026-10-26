@@ -42,6 +42,8 @@ def main() -> None:
     ap.add_argument("--arch", default="", help="label for the zip name, e.g. arm64 or x86_64")
     ap.add_argument("--no-runtime", action="store_true",
                     help="leave out PRISM's own Python (bots can't RUN code; a much smaller build)")
+    ap.add_argument("--no-engine", action="store_true",
+                    help="leave out PRISM's model engine (llama.cpp; no built-in local models)")
     args = ap.parse_args()
 
     # Isolated build venv so the result never depends on what this machine has installed.
@@ -106,6 +108,13 @@ def main() -> None:
         shutil.copy2(archive, dest / "runtime.tar.gz")
         (dest / "runtime.json").write_text(json.dumps({"python": runtime.PY, "tag": runtime.TAG,
                                                        "packages": len(runtime.PACKAGES)}))
+    if not args.no_engine:  # llama.cpp's llama-server for built-in local models (packaging/llama.py)
+        sys.path.insert(0, str(ROOT / "packaging"))
+        import llama
+        key = "windows" if osname == "windows" else \
+            ("macos-arm64" if platform.machine() == "arm64" else "macos-x86_64") if mac else "linux"
+        dest = (args.dist_dir / "PRISM.app/Contents/Resources") if mac else (args.dist_dir / "PRISM")
+        llama.install(key, dest, args.build_dir / "llama")
     if mac:
         app = args.dist_dir / "PRISM.app"
         finish_mac_app(app, version)
